@@ -1,0 +1,101 @@
+MINIGITHUB1
+2
+11:hello-world
+34:My first repository on Mini GitHub
+0
+1791026841
+3
+9:README.md
+252:# hello-world
+
+Welcome to Mini GitHub!
+
+This is an example repository so you can see how things work.
+
+## How to use it
+
+1. Open the Code tab and edit a file
+2. Type a commit message and press Commit
+3. Open the Commits tab to see exactly what changed
+
+6:main.c
+84:#include <stdio.h>
+
+int main(void)
+{
+    printf("Hello, world!\n");
+    return 0;
+}
+
+11:newfile.txt
+18:this is a new file
+4
+102:# hello-world
+
+Welcome to Mini GitHub!
+
+This is an example repository so you can see how things work.
+
+84:#include <stdio.h>
+
+int main(void)
+{
+    printf("Hello, world!\n");
+    return 0;
+}
+
+252:# hello-world
+
+Welcome to Mini GitHub!
+
+This is an example repository so you can see how things work.
+
+## How to use it
+
+1. Open the Code tab and edit a file
+2. Type a commit message and press Commit
+3. Open the Commits tab to see exactly what changed
+
+18:this is a new file
+3
+7:3da007a
+14:Initial commit
+1791113241
+2
+9:README.md
+0
+6:main.c
+1
+7:ba7c2f1
+30:Add instructions to the README
+1791275241
+2
+9:README.md
+2
+6:main.c
+1
+7:0fccc0c
+14:added new file
+1791286154
+3
+9:README.md
+2
+6:main.c
+1
+11:newfile.txt
+3
+2
+18:Add a LICENSE file
+1
+1791199641
+18:Fix typo in README
+0
+1791113241
+7:newrepo
+18:this is a new repo
+0
+1791286088
+0
+0
+0
+0
