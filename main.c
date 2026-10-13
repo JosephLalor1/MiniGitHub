@@ -11,7 +11,8 @@
  *   - Commits: a snapshot of every file, saved with a message and an author
  *   - Commit history and line-by-line diffs (what was added / removed)
  *   - Issues: anyone can open one; the repo owner or the issue's author can close it
- *   - A contribution graph of your commits over the last six months
+ *   - A contribution graph of the last six months: hover a day to see what you
+ *     did, click it to open a page listing every commit and issue from that day
  *
  * Everything is saved automatically to "minigithub.dat" in the folder the
  * program is run from. A save file from before accounts existed is upgraded
@@ -95,6 +96,8 @@ typedef struct {
     int       fileCount;
     char      names[MAX_FILES][NAME_LEN];
     int       blobs[MAX_FILES];
+    bool      statsDone;             /* the three below are worked out when first needed, */
+    int       sFiles, sAdds, sDels;  /* not saved: files changed, lines added / removed     */
 } Commit;
 
 /* A working file is the version the owner is editing right now. */
@@ -125,7 +128,7 @@ static int  repoCount = 0;
 /* ------------------------------------------------------------------ */
 /* App state                                                          */
 /* ------------------------------------------------------------------ */
-typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_HOME, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT } Screen;
+typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_HOME, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY } Screen;
 typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES } Tab;
 
 typedef struct { char buf[TEXT_LEN]; int len; bool active; bool secret; } TextField;
@@ -142,7 +145,9 @@ static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
 static EditorState ed;
 static bool  optReadme = true, optExample = true;
 static int   homeView;                /* 0 = your repositories, 1 = everyone's */
-static float scHome, scFiles, scCommits, scIssues, scChanges, scDiff;
+static float scHome, scFiles, scCommits, scIssues, scChanges, scDiff, scDay, scDayRepos;
+static long long curDay;              /* midnight at the start of the day being viewed      */
+static bool  fromDay;                 /* commit page was opened from a day page: go back there */
 static int   failedLogins;
 static float lockT;                   /* sign-in paused after too many wrong passwords */
 
@@ -1254,6 +1259,280 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
 }
 
 /* ------------------------------------------------------------------ */
+/* Days and contributions                                             */
+/*                                                                    */
+/* A "contribution" is a commit you made or an issue you opened.      */
+/* Days run from local midnight to local midnight.                    */
+/* ------------------------------------------------------------------ */
+
+/* Midnight (local time) at the start of the day that t falls on. */
+static long long DayStart(long long t)
+{
+    time_t tt = (time_t)t;
+    struct tm lt = *localtime(&tt);
+    lt.tm_hour = lt.tm_min = lt.tm_sec = 0;
+    lt.tm_isdst = -1;
+    return (long long)mktime(&lt);
+}
+
+/* Midnight n days later (n may be negative). Safe across clock changes. */
+static long long AddDays(long long dayStart, int n)
+{
+    time_t tt = (time_t)dayStart;
+    struct tm lt = *localtime(&tt);
+    lt.tm_mday += n;
+    lt.tm_hour = lt.tm_min = lt.tm_sec = 0;
+    lt.tm_isdst = -1;
+    return (long long)mktime(&lt);
+}
+
+/* Whole days from midnight a to midnight b (rounded, so a 23- or 25-hour day still counts as one). */
+static int DaysBetween(long long a, long long b)
+{
+    long long d = b - a;
+    return (int)((d >= 0 ? d + 43200 : d - 43200) / 86400);
+}
+
+/* "Tuesday 13 October 2026" (long) or "Tue 13 Oct 2026" (short). */
+static const char *FormatDay(long long day, bool longForm)
+{
+    static char b[64];
+    time_t tt = (time_t)day;
+    struct tm lt = *localtime(&tt);
+    char wd[16], mon[16];
+    strftime(wd,  sizeof wd,  longForm ? "%A" : "%a", &lt);
+    strftime(mon, sizeof mon, longForm ? "%B" : "%b", &lt);
+    snprintf(b, sizeof b, "%s %d %s %d", wd, lt.tm_mday, mon, lt.tm_year + 1900);
+    return b;
+}
+
+/* "1 commit", "3 commits", "2 repositories"... written into the caller's buffer. */
+static const char *Count(char *buf, int n, const char *one, const char *many)
+{
+    snprintf(buf, 48, "%d %s", n, n == 1 ? one : many);
+    return buf;
+}
+
+/* "hello-world" for your own repos, "alice/hello-world" for anyone else's. */
+static const char *RepoLabel(int i)
+{
+    static char b[2][NAME_LEN * 2 + 4];
+    static int which;
+    which ^= 1;
+    Repo *r = &repos[i];
+    if (IsMine(r)) snprintf(b[which], sizeof b[which], "%s", r->name);
+    else           snprintf(b[which], sizeof b[which], "%s/%s", UserName(r->owner), r->name);
+    return b[which];
+}
+
+/* How many files a commit touched and how many lines it added / removed.
+   Worked out the first time it's needed, then remembered. */
+static void CommitStats(Repo *r, int ci)
+{
+    Commit *c = &r->commits[ci];
+    if (c->statsDone) return;
+    Commit *p = ci > 0 ? &r->commits[ci - 1] : NULL;
+    int files = 0, adds = 0, dels = 0, a, d;
+    for (int k = 0; k < c->fileCount; k++) {
+        int pk = p ? FindInCommit(p, c->names[k]) : -1;
+        int ob = pk >= 0 ? p->blobs[pk] : -1;
+        if (ob == c->blobs[k]) continue;
+        ComputeDiff(BlobText(r, ob), BlobText(r, c->blobs[k]), &a, &d);
+        files++; adds += a; dels += d;
+    }
+    if (p) for (int k = 0; k < p->fileCount; k++) {
+        if (FindInCommit(c, p->names[k]) >= 0) continue;          /* file was deleted */
+        ComputeDiff(BlobText(r, p->blobs[k]), "", &a, &d);
+        files++; adds += a; dels += d;
+    }
+    c->sFiles = files; c->sAdds = adds; c->sDels = dels;
+    c->statsDone = true;
+}
+
+/* The files a commit changed: kind is 'A' added, 'M' modified, 'D' deleted. Cheap - no diffing. */
+static int CommitFileList(Repo *r, int ci, char *kinds, const char **names)
+{
+    Commit *c = &r->commits[ci];
+    Commit *p = ci > 0 ? &r->commits[ci - 1] : NULL;
+    int n = 0;
+    for (int k = 0; k < c->fileCount; k++) {
+        int pk = p ? FindInCommit(p, c->names[k]) : -1;
+        if (pk >= 0 && p->blobs[pk] == c->blobs[k]) continue;
+        kinds[n] = pk < 0 ? 'A' : 'M';
+        names[n++] = c->names[k];
+    }
+    if (p) for (int k = 0; k < p->fileCount; k++)
+        if (FindInCommit(c, p->names[k]) < 0) { kinds[n] = 'D'; names[n++] = p->names[k]; }
+    return n;
+}
+
+/* Everything one user did on one day. */
+typedef struct { char kind; int repo, idx; long long time; } Activity;   /* kind: 'C' commit, 'I' issue */
+typedef struct { int repo, commits, issues, adds, dels; } RepoTally;
+
+#define MAX_ACTS 1024
+static Activity  acts[MAX_ACTS];
+static int       actCount, actTotal;                 /* stored / actually happened */
+static RepoTally tallies[MAX_REPOS];
+static int       tallyCount, dayCommits, dayIssues, dayAdds, dayDels, dayFiles;
+
+static void GatherDay(int uid, long long start)
+{
+    long long end = AddDays(start, 1);
+    actCount = actTotal = tallyCount = 0;
+    dayCommits = dayIssues = dayAdds = dayDels = dayFiles = 0;
+
+    for (int i = 0; i < repoCount; i++) {
+        Repo *r = &repos[i];
+        RepoTally t = {i, 0, 0, 0, 0};
+        for (int k = 0; k < r->commitCount; k++) {
+            Commit *c = &r->commits[k];
+            if (c->author != uid || c->time < start || c->time >= end) continue;
+            CommitStats(r, k);
+            t.commits++; t.adds += c->sAdds; t.dels += c->sDels;
+            dayFiles += c->sFiles;
+            if (actCount < MAX_ACTS) acts[actCount++] = (Activity){'C', i, k, c->time};
+            actTotal++;
+        }
+        for (int k = 0; k < r->issueCount; k++) {
+            Issue *is = &r->issues[k];
+            if (is->author != uid || is->time < start || is->time >= end) continue;
+            t.issues++;
+            if (actCount < MAX_ACTS) acts[actCount++] = (Activity){'I', i, k, is->time};
+            actTotal++;
+        }
+        if (t.commits || t.issues) {
+            tallies[tallyCount++] = t;
+            dayCommits += t.commits; dayIssues += t.issues;
+            dayAdds += t.adds;       dayDels += t.dels;
+        }
+    }
+    /* timeline: earliest first */
+    for (int a = 1; a < actCount; a++) {
+        Activity x = acts[a];
+        int b = a - 1;
+        while (b >= 0 && acts[b].time > x.time) { acts[b + 1] = acts[b]; b--; }
+        acts[b + 1] = x;
+    }
+    /* repositories: busiest first */
+    for (int a = 1; a < tallyCount; a++) {
+        RepoTally x = tallies[a];
+        int b = a - 1;
+        while (b >= 0 && tallies[b].commits + tallies[b].issues < x.commits + x.issues) { tallies[b + 1] = tallies[b]; b--; }
+        tallies[b + 1] = x;
+    }
+}
+
+/* "3 commits, 1 issue" */
+static const char *TallyText(int commits, int issues)
+{
+    static char b[104];
+    char c1[48], c2[48];
+    if (commits && issues) snprintf(b, sizeof b, "%s, %s", Count(c1, commits, "commit", "commits"), Count(c2, issues, "issue", "issues"));
+    else if (commits)      snprintf(b, sizeof b, "%s", Count(c1, commits, "commit", "commits"));
+    else                   snprintf(b, sizeof b, "%s", Count(c2, issues, "issue opened", "issues opened"));
+    return b;
+}
+
+/* Draws "+12 -4" in green and red. Returns the width used. */
+static int DrawAddsDels(int adds, int dels, int x, int y)
+{
+    const char *p = TextFormat("+%d", adds);
+    int w = MeasureText(p, FS);
+    DrawText(p, x, y, FS, UI_GREENT);
+    const char *m = TextFormat("-%d", dels);
+    DrawText(m, x + w + 10, y, FS, UI_REDT);
+    return w + 10 + MeasureText(m, FS);
+}
+
+/* The little pop-up shown when the mouse is over a day square. */
+static void DrawDayTooltip(long long day)
+{
+    GatherDay(curUser, day);
+
+    enum { MAXL = 12 };
+    char  text[MAXL][160];
+    Color col[MAXL];
+    int   addsDels[MAXL][2];     /* -1 = none; otherwise +adds -dels drawn after the text */
+    bool  bold[MAXL] = {0}, rule[MAXL] = {0};
+    int   linkLen[MAXL] = {0};   /* this many leading characters are a repository name, drawn in blue */
+    int   n = 0;
+    char  b1[48], b2[48];
+
+#define LINE(c) (addsDels[n][0] = -1, col[n] = (c), n++)
+    snprintf(text[n], 160, "%s", FormatDay(day, false)); bold[n] = true; LINE(UI_TEXT);
+    if (actTotal == 0) {
+        snprintf(text[n], 160, "No contributions"); LINE(UI_MUTED);
+    } else {
+        snprintf(text[n], 160, "%s in %s", Count(b1, actTotal, "contribution", "contributions"),
+                 Count(b2, tallyCount, "repository", "repositories"));
+        LINE(UI_TEXT);
+        if (dayCommits) {
+            snprintf(text[n], 160, "%s, %s changed   ", Count(b1, dayCommits, "commit", "commits"),
+                     Count(b2, dayFiles, "file", "files"));
+            addsDels[n][0] = dayAdds; addsDels[n][1] = dayDels; col[n] = UI_MUTED; n++;
+        }
+        if (dayIssues) { snprintf(text[n], 160, "%s", Count(b1, dayIssues, "issue opened", "issues opened")); LINE(UI_MUTED); }
+
+        rule[n] = true;
+        int shown = tallyCount < 5 ? tallyCount : 5;
+        for (int i = 0; i < shown; i++) {
+            RepoTally *t = &tallies[i];
+            const char *label = RepoLabel(t->repo);
+            snprintf(text[n], 160, "%s:  %s   ", label, TallyText(t->commits, t->issues));
+            linkLen[n] = (int)strlen(label);
+            col[n] = UI_MUTED;
+            addsDels[n][0] = t->commits ? t->adds : -1;
+            addsDels[n][1] = t->dels;
+            n++;
+        }
+        if (tallyCount > shown) {
+            snprintf(text[n], 160, "...and %s", Count(b1, tallyCount - shown, "more repository", "more repositories"));
+            LINE(UI_MUTED);
+        }
+    }
+    rule[n] = true;
+    snprintf(text[n], 160, "Click to see the whole day"); LINE(UI_MUTED);
+#undef LINE
+
+    /* size and place it next to the mouse, kept on screen */
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        int lw = MeasureText(text[i], FS);
+        if (addsDels[i][0] >= 0) lw += MeasureText(TextFormat("+%d -%d", addsDels[i][0], addsDels[i][1]), FS) + 10;
+        if (lw > w) w = lw;
+    }
+    int rules = 0;
+    for (int i = 0; i < n; i++) if (rule[i]) rules++;
+    int bw = w + 32, bh = n * 26 + rules * 10 + 22;
+    Vector2 m = GetMousePosition();
+    int x = (int)m.x + 18, y = (int)m.y + 22;
+    if (x + bw > W - 8) x = (int)m.x - 18 - bw;
+    if (x < 8) x = 8;
+    if (y + bh > H - 8) y = (int)m.y - 12 - bh;
+    if (y < 8) y = 8;
+
+    Rectangle box = {(float)x, (float)y, (float)bw, (float)bh};
+    DrawRectangleRounded((Rectangle){box.x + 3, box.y + 4, box.width, box.height}, 0.06f, 6, (Color){0, 0, 0, 120});
+    DrawRectangleRounded(box, 0.06f, 6, (Color){36, 41, 49, 255});
+    DrawRectangleRoundedLinesEx(box, 0.06f, 6, 1, UI_BORDER);
+
+    int ty = y + 12;
+    for (int i = 0; i < n; i++) {
+        if (rule[i]) { DrawLine(x + 12, ty + 3, x + bw - 12, ty + 3, UI_BORDER); ty += 10; }
+        if (bold[i]) DrawBold(text[i], x + 16, ty, FS, col[i]);
+        else         DrawText(text[i], x + 16, ty, FS, col[i]);
+        if (linkLen[i] > 0) {            /* redraw the name part in blue on a clean background */
+            int nw = MeasureText(Slice(text[i], linkLen[i]), FS);
+            DrawRectangle(x + 15, ty - 2, nw + 2, FS + 4, (Color){36, 41, 49, 255});
+            DrawText(Slice(text[i], linkLen[i]), x + 16, ty, FS, UI_LINK);
+        }
+        if (addsDels[i][0] >= 0) DrawAddsDels(addsDels[i][0], addsDels[i][1], x + 16 + MeasureText(text[i], FS), ty);
+        ty += 26;
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Navigation                                                         */
 /* ------------------------------------------------------------------ */
 static void Unfocus(void)
@@ -1335,9 +1614,18 @@ static void OpenAccount(void)
     screen = SCR_ACCOUNT;
 }
 
+static void OpenDay(long long day)
+{
+    Unfocus();
+    curDay = day;
+    scDay = scDayRepos = 0;
+    screen = SCR_DAY;
+}
+
 static void OpenRepo(int i)
 {
     Unfocus();
+    fromDay = false;
     curRepo = i;
     screen  = SCR_REPO;
     tab     = TAB_CODE;
@@ -1362,6 +1650,7 @@ static void OpenCommit(int ci)
 {
     Unfocus();
     curCommit = ci;
+    fromDay = false;
     screen = SCR_COMMIT;
     BuildChanges(&repos[curRepo], ci);
     scChanges = 0;
@@ -1532,36 +1821,56 @@ static Color Heat(int c)
     return             (Color){ 57, 211,  83, 255};
 }
 
-/* Squares for the last 26 weeks, coloured by how many commits uid made that day. */
-static void DrawContributions(Rectangle area, int uid)
+/* Squares for the last 26 weeks, coloured by how many contributions uid made that day.
+   Hovering a square sets *hoverDay; clicking one opens that day's page. */
+static void DrawContributions(Rectangle area, int uid, long long *hoverDay)
 {
     enum { WEEKS = 26 };
     int counts[WEEKS * 7] = {0}, total = 0;
-    time_t now = time(NULL);
-    struct tm lt = *localtime(&now);
-    int wd = lt.tm_wday;
-    lt.tm_hour = lt.tm_min = lt.tm_sec = 0;
-    time_t midnight = mktime(&lt);
+    long long today = DayStart((long long)time(NULL));
+    time_t tt = (time_t)today;
+    int wd = localtime(&tt)->tm_wday;                 /* 0 = Sunday: rows run Sunday to Saturday */
     int todayPos = (WEEKS - 1) * 7 + wd;
 
-    for (int i = 0; i < repoCount; i++)
-        for (int k = 0; k < repos[i].commitCount; k++) {
-            if (repos[i].commits[k].author != uid) continue;
-            long long t = repos[i].commits[k].time;
-            int daysAgo = t >= (long long)midnight ? 0 : (int)(((long long)midnight - t - 1) / 86400) + 1;
-            int pos = todayPos - daysAgo;
-            if (pos >= 0) { counts[pos]++; total++; }
+    for (int i = 0; i < repoCount; i++) {
+        Repo *r = &repos[i];
+        for (int k = 0; k < r->commitCount + r->issueCount; k++) {
+            bool isCommit = k < r->commitCount;
+            int author    = isCommit ? r->commits[k].author : r->issues[k - r->commitCount].author;
+            long long t   = isCommit ? r->commits[k].time   : r->issues[k - r->commitCount].time;
+            if (author != uid) continue;
+            int pos = todayPos - DaysBetween(DayStart(t), today);
+            if (pos >= 0 && pos <= todayPos) { counts[pos]++; total++; }
         }
+    }
 
     DrawRectangleRec(area, UI_PANEL);
     DrawRectangleLinesEx(area, 1, UI_BORDER);
     DrawText(TextFormat("%d contribution%s in the last 6 months", total, total == 1 ? "" : "s"),
              (int)area.x + 16, (int)area.y + 12, FS, UI_TEXT);
+    const char *hint = "Hover a day for details, click it for the full list";
+    int titleW = MeasureText(TextFormat("%d contribution%s in the last 6 months", total, total == 1 ? "" : "s"), FS);
+    if (area.width > titleW + MeasureText(hint, FS) + 60)
+        DrawText(hint, (int)(area.x + area.width) - 16 - MeasureText(hint, FS), (int)area.y + 12, FS, UI_MUTED);
+
+    int hovered = -1;
     for (int pos = 0; pos <= todayPos; pos++) {
         int col = pos / 7, row = pos % 7;
         Rectangle cell = {area.x + 16 + col * 15, area.y + 44 + row * 15, 12, 12};
+        Rectangle hit  = {cell.x - 1, cell.y - 1, 15, 15};     /* no gaps between hover areas */
         DrawRectangleRounded(cell, 0.3f, 4, Heat(counts[pos]));
+        if (Hover(hit)) hovered = pos;
     }
+    if (hovered >= 0) {
+        int col = hovered / 7, row = hovered % 7;
+        Rectangle cell = {area.x + 16 + col * 15, area.y + 44 + row * 15, 12, 12};
+        DrawRectangleRoundedLinesEx((Rectangle){cell.x - 1, cell.y - 1, 14, 14}, 0.3f, 4, 2, UI_TEXT);
+        wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        long long day = AddDays(today, hovered - todayPos);
+        *hoverDay = day;
+        if (Clicked((Rectangle){cell.x - 1, cell.y - 1, 15, 15})) OpenDay(day);
+    }
+
     int lx = (int)(area.x + area.width) - 200, ly = (int)(area.y + area.height) - 30;
     DrawText("Less", lx, ly, FS, UI_MUTED);
     for (int i = 0; i < 5; i++)
@@ -1727,7 +2036,9 @@ static void ScreenHome(void)
 
     /* main column */
     float mx = 320, mw = (float)W - 340;
-    DrawContributions((Rectangle){mx, 72, mw, 160}, curUser);
+    long long hoverDay = 0;
+    DrawContributions((Rectangle){mx, 72, mw, 160}, curUser, &hoverDay);
+    if (screen != SCR_HOME) return;                 /* a day was clicked */
 
     if (ButtonEx((Rectangle){mx, 248, 100, 40}, "Yours", homeView == 0 ? UI_BLUE : UI_BTN, true))       { homeView = 0; scHome = 0; }
     if (ButtonEx((Rectangle){mx + 106, 248, 120, 40}, "Everyone", homeView == 1 ? UI_BLUE : UI_BTN, true)) { homeView = 1; scHome = 0; }
@@ -1795,6 +2106,8 @@ static void ScreenHome(void)
     }
     EndScissorMode();
     DrawScrollbar(la, scHome, n * rowH - 10);
+
+    if (hoverDay) DrawDayTooltip(hoverDay);          /* last, so it sits on top of everything */
 }
 
 static void TryCreateRepo(void)
@@ -2167,7 +2480,12 @@ static void ScreenCommit(Repo *r)
 {
     Commit *c = &r->commits[curCommit];
 
-    if (Button((Rectangle){20, 186, 170, 38}, "< All commits", UI_BTN)) { Unfocus(); screen = SCR_REPO; tab = TAB_COMMITS; return; }
+    if (Button((Rectangle){20, 186, 170, 38}, fromDay ? "< Back to day" : "< All commits", UI_BTN)) {
+        Unfocus();
+        if (fromDay) screen = SCR_DAY;
+        else { screen = SCR_REPO; tab = TAB_COMMITS; }
+        return;
+    }
     if (IsMine(r) &&
         ConfirmButton((Rectangle){(float)W - 330, 186, 310, 38}, "Restore files from here", "Click again to confirm", 2)) {
         RestoreCommit(r, curCommit);
@@ -2234,6 +2552,163 @@ static void ScreenCommit(Repo *r)
     DrawDiff((Rectangle){rp.x, rp.y + 42, rp.width, rp.height - 42});
 }
 
+/* ---------------- one day of contributions ---------------- */
+static void ScreenDay(void)
+{
+    long long today = DayStart((long long)time(NULL));
+
+    if (Button((Rectangle){20, 72, 110, 38}, "< Back", UI_BTN)) { GoHome(); return; }
+    if (Button((Rectangle){(float)W - 380, 72, 175, 38}, "< Earlier day", UI_BTN)) { curDay = AddDays(curDay, -1); scDay = scDayRepos = 0; }
+    bool canLater = curDay < today;
+    if (ButtonEx((Rectangle){(float)W - 195, 72, 175, 38}, "Later day >", canLater ? UI_BTN : UI_PANEL, canLater)) {
+        curDay = AddDays(curDay, 1);
+        scDay = scDayRepos = 0;
+    }
+
+    char title[96];
+    snprintf(title, sizeof title, "%s%s", FormatDay(curDay, true), curDay == today ? "  (today)" : "");
+    DrawFit(title, 150, 75, 30, W - 560, UI_TEXT);
+
+    GatherDay(curUser, curDay);
+
+    /* one-line summary */
+    char b1[48], b2[48];
+    int sy = 124;
+    if (actTotal == 0) {
+        DrawText("You didn't make any commits or open any issues on this day.", 20, sy, FS, UI_MUTED);
+    } else {
+        const char *s = TextFormat("%s in %s   |   ", Count(b1, actTotal, "contribution", "contributions"),
+                                   Count(b2, tallyCount, "repository", "repositories"));
+        DrawText(s, 20, sy, FS, UI_TEXT);
+        int x = 20 + MeasureText(s, FS);
+        s = TextFormat("%s, %s changed   ", Count(b1, dayCommits, "commit", "commits"), Count(b2, dayFiles, "file", "files"));
+        DrawText(s, x, sy, FS, UI_MUTED);
+        x += MeasureText(s, FS);
+        x += DrawAddsDels(dayAdds, dayDels, x, sy);
+        if (dayIssues) DrawText(TextFormat("   |   %s", Count(b1, dayIssues, "issue opened", "issues opened")), x, sy, FS, UI_MUTED);
+    }
+    DrawLine(0, 160, W, 160, UI_BORDER);
+
+    float top = 176, bottom = (float)H - 20;
+
+    /* ---- left: breakdown by repository ---- */
+    Rectangle lp = {20, top, 300, bottom - top};
+    DrawRectangleRec(lp, UI_PANEL);
+    DrawRectangleLinesEx(lp, 1, UI_BORDER);
+    DrawBold("By repository", (int)lp.x + 14, (int)top + 12, FS, UI_TEXT);
+    Rectangle la = {lp.x + 1, top + 44, lp.width - 2, lp.height - 46};
+    float rh = 84;
+    ScrollArea(la, &scDayRepos, tallyCount * rh);
+    if (!tallyCount) DrawText("Nothing here", (int)la.x + 14, (int)la.y + 6, FS, UI_MUTED);
+    BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
+    for (int i = 0; i < tallyCount; i++) {
+        RepoTally *t = &tallies[i];
+        Rectangle row = {la.x, la.y + i * rh - scDayRepos, la.width, rh};
+        bool hot = Hover(la) && Hover(row);
+        if (hot) { DrawRectangleRec(row, UI_HOVER); wantCursor = MOUSE_CURSOR_POINTING_HAND; }
+        if (i) DrawLine((int)row.x + 12, (int)row.y, (int)(row.x + row.width - 12), (int)row.y, UI_BORDER);
+        DrawFit(RepoLabel(t->repo), (int)row.x + 14, (int)row.y + 10, FS, (int)row.width - 28, UI_LINK);
+        DrawText(TallyText(t->commits, t->issues), (int)row.x + 14, (int)row.y + 34, FS, UI_MUTED);
+        if (t->commits) DrawAddsDels(t->adds, t->dels, (int)row.x + 14, (int)row.y + 56);
+        if (Hover(la) && Clicked(row)) { OpenRepo(t->repo); EndScissorMode(); return; }
+    }
+    EndScissorMode();
+    DrawScrollbar(la, scDayRepos, tallyCount * rh);
+
+    /* ---- right: every contribution, in the order it happened ---- */
+    Rectangle ra = {340, top, (float)W - 360, bottom - top};
+    if (actTotal == 0) {
+        DrawRectangleRec(ra, UI_PANEL);
+        DrawRectangleLinesEx(ra, 1, UI_BORDER);
+        const char *m = "Use the buttons at the top to look at other days.";
+        DrawText(m, (int)(ra.x + ra.width / 2) - MeasureText(m, FS) / 2, (int)(ra.y + ra.height / 2) - 10, FS, UI_MUTED);
+        return;
+    }
+
+    /* work out each card's height first, so the list can scroll */
+    static float cardY[MAX_ACTS], cardH[MAX_ACTS];
+    static char        kinds[MAX_FILES * 2];
+    static const char *names[MAX_FILES * 2];
+    float total = 0;
+    for (int i = 0; i < actCount; i++) {
+        Activity *a = &acts[i];
+        int nf = a->kind == 'C' ? CommitFileList(&repos[a->repo], a->idx, kinds, names) : 0;
+        cardY[i] = total;
+        cardH[i] = 76 + (nf ? nf * 24 + 8 : 0);
+        total += cardH[i] + 10;
+    }
+    float extra = actCount < actTotal ? 40 : 0;
+    ScrollArea(ra, &scDay, total + extra);
+
+    BeginScissorMode((int)ra.x, (int)ra.y, (int)ra.width, (int)ra.height);
+    for (int i = 0; i < actCount; i++) {
+        Activity *a = &acts[i];
+        Repo *r = &repos[a->repo];
+        Rectangle card = {ra.x, ra.y + cardY[i] - scDay, ra.width - 12, cardH[i]};
+        if (card.y > ra.y + ra.height || card.y + card.height < ra.y) continue;
+        bool hot = Hover(ra) && Hover(card);
+        if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        DrawRectangleRec(card, hot ? UI_HOVER : UI_PANEL);
+        DrawRectangleLinesEx(card, 1, UI_BORDER);
+
+        /* left column: time and what kind of thing it was */
+        char hm[16];
+        time_t tt = (time_t)a->time;
+        strftime(hm, sizeof hm, "%H:%M", localtime(&tt));
+        DrawText(hm, (int)card.x + 18, (int)card.y + 12, FS, UI_MUTED);
+        Rectangle pill = {card.x + 14, card.y + 40, 82, 26};
+        const char *kind = a->kind == 'C' ? "Commit" : "Issue";
+        DrawRectangleRounded(pill, 0.5f, 6, a->kind == 'C' ? UI_GREEN : UI_PURPLE);
+        DrawText(kind, (int)(pill.x + pill.width / 2) - MeasureText(kind, FS) / 2, (int)pill.y + 3, FS, UI_TEXT);
+
+        int cx = (int)card.x + 116, cw = (int)card.width - 132;
+        if (a->kind == 'C') {
+            Commit *c = &r->commits[a->idx];
+            CommitStats(r, a->idx);
+            DrawFit(c->message, cx, (int)card.y + 12, FS, cw, UI_TEXT);
+            const char *meta = TextFormat("%s   |   commit %s   |   %d file%s changed   ",
+                                          RepoLabel(a->repo), c->id, c->sFiles, c->sFiles == 1 ? "" : "s");
+            DrawText(meta, cx, (int)card.y + 42, FS, UI_MUTED);
+            DrawAddsDels(c->sAdds, c->sDels, cx + MeasureText(meta, FS), (int)card.y + 42);
+
+            int nf = CommitFileList(r, a->idx, kinds, names);
+            for (int f = 0; f < nf; f++) {
+                int fy = (int)card.y + 76 + f * 24;
+                char k[2] = {kinds[f], 0};
+                Color kc = kinds[f] == 'A' ? UI_GREENT : kinds[f] == 'D' ? UI_REDT : UI_YELLOW;
+                DrawText(k, cx, fy, FS, kc);
+                DrawFit(names[f], cx + 24, fy, FS, cw - 24, UI_TEXT);
+            }
+            if (Hover(ra) && Clicked(card)) {
+                int repo = a->repo, ci = a->idx;
+                EndScissorMode();
+                OpenRepo(repo);
+                tab = TAB_COMMITS;
+                OpenCommit(ci);
+                fromDay = true;
+                return;
+            }
+        } else {
+            Issue *is = &r->issues[a->idx];
+            DrawFit(is->title, cx, (int)card.y + 12, FS, cw, UI_TEXT);
+            DrawText(TextFormat("%s   |   opened issue #%d   |   %s", RepoLabel(a->repo), a->idx + 1,
+                                is->open ? "still open" : "now closed"),
+                     cx, (int)card.y + 42, FS, UI_MUTED);
+            if (Hover(ra) && Clicked(card)) {
+                int repo = a->repo;
+                EndScissorMode();
+                OpenRepo(repo);
+                tab = TAB_ISSUES;
+                return;
+            }
+        }
+    }
+    if (extra > 0)
+        DrawText(TextFormat("...and %d more not shown", actTotal - actCount), (int)ra.x + 4, (int)(ra.y + total - scDay + 8), FS, UI_MUTED);
+    EndScissorMode();
+    DrawScrollbar(ra, scDay, total + extra);
+}
+
 static void DrawToast(void)
 {
     if (toastT <= 0) return;
@@ -2283,7 +2758,8 @@ int main(void)
                             tfPass.active || tfPass2.active || tfOldPass.active || tfNewPass.active ||
                             tfNewPass2.active || tfDelPass.active;
             if (anyFocus) Unfocus();
-            else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT) GoHome();
+            else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT || screen == SCR_DAY) GoHome();
+            else if (screen == SCR_COMMIT && fromDay) screen = SCR_DAY;
             else if (screen == SCR_COMMIT) { screen = SCR_REPO; tab = TAB_COMMITS; }
         }
 
@@ -2295,6 +2771,7 @@ int main(void)
         case SCR_LOGIN:    ScreenLogin();    break;
         case SCR_REGISTER: ScreenRegister(); break;
         case SCR_ACCOUNT:  ScreenAccount();  break;
+        case SCR_DAY:      ScreenDay();      break;
         case SCR_HOME:     ScreenHome();     break;
         case SCR_NEW:      ScreenNew();      break;
         case SCR_REPO: {
