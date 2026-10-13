@@ -5,12 +5,19 @@
  *
  *   - User accounts: sign up, sign in, sign out, change password, delete account.
  *     Passwords are never stored - only a salted PBKDF2-SHA256 hash of them.
+ *   - Password boxes have an "eye" button to show / hide what you typed.
+ *   - Forgot your password? Each account gets a one-time recovery code
+ *     (shown when you sign up, or made in Account settings). Enter it on the
+ *     "Forgot password?" screen to choose a new password.
  *   - Repositories belong to a user: create, star and delete your own
  *   - Browse everyone's repositories (read-only unless they're yours)
  *   - A built-in text editor for the files in your repositories
  *   - Commits: a snapshot of every file, saved with a message and an author
  *   - Commit history and line-by-line diffs (what was added / removed)
  *   - Issues: anyone can open one; the repo owner or the issue's author can close it
+ *   - Profiles: a picture (PNG or JPG, dragged onto the window or by file path), a short
+ *     bio, a circle colour, and a choice of animated themes (Classic is the plain look)
+ *   - A People page and a profile page for every user
  *   - A contribution graph of the last six months: hover a day to see what you
  *     did, click it to open a page listing every commit and issue from that day
  *
@@ -21,6 +28,12 @@
  * Language: C99    Library: raylib 5.x    One file, nothing else needed.
  */
 
+/* On Windows, rand_s() gives cryptographically secure random numbers.
+   This must be defined before <stdlib.h> is included. */
+#ifdef _WIN32
+#define _CRT_RAND_S
+#endif
+
 #include "raylib.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +41,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <time.h>
+#include <math.h>
 
 /* ------------------------------------------------------------------ */
 /* Limits                                                             */
@@ -43,6 +57,7 @@
 #define MAX_DIFF     1500
 #define SAVE_FILE    "minigithub.dat"
 
+#define BIO_LEN      150     /* longest bio allowed                           */
 #define MIN_PASS     8       /* shortest password allowed                     */
 #define PBKDF2_ITER  60000   /* hashing rounds: makes password guessing slow   */
 
@@ -52,9 +67,10 @@
 /* ------------------------------------------------------------------ */
 /* Colours (GitHub's dark theme)                                       */
 /* ------------------------------------------------------------------ */
-static const Color UI_BG     = { 13,  17,  23, 255};
-static const Color UI_PANEL  = { 22,  27,  34, 255};
-static const Color UI_HOVER  = { 30,  36,  44, 255};
+static const Color UI_BASE   = { 13,  17,  23, 255};    /* the window background, always solid */
+static Color       UI_BG     = { 13,  17,  23, 255};    /* these three turn slightly see-through */
+static Color       UI_PANEL  = { 22,  27,  34, 255};    /* when a theme is showing behind them   */
+static Color       UI_HOVER  = { 30,  36,  44, 255};
 static const Color UI_BORDER = { 48,  54,  61, 255};
 static const Color UI_TEXT   = {230, 237, 243, 255};
 static const Color UI_MUTED  = {125, 133, 144, 255};
@@ -80,7 +96,15 @@ typedef struct {
     char      name[NAME_LEN];
     char      salt[33];              /* 16 random bytes as hex            */
     char      hash[65];              /* 32-byte PBKDF2 result as hex      */
+    char      rsalt[33];             /* recovery code: salt and hash,     */
+    char      rhash[65];             /* stored like the password ("" = none) */
     long long created;
+    char      bio[TEXT_LEN];
+    int       theme;                 /* one of THEME_...                  */
+    int       avatarColor;           /* 0 = automatic, 1..8 = chosen      */
+    char     *avatar;                /* profile picture: PNG as base64 text, or NULL */
+    Texture2D tex;                   /* the picture loaded for drawing (not saved)   */
+    int       texState;              /* 0 not loaded yet, 1 loaded, -1 broken        */
 } User;
 
 /* A blob is one unique version of a file's contents. Identical
@@ -128,17 +152,17 @@ static int  repoCount = 0;
 /* ------------------------------------------------------------------ */
 /* App state                                                          */
 /* ------------------------------------------------------------------ */
-typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_HOME, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY } Screen;
+typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_FORGOT, SCR_RECOVERY, SCR_HOME, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY, SCR_PROFILE, SCR_PEOPLE } Screen;
 typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES } Tab;
 
-typedef struct { char buf[TEXT_LEN]; int len; bool active; bool secret; } TextField;
+typedef struct { char buf[TEXT_LEN]; int len; bool active; bool secret; bool reveal; } TextField;
 typedef struct { int cursor; float scrollY, scrollX; bool focused; } EditorState;
 
 static Screen screen = SCR_LOGIN;
 static Tab    tab    = TAB_CODE;
 static int    curRepo = -1, curFile = -1, curCommit = -1, curChange = -1;
 
-static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser;
+static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode;
 static TextField tfPass    = {.secret = true}, tfPass2    = {.secret = true};
 static TextField tfOldPass = {.secret = true}, tfNewPass  = {.secret = true};
 static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
@@ -146,6 +170,13 @@ static EditorState ed;
 static bool  optReadme = true, optExample = true;
 static int   homeView;                /* 0 = your repositories, 1 = everyone's */
 static float scHome, scFiles, scCommits, scIssues, scChanges, scDiff, scDay, scDayRepos;
+static char  shownCode[24];           /* recovery code on screen right now (never saved) */
+static bool  codeAfterReset;          /* the code screen was reached by resetting a password */
+static float scProfile, scPeople, scSettings;
+static int   viewUser = -1;           /* whose profile page is open             */
+static int   dayUser  = -1;           /* whose contributions the day page shows */
+static int   settingsTab;             /* 0 = profile, 1 = password & account    */
+static Color uiAccent = {247, 129, 102, 255};   /* the signed-in user's theme colour */
 static long long curDay;              /* midnight at the start of the day being viewed      */
 static bool  fromDay;                 /* commit page was opened from a day page: go back there */
 static int   failedLogins;
@@ -511,6 +542,8 @@ static void DeleteAccount(int uid)
     for (int i = 0; i < repoCount; i++) RemoveStar(&repos[i], uid);
     for (int i = 0; i < userCount; i++)
         if (users[i].id == uid) {
+            if (users[i].texState == 1) UnloadTexture(users[i].tex);
+            free(users[i].avatar);
             memmove(&users[i], &users[i + 1], (size_t)(userCount - i - 1) * sizeof(User));
             userCount--;
             memset(&users[userCount], 0, sizeof(User));
@@ -651,6 +684,15 @@ static void FromHex(const char *in, uint8_t *out, int n)
    is one (Linux / macOS), otherwise a mix of clocks and raylib's generator. */
 static void RandomBytes(uint8_t *out, int n)
 {
+#ifdef _WIN32
+    bool good = true;
+    for (int i = 0; i < n && good; i++) {
+        unsigned int v;
+        if (rand_s(&v) != 0) good = false;
+        else out[i] = (uint8_t)v;
+    }
+    if (good) return;
+#endif
     FILE *f = fopen("/dev/urandom", "rb");
     if (f) {
         size_t got = fread(out, 1, (size_t)n, f);
@@ -694,6 +736,63 @@ static bool CheckPassword(User *u, const char *pass)
     for (int i = 0; i < 64; i++) diff |= (unsigned)(h[i] ^ u->hash[i]);
     return diff == 0;
 }
+
+/* ------------------------------------------------------------------ */
+/* Recovery codes ("forgot password")                                 */
+/*                                                                    */
+/* There's no email on a local app, so instead every account can have */
+/* a recovery code like  K7QM-2XWD-9PRT-H4NC . It is shown once, and   */
+/* only its hash is saved - exactly like the password. Using it to    */
+/* reset the password uses it up, and a fresh one is shown.           */
+/* ------------------------------------------------------------------ */
+#define CODE_CHARS 16
+/* 32 letters/digits with the easily confused ones (0 O 1 I) left out */
+static const char CODE_ALPHABET[] = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/* Keep only letters and digits, in capitals, so "k7qm 2xwd-..." still works.
+   Returns how many characters were kept. */
+static int NormalizeCode(const char *in, char out[CODE_CHARS + 1])
+{
+    int n = 0;
+    for (int i = 0; in[i]; i++) {
+        if (!isalnum((unsigned char)in[i])) continue;
+        if (n == CODE_CHARS) return CODE_CHARS + 1;          /* too long */
+        out[n++] = (char)toupper((unsigned char)in[i]);
+    }
+    out[n] = 0;
+    return n;
+}
+
+static bool HasRecoveryCode(User *u) { return u->rhash[0] != 0; }
+
+/* Makes a new code for u (the old one stops working) and writes the
+   readable "XXXX-XXXX-XXXX-XXXX" form into shown. */
+static void NewRecoveryCode(User *u, char shown[24])
+{
+    uint8_t rnd[CODE_CHARS], salt[16];
+    char plain[CODE_CHARS + 1];
+    RandomBytes(rnd, CODE_CHARS);
+    for (int i = 0; i < CODE_CHARS; i++) plain[i] = CODE_ALPHABET[rnd[i] % 32];   /* 256 % 32 == 0: no bias */
+    plain[CODE_CHARS] = 0;
+    snprintf(shown, 24, "%.4s-%.4s-%.4s-%.4s", plain, plain + 4, plain + 8, plain + 12);
+
+    RandomBytes(salt, 16);
+    ToHex(salt, 16, u->rsalt);
+    HashPassword(plain, u->rsalt, u->rhash);
+    memset(plain, 0, sizeof plain);
+    memset(rnd, 0, sizeof rnd);
+}
+
+static bool CheckRecoveryCode(User *u, const char *typed)
+{
+    char norm[CODE_CHARS + 1], h[65];
+    if (!HasRecoveryCode(u) || NormalizeCode(typed, norm) != CODE_CHARS) return false;
+    HashPassword(norm, u->rsalt, h);
+    unsigned diff = 0;
+    for (int i = 0; i < 64; i++) diff |= (unsigned)(h[i] ^ u->rhash[i]);
+    return diff == 0;
+}
+
 
 /* ------------------------------------------------------------------ */
 /* Diff: which lines were added, removed or kept                       */
@@ -783,6 +882,280 @@ static void BuildChanges(Repo *r, int ci)
 }
 
 /* ------------------------------------------------------------------ */
+/* Themes                                                             */
+/*                                                                    */
+/* Each theme is drawn with simple shapes every frame, so it can move. */
+/* "Random" positions come from a hash of the item's number, so they   */
+/* are the same every frame (things don't jump around).               */
+/* ------------------------------------------------------------------ */
+enum { THEME_CLASSIC, THEME_CODE, THEME_GARDEN, THEME_NIGHT, THEME_CIRCUIT, THEME_OCEAN, THEME_AUTUMN, THEME_COUNT };
+
+typedef struct { const char *name, *blurb; Color accent; } ThemeInfo;
+static const ThemeInfo THEMES[THEME_COUNT] = {
+    {"Classic",       "Plain and dark",       {247, 129, 102, 255}},
+    {"Code rain",     "Falling green code",                 { 63, 185,  80, 255}},
+    {"Flower garden", "Flowers and petals", {255, 143, 171, 255}},
+    {"Night sky",     "Stars and a moon", {200, 170, 255, 255}},
+    {"Circuit board", "Glowing circuits",           { 45, 212, 191, 255}},
+    {"Ocean",         "Waves and bubbles",          { 88, 166, 255, 255}},
+    {"Autumn",        "Falling leaves",                     {230, 126,  34, 255}},
+};
+
+/* A repeatable "random" number from 0 to 1 for item a, property b. */
+static float Rnd(int a, int b)
+{
+    uint32_t h = (uint32_t)a * 374761393u + (uint32_t)b * 668265263u + 0x9e3779b9u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return (float)(h & 0xFFFFFF) / 16777216.0f;
+}
+
+static Color Alpha(Color c, float a)
+{
+    if (a < 0) a = 0;
+    if (a > 1) a = 1;
+    c.a = (unsigned char)(c.a * a);
+    return c;
+}
+
+/* Colour fades drawn as thin strips. (raylib has functions for this, but their
+   arguments have changed between raylib versions, so these work with any of them.) */
+static Color Mix(Color a, Color b, float t)
+{
+    return (Color){(unsigned char)(a.r + (b.r - a.r) * t), (unsigned char)(a.g + (b.g - a.g) * t),
+                   (unsigned char)(a.b + (b.b - a.b) * t), (unsigned char)(a.a + (b.a - a.a) * t)};
+}
+static void GradientV(int x, int y, int w, int h, Color top, Color bottom)
+{
+    for (int i = 0; i < h; i += 4) DrawRectangle(x, y + i, w, h - i < 4 ? h - i : 4, Mix(top, bottom, h > 1 ? (float)i / (h - 1) : 0));
+}
+static void GradientH(int x, int y, int w, int h, Color left, Color right)
+{
+    for (int i = 0; i < w; i += 4) DrawRectangle(x + i, y, w - i < 4 ? w - i : 4, h, Mix(left, right, w > 1 ? (float)i / (w - 1) : 0));
+}
+
+/* raylib only fills triangles whose corners go anticlockwise on screen, so fix the order. */
+static void Tri(Vector2 a, Vector2 b, Vector2 c, Color col)
+{
+    float cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+    if (cross > 0) DrawTriangle(a, c, b, col);
+    else           DrawTriangle(a, b, c, col);
+}
+
+static int ItemCount(Rectangle r, float areaPer, int cap)
+{
+    int n = (int)(r.width * r.height / areaPer);
+    return n < 6 ? 6 : n > cap ? cap : n;
+}
+
+static void ThemeCode(Rectangle r, float t, float k)
+{
+    static const char glyphs[] = "01{}[]()<>=+-*/;:#&|!?$%^~ifelsfnvarint";
+    int ng = (int)sizeof glyphs - 1, cols = (int)(r.width / 20) + 1;
+    DrawRectangleRec(r, Alpha((Color){0, 30, 10, 255}, 0.35f * k));
+    for (int c = 0; c < cols; c++) {
+        float speed = 50 + Rnd(c, 1) * 110, len = 6 + Rnd(c, 2) * 16, period = r.height + len * 20 + 200;
+        float head = fmodf(t * speed + Rnd(c, 3) * period, period) - 100;
+        for (int i = 0; i < (int)len; i++) {
+            float y = head - i * 20;
+            if (y < -20 || y > r.height) continue;
+            int cell = (int)floorf((y + 10000) / 20);
+            int g = (int)(Rnd(c * 977 + cell, (int)(t * 1.5f + Rnd(c, cell) * 20)) * ng) % ng;
+            char s[2] = {glyphs[g], 0};
+            float a = (1.0f - (float)i / len) * 0.75f * k;
+            Color col = i == 0 ? (Color){200, 255, 210, 255} : (Color){40, 200, 90, 255};
+            DrawText(s, (int)(r.x + c * 20 + 4), (int)(r.y + y), 18, Alpha(col, a));
+        }
+    }
+}
+
+static void Flower(Vector2 p, float s, float rot, Color petal, float a)
+{
+    for (int i = 0; i < 5; i++) {
+        float ang = rot + i * 72 * DEG2RAD;
+        Vector2 q = {p.x + cosf(ang) * s * 0.85f, p.y + sinf(ang) * s * 0.85f};
+        DrawCircleV(q, s * 0.6f, Alpha(petal, a));
+    }
+    DrawCircleV(p, s * 0.42f, Alpha((Color){255, 214, 102, 255}, a * 1.2f));
+    DrawCircleV(p, s * 0.2f, Alpha((Color){180, 110, 40, 255}, a));
+}
+
+static void ThemeGarden(Rectangle r, float t, float k)
+{
+    static const Color pal[5] = {{255, 143, 171, 255}, {196, 160, 255, 255}, {255, 190, 140, 255},
+                                 {240, 240, 250, 255}, {255, 214, 102, 255}};
+    GradientV((int)r.x, (int)r.y, (int)r.width, (int)r.height,
+                           Alpha((Color){40, 20, 50, 255}, 0.3f * k), Alpha((Color){20, 60, 35, 255}, 0.45f * k));
+    int n = ItemCount(r, 9000, 220);
+    for (int i = 0; i < n; i++) {
+        Vector2 p = {r.x + Rnd(i, 1) * r.width, r.y + Rnd(i, 2) * r.height};
+        float s = 5 + Rnd(i, 3) * 9;
+        float sway = sinf(t * 0.9f + Rnd(i, 4) * 6.28f) * 10 * DEG2RAD;
+        DrawEllipse((int)(p.x - s * 1.3f), (int)(p.y + s * 1.1f), s * 0.9f, s * 0.35f, Alpha((Color){70, 160, 90, 255}, 0.5f * k));
+        Flower(p, s, Rnd(i, 5) * 6.28f + sway, pal[(int)(Rnd(i, 6) * 5) % 5], 0.85f * k);
+    }
+    for (int i = 0; i < 30; i++) {                     /* petals drifting in the breeze */
+        float x = r.x + fmodf(Rnd(i, 11) * r.width + t * (20 + Rnd(i, 12) * 25), r.width);
+        float y = r.y + fmodf(Rnd(i, 13) * r.height + t * (25 + Rnd(i, 14) * 20), r.height) + sinf(t + i) * 6;
+        DrawEllipse((int)x, (int)y, 4, 2.5f, Alpha(pal[i % 3], 0.6f * k));
+    }
+}
+
+static void ThemeNight(Rectangle r, float t, float k)
+{
+    GradientV((int)r.x, (int)r.y, (int)r.width, (int)r.height,
+                           Alpha((Color){10, 20, 60, 255}, 0.75f * k), Alpha((Color){50, 25, 80, 255}, 0.5f * k));
+    int n = ItemCount(r, 2200, 650);
+    for (int i = 0; i < n; i++) {
+        Vector2 p = {r.x + Rnd(i, 1) * r.width, r.y + Rnd(i, 2) * r.height};
+        float tw = 0.35f + 0.65f * (0.5f + 0.5f * sinf(t * (0.8f + Rnd(i, 3) * 2.5f) + Rnd(i, 4) * 6.28f));
+        float s = 0.8f + Rnd(i, 5) * 1.6f;
+        Color c = Rnd(i, 6) < 0.7f ? (Color){255, 255, 255, 255} : Rnd(i, 6) < 0.85f ? (Color){180, 200, 255, 255}
+                                                                                      : (Color){255, 230, 170, 255};
+        DrawCircleV(p, s, Alpha(c, tw * k));
+        if (s > 2.1f) DrawCircleV(p, s * 3, Alpha(c, tw * 0.12f * k));
+    }
+    /* crescent moon */
+    float mr = r.height < 300 ? 26 : 34;
+    Vector2 m = {r.x + r.width * 0.84f, r.y + (r.height < 300 ? r.height * 0.4f : 90)};
+    for (int g = 8; g >= 1; g--)                       /* soft glow: faint circles, smaller ones on top */
+        DrawCircleV(m, mr * (1.0f + 0.19f * g), Alpha((Color){255, 245, 200, 255}, 0.03f * k));
+    /* the crescent: the moon's disc minus a slightly smaller disc shifted up and right,
+       filled in one thin horizontal line at a time */
+    {
+        Color mc = Alpha((Color){250, 240, 205, 255}, 0.95f * k);
+        float ox = mr * 0.45f, oy = -mr * 0.25f, rb = mr * 0.9f;
+        for (float y = -mr; y < mr; y += 1) {
+            float yc = y + 0.5f, sa = sqrtf(mr * mr - yc * yc);
+            float dy = yc - oy;
+            if (fabsf(dy) >= rb) { DrawRectangleRec((Rectangle){m.x - sa, m.y + y, sa * 2, 1}, mc); continue; }
+            float sb = sqrtf(rb * rb - dy * dy), b0 = ox - sb, b1 = ox + sb;
+            if (b0 > -sa) DrawRectangleRec((Rectangle){m.x - sa, m.y + y, (b0 < sa ? b0 : sa) + sa, 1}, mc);
+            if (b1 < sa)  DrawRectangleRec((Rectangle){m.x + (b1 > -sa ? b1 : -sa), m.y + y, sa - (b1 > -sa ? b1 : -sa), 1}, mc);
+        }
+    }
+    /* a shooting star every 7 seconds */
+    int cyc = (int)(t / 7);
+    float ph = fmodf(t, 7);
+    if (ph < 0.9f) {
+        Vector2 s0 = {r.x + (0.3f + Rnd(cyc, 1) * 0.6f) * r.width, r.y + Rnd(cyc, 2) * r.height * 0.5f};
+        Vector2 dir = {-0.9f, 0.43f};
+        Vector2 head = {s0.x + dir.x * ph * 520, s0.y + dir.y * ph * 520};
+        Vector2 tail = {head.x - dir.x * 90, head.y - dir.y * 90};
+        DrawLineEx(tail, head, 2, Alpha(WHITE, (1 - ph / 0.9f) * k));
+    }
+}
+
+static void ThemeCircuit(Rectangle r, float t, float k)
+{
+    Color line = {45, 212, 191, 255};
+    DrawRectangleRec(r, Alpha((Color){0, 40, 40, 255}, 0.3f * k));
+    int n = ItemCount(r, 11000, 120);
+    for (int i = 0; i < n; i++) {
+        /* each trace: across, then diagonally, then across again, like on a real board */
+        float gx = r.x + floorf(Rnd(i, 1) * r.width / 24) * 24, gy = r.y + floorf(Rnd(i, 2) * r.height / 24) * 24;
+        float dx = Rnd(i, 3) < 0.5f ? 1 : -1, dy = Rnd(i, 4) < 0.5f ? 1 : -1;
+        float l1 = 24 + floorf(Rnd(i, 5) * 5) * 24, l2 = 12 + floorf(Rnd(i, 6) * 3) * 12, l3 = 24 + floorf(Rnd(i, 7) * 4) * 24;
+        Vector2 p0 = {gx, gy}, p1 = {gx + dx * l1, gy}, p2 = {p1.x + dx * l2, p1.y + dy * l2}, p3 = {p2.x + dx * l3, p2.y};
+        DrawLineEx(p0, p1, 2, Alpha(line, 0.35f * k));
+        DrawLineEx(p1, p2, 2, Alpha(line, 0.35f * k));
+        DrawLineEx(p2, p3, 2, Alpha(line, 0.35f * k));
+        DrawCircleV(p0, 4, Alpha(line, 0.45f * k));
+        DrawCircleV(p0, 2, Alpha((Color){13, 17, 23, 255}, k));
+        DrawCircleV(p3, 4, Alpha(line, 0.45f * k));
+        /* a pulse of light running along the trace */
+        float d12 = l2 * 1.41421f, total = l1 + d12 + l3;
+        float s = fmodf(t * (60 + Rnd(i, 8) * 60) + Rnd(i, 9) * 600, total + 260);
+        if (s < total) {
+            Vector2 q;
+            if (s < l1)            q = (Vector2){p0.x + dx * s, p0.y};
+            else if (s < l1 + d12) { float u = (s - l1) / 1.41421f; q = (Vector2){p1.x + dx * u, p1.y + dy * u}; }
+            else                   q = (Vector2){p2.x + dx * (s - l1 - d12), p2.y};
+            DrawCircleV(q, 6, Alpha(line, 0.25f * k));
+            DrawCircleV(q, 2.5f, Alpha((Color){200, 255, 245, 255}, 0.9f * k));
+        }
+    }
+    int chips = n / 12 + 1;
+    for (int i = 0; i < chips; i++) {
+        Rectangle c = {r.x + Rnd(i, 21) * (r.width - 60), r.y + Rnd(i, 22) * (r.height - 40), 44 + Rnd(i, 23) * 30, 26 + Rnd(i, 24) * 14};
+        DrawRectangleRec(c, Alpha((Color){10, 30, 32, 255}, 0.9f * k));
+        DrawRectangleLinesEx(c, 1.5f, Alpha(line, 0.5f * k));
+        for (float px = c.x + 6; px < c.x + c.width - 4; px += 8) {
+            DrawLineEx((Vector2){px, c.y}, (Vector2){px, c.y - 5}, 2, Alpha(line, 0.4f * k));
+            DrawLineEx((Vector2){px, c.y + c.height}, (Vector2){px, c.y + c.height + 5}, 2, Alpha(line, 0.4f * k));
+        }
+    }
+}
+
+static void ThemeOcean(Rectangle r, float t, float k)
+{
+    GradientV((int)r.x, (int)r.y, (int)r.width, (int)r.height,
+                           Alpha((Color){10, 40, 80, 255}, 0.45f * k), Alpha((Color){5, 25, 60, 255}, 0.6f * k));
+    static const Color waves[4] = {{90, 180, 235, 255}, {60, 140, 215, 255}, {35, 100, 185, 255}, {20, 65, 150, 255}};
+    float bottom = r.y + r.height;
+    for (int l = 0; l < 4; l++) {
+        float base = r.y + r.height * (0.5f + l * 0.12f), amp = 7 + l * 3, wl = 190 - l * 25, sp = 0.6f + l * 0.25f;
+        for (float x = r.x; x < r.x + r.width; x += 4) {
+            float y = base + sinf((x / wl) * 6.28f + t * sp + l * 1.7f) * amp + sinf((x / (wl * 0.37f)) + t * sp * 1.6f) * amp * 0.3f;
+            DrawRectangle((int)x, (int)y, 4, (int)(bottom - y) + 1, Alpha(waves[l], 0.32f * k));
+        }
+    }
+    for (int i = 0; i < 40; i++) {
+        float x = r.x + Rnd(i, 1) * r.width + sinf(t * 1.3f + i) * 6;
+        float y = bottom - fmodf(t * (18 + Rnd(i, 2) * 30) + Rnd(i, 3) * r.height, r.height * 0.6f);
+        DrawCircleLines((int)x, (int)y, 2 + Rnd(i, 4) * 4, Alpha((Color){190, 230, 255, 255}, 0.45f * k));
+    }
+}
+
+static void ThemeAutumn(Rectangle r, float t, float k)
+{
+    static const Color pal[4] = {{230, 126, 34, 255}, {192, 57, 43, 255}, {241, 196, 15, 255}, {160, 82, 45, 255}};
+    GradientV((int)r.x, (int)r.y, (int)r.width, (int)r.height,
+                           Alpha((Color){60, 30, 10, 255}, 0.25f * k), Alpha((Color){70, 35, 15, 255}, 0.45f * k));
+    int n = ItemCount(r, 13000, 150);
+    for (int i = 0; i < n; i++) {
+        float fall = 22 + Rnd(i, 1) * 35;
+        float y = r.y + fmodf(Rnd(i, 2) * (r.height + 40) + t * fall, r.height + 40) - 20;
+        float x = r.x + Rnd(i, 3) * r.width + sinf(t * (0.5f + Rnd(i, 4)) + Rnd(i, 5) * 6.28f) * 30;
+        float s = 7 + Rnd(i, 6) * 8, a = t * (Rnd(i, 7) * 2 - 1) * 1.4f + Rnd(i, 8) * 6.28f;
+        Vector2 d = {cosf(a), sinf(a)}, pp = {-d.y, d.x}, c = {x, y};
+        Vector2 tip  = {c.x + d.x * s,  c.y + d.y * s},  back = {c.x - d.x * s,  c.y - d.y * s};
+        Vector2 left = {c.x + pp.x * s * 0.5f, c.y + pp.y * s * 0.5f}, right = {c.x - pp.x * s * 0.5f, c.y - pp.y * s * 0.5f};
+        Color col = Alpha(pal[(int)(Rnd(i, 9) * 4) % 4], 0.7f * k);
+        Tri(tip, left, back, col);
+        Tri(tip, back, right, col);
+        DrawLineEx((Vector2){back.x - d.x * 4, back.y - d.y * 4}, tip, 1, Alpha((Color){90, 40, 10, 255}, 0.6f * k));
+    }
+}
+
+/* Draws a theme filling rectangle r, but only the part inside clip.
+   strength 0..1: low for behind the app, 1 for banners and previews. */
+static void DrawThemeClip(int theme, Rectangle r, Rectangle clip, float strength)
+{
+    float t = (float)GetTime();
+    if (clip.width <= 0 || clip.height <= 0) return;
+    BeginScissorMode((int)clip.x, (int)clip.y, (int)clip.width, (int)clip.height);
+    switch (theme) {
+    case THEME_CODE:    ThemeCode(r, t, strength);    break;
+    case THEME_GARDEN:  ThemeGarden(r, t, strength);  break;
+    case THEME_NIGHT:   ThemeNight(r, t, strength);   break;
+    case THEME_CIRCUIT: ThemeCircuit(r, t, strength); break;
+    case THEME_OCEAN:   ThemeOcean(r, t, strength);   break;
+    case THEME_AUTUMN:  ThemeAutumn(r, t, strength);  break;
+    default:            /* Classic: a quiet banner, nothing behind the app */
+        if (strength >= 0.99f) {
+            GradientH((int)r.x, (int)r.y, (int)r.width, (int)r.height, (Color){22, 27, 34, 255}, (Color){33, 38, 45, 255});
+            for (float x = r.x + 12; x < r.x + r.width; x += 24)
+                for (float y = r.y + 12; y < r.y + r.height; y += 24) DrawCircleV((Vector2){x, y}, 1.2f, (Color){48, 54, 61, 255});
+        }
+        break;
+    }
+    EndScissorMode();
+}
+
+static void DrawTheme(int theme, Rectangle r, float strength) { DrawThemeClip(theme, r, r, strength); }
+
+/* ------------------------------------------------------------------ */
 /* Saving and loading                                                 */
 /* Format: numbers on their own line; text as  <length>:<bytes>\n      */
 /* ------------------------------------------------------------------ */
@@ -817,13 +1190,15 @@ static void Save(void)
 {
     FILE *f = fopen(SAVE_FILE ".tmp", "wb");
     if (!f) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(f, "MINIGITHUB2\n");
+    fprintf(f, "MINIGITHUB4\n");
     WI(f, nextUserId);
     WS(f, lastUser);
     WI(f, userCount);
     for (int i = 0; i < userCount; i++) {
         User *u = &users[i];
         WI(f, u->id); WS(f, u->name); WS(f, u->salt); WS(f, u->hash); WI(f, u->created);
+        WS(f, u->bio); WI(f, u->theme); WI(f, u->avatarColor); WS(f, u->avatar ? u->avatar : "");
+        WS(f, u->rsalt); WS(f, u->rhash);
     }
     WI(f, repoCount);
     for (int i = 0; i < repoCount; i++) {
@@ -852,7 +1227,24 @@ static void Save(void)
     rename(SAVE_FILE ".tmp", SAVE_FILE);
 }
 
-/* Reads version 2 (with accounts) and version 1 (before accounts). */
+/* "MINIGITHUB3" was used by two different versions of this program: one added
+   profiles, the other added recovery codes. Both put their new fields right after
+   each account's creation time: profiles start with the bio (text, then a number),
+   recovery codes with two pieces of text. So peek at the second item to tell. */
+static bool V3HasProfiles(FILE *f)
+{
+    long at = ftell(f);
+    int saved = loadErr;
+    char *first = RS(f);
+    free(first);
+    int n = 0, after = 0;
+    bool isText = fscanf(f, " %d", &n) == 1 && (after = fgetc(f)) == ':';
+    fseek(f, at, SEEK_SET);
+    loadErr = saved;
+    return !isText;
+}
+
+/* Reads every version: 4 (profiles + recovery codes), 3 (either one), 2 (accounts), 1 (before accounts). */
 static bool Load(void)
 {
     FILE *f = fopen(SAVE_FILE, "rb");
@@ -863,10 +1255,12 @@ static bool Load(void)
     if (fscanf(f, "%31s", magic) == 1) {
         if (strcmp(magic, "MINIGITHUB1") == 0) ver = 1;
         if (strcmp(magic, "MINIGITHUB2") == 0) ver = 2;
+        if (strcmp(magic, "MINIGITHUB3") == 0) ver = 3;
+        if (strcmp(magic, "MINIGITHUB4") == 0) ver = 4;
     }
     if (!ver) loadErr = 1;
 
-    if (ver == 2) {
+    if (ver >= 2) {
         nextUserId = (int)RI(f);
         RSInto(f, lastUser, NAME_LEN);
         int uc = (int)RI(f);
@@ -879,6 +1273,23 @@ static bool Load(void)
             RSInto(f, u->salt, (int)sizeof u->salt);
             RSInto(f, u->hash, (int)sizeof u->hash);
             u->created = RI(f);
+            bool profiles = ver >= 4 || (ver == 3 && V3HasProfiles(f));
+            bool recovery = ver >= 4 || (ver == 3 && !profiles);
+            if (profiles) {
+                RSInto(f, u->bio, TEXT_LEN);
+                u->theme       = (int)RI(f);
+                u->avatarColor = (int)RI(f);
+                u->avatar      = RS(f);
+                if (u->avatar && !u->avatar[0]) { free(u->avatar); u->avatar = NULL; }
+                if (u->theme < 0 || u->theme >= THEME_COUNT) u->theme = 0;
+                if (u->avatarColor < 0 || u->avatarColor > 8) u->avatarColor = 0;
+            }
+            if (recovery) {
+                RSInto(f, u->rsalt, (int)sizeof u->rsalt);
+                RSInto(f, u->rhash, (int)sizeof u->rhash);
+                bool none = !u->rsalt[0] && !u->rhash[0];
+                if (!none && (strlen(u->rsalt) != 32 || strlen(u->rhash) != 64)) loadErr = 1;
+            }
             if (u->id <= 0 || strlen(u->salt) != 32 || strlen(u->hash) != 64) loadErr = 1;
             if (u->id >= nextUserId) nextUserId = u->id + 1;
         }
@@ -890,12 +1301,12 @@ static bool Load(void)
     for (int i = 0; i < n && !loadErr; i++) {
         Repo *r = &repos[repoCount++];
         memset(r, 0, sizeof *r);
-        r->owner = ver == 2 ? (int)RI(f) : -1;
+        r->owner = ver >= 2 ? (int)RI(f) : -1;
         RSInto(f, r->name, NAME_LEN);
         RSInto(f, r->desc, TEXT_LEN);
         if (ver == 1) RI(f);                    /* old single-user "starred" flag: dropped */
         r->created = RI(f);
-        if (ver == 2) {
+        if (ver >= 2) {
             int sc = (int)RI(f);
             if (sc < 0 || sc > MAX_USERS) { loadErr = 1; break; }
             for (int k = 0; k < sc; k++) r->starredBy[r->starCount++] = (int)RI(f);
@@ -928,7 +1339,7 @@ static bool Load(void)
             RSInto(f, c->id, (int)sizeof c->id);
             RSInto(f, c->message, TEXT_LEN);
             c->time   = RI(f);
-            c->author = ver == 2 ? (int)RI(f) : -1;
+            c->author = ver >= 2 ? (int)RI(f) : -1;
             int ff = (int)RI(f);
             if (ff < 0 || ff > MAX_FILES) { loadErr = 1; break; }
             c->fileCount = ff;
@@ -948,13 +1359,14 @@ static bool Load(void)
             RSInto(f, is->title, TEXT_LEN);
             is->open   = RI(f) != 0;
             is->time   = RI(f);
-            is->author = ver == 2 ? (int)RI(f) : -1;
+            is->author = ver >= 2 ? (int)RI(f) : -1;
         }
     }
     fclose(f);
 
     if (loadErr) {
         for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);
+        for (int i = 0; i < userCount; i++) free(users[i].avatar);
         memset(repos, 0, sizeof repos);
         memset(users, 0, sizeof users);
         repoCount = userCount = 0;
@@ -1063,36 +1475,70 @@ static void Checkbox(bool *v, int x, int y, const char *label)
     if (Clicked(row)) *v = !*v;
 }
 
-/* One-line text box. Returns true when Enter is pressed in it. */
+/* An eye; with a line through it when "slashed". */
+static void DrawEye(float cx, float cy, bool slashed, Color c, Color bg)
+{
+    DrawEllipse((int)cx, (int)cy, 11, 7, c);
+    DrawEllipse((int)cx, (int)cy, 9, 5, bg);
+    DrawCircle((int)cx, (int)cy, 3.5f, c);
+    if (slashed) {
+        DrawLineEx((Vector2){cx - 11, cy + 9}, (Vector2){cx + 11, cy - 9}, 5, bg);
+        DrawLineEx((Vector2){cx - 11, cy + 9}, (Vector2){cx + 11, cy - 9}, 2, c);
+    }
+}
+
+/* One-line text box. Returns true when Enter is pressed in it.
+   Password boxes get an eye button on the right to show / hide the text. */
 static bool TextFieldUI(TextField *t, Rectangle r, const char *placeholder)
 {
     bool enter = false;
+    float eyeW = t->secret ? 42.0f : 0.0f;
+    Rectangle eye = {r.x + r.width - eyeW, r.y, eyeW, r.height};
+    bool eyeHot = t->secret && Hover(eye);
+    if (t->secret && Clicked(eye)) t->reveal = !t->reveal;
+
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) t->active = Hover(r);
-    if (Hover(r)) wantCursor = MOUSE_CURSOR_IBEAM;
+    if (eyeHot)       wantCursor = MOUSE_CURSOR_POINTING_HAND;
+    else if (Hover(r)) wantCursor = MOUSE_CURSOR_IBEAM;
     if (t->active) {
         int ch;
         while ((ch = GetCharPressed()) > 0)
             if (ch >= 32 && ch < 127 && t->len < TEXT_LEN - 1) { t->buf[t->len++] = (char)ch; t->buf[t->len] = 0; }
         if (KeyRep(KEY_BACKSPACE) && t->len > 0) t->buf[--t->len] = 0;
         if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) enter = true;
+        bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL) ||
+                    IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+        if (ctrl && IsKeyPressed(KEY_V)) {                   /* Ctrl+V pastes */
+            const char *clip = GetClipboardText();
+            for (; clip && *clip && t->len < TEXT_LEN - 1; clip++)
+                if (*clip >= 32 && *clip < 127) { t->buf[t->len++] = *clip; t->buf[t->len] = 0; }
+        }
     }
     DrawRectangleRec(r, UI_BG);
     DrawRectangleLinesEx(r, t->active ? 2.0f : 1.0f, t->active ? UI_LINK : UI_BORDER);
 
-    /* password boxes show one * per character instead of the text */
+    /* password boxes show one * per character, unless the eye is open */
     const char *shown = t->buf;
     char masked[TEXT_LEN];
-    if (t->secret) { memset(masked, '*', (size_t)t->len); masked[t->len] = 0; shown = masked; }
+    if (t->secret && !t->reveal) { memset(masked, '*', (size_t)t->len); masked[t->len] = 0; shown = masked; }
 
     int tx = (int)r.x + 10, ty = (int)(r.y + (r.height - FS) / 2);
     int textW = MeasureText(shown, FS);
-    int off = textW > (int)r.width - 30 ? textW - (int)r.width + 30 : 0;
-    BeginScissorMode((int)r.x + 2, (int)r.y, (int)r.width - 4, (int)r.height);
+    int room  = (int)(r.width - eyeW) - 30;
+    int off = textW > room ? textW - room : 0;
+    BeginScissorMode((int)r.x + 2, (int)r.y, (int)(r.width - eyeW) - 4, (int)r.height);
     if (t->len == 0) DrawText(placeholder, tx, ty, FS, UI_MUTED);
     else             DrawText(shown, tx - off, ty, FS, UI_TEXT);
     if (t->active && ((int)(GetTime() * 2) % 2) == 0)
         DrawRectangle(tx - off + textW + (t->len ? 2 : 0), ty - 2, 2, FS + 4, UI_TEXT);
     EndScissorMode();
+    if (t->secret) {
+        Rectangle hit = {eye.x + 4, eye.y + 4, eye.width - 8, eye.height - 8};
+        if (eyeHot) DrawRectangleRounded(hit, 0.3f, 6, UI_HOVER);
+        /* eye = "show password"; eye with a line = "hide it again" */
+        DrawEye(eye.x + eye.width / 2, eye.y + eye.height / 2, t->reveal,
+                eyeHot ? UI_TEXT : UI_MUTED, eyeHot ? UI_HOVER : UI_BG);
+    }
     return enter;
 }
 
@@ -1219,9 +1665,9 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
     if (ed.scrollY < 0) ed.scrollY = 0;
 
     /* draw */
-    DrawRectangleRec(area, UI_BG);
+    DrawRectangleRec(area, UI_BASE);
     BeginScissorMode((int)area.x, (int)area.y, (int)area.width, (int)area.height);
-    DrawRectangle((int)area.x, (int)area.y, (int)gutter, (int)area.height, UI_PANEL);
+    DrawRectangle((int)area.x, (int)area.y, (int)gutter, (int)area.height, (Color){22, 27, 34, 255});
     const char *t = f->text;
     int p = 0, line = 0, curLine = LineOf(t, ed.cursor);
     for (;;) {
@@ -1245,7 +1691,7 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
                 DrawRectangle(cx, (int)y - 2, 2, FS + 4, UI_TEXT);
             }
             /* line numbers, drawn over any text that scrolled left */
-            DrawRectangle((int)area.x, (int)y - 2, (int)gutter, LH, UI_PANEL);
+            DrawRectangle((int)area.x, (int)y - 2, (int)gutter, LH, (Color){22, 27, 34, 255});
             const char *num = TextFormat("%d", line + 1);
             DrawText(num, (int)(area.x + gutter - 10) - MeasureText(num, FS), (int)y, FS,
                      line == curLine ? UI_TEXT : UI_MUTED);
@@ -1446,9 +1892,9 @@ static int DrawAddsDels(int adds, int dels, int x, int y)
 }
 
 /* The little pop-up shown when the mouse is over a day square. */
-static void DrawDayTooltip(long long day)
+static void DrawDayTooltip(int uid, long long day)
 {
-    GatherDay(curUser, day);
+    GatherDay(uid, day);
 
     enum { MAXL = 12 };
     char  text[MAXL][160];
@@ -1533,23 +1979,585 @@ static void DrawDayTooltip(long long day)
 }
 
 /* ------------------------------------------------------------------ */
+/* JPG reader                                                         */
+/*                                                                    */
+/* raylib's standard build can open PNG but not JPG, and most photos  */
+/* are JPG, so here is a small reader for "baseline" JPG files (the   */
+/* kind cameras, phones and most programs save).                      */
+/*                                                                    */
+/* How a JPG works, in short: the picture is cut into 8x8 squares.    */
+/* Each square is stored as 64 "frequency" numbers (mostly zeros),    */
+/* squeezed with Huffman coding. To read it we undo the squeezing,    */
+/* turn the frequencies back into pixels (the IDCT step), and convert */
+/* from brightness + colour-difference (YCbCr) to red/green/blue.     */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    uint8_t counts[17];          /* how many codes of each length 1..16 */
+    uint8_t vals[256];
+    int     mincode[17], maxcode[18], valptr[17];
+    bool    ok;
+} JHuff;
+
+typedef struct {
+    int id, h, v, tq;            /* sampling factors and which quantisation table */
+    int td, ta;                  /* Huffman tables for this scan                  */
+    int pred;                    /* last DC value (each block stores a difference) */
+    int bw, bh;                  /* size of its pixel plane, in 8x8 blocks        */
+    uint8_t *pix;
+} JComp;
+
+typedef struct {
+    const uint8_t *p;
+    size_t n, pos;
+    unsigned cur; int nbits; bool marker;
+    uint16_t q[4][64];
+    JHuff dc[4], ac[4];
+    JComp comp[3];
+    int ncomp, w, h, hmax, vmax, restart, orientation;
+    bool progressive;
+    const char *err;
+} Jpg;
+
+static const uint8_t ZIGZAG[64] = {
+     0, 1, 8,16, 9, 2, 3,10, 17,24,32,25,18,11, 4, 5,
+    12,19,26,33,40,48,41,34, 27,20,13, 6, 7,14,21,28,
+    35,42,49,56,57,50,43,36, 29,22,15,23,30,37,44,51,
+    58,59,52,45,38,31,39,46, 53,60,61,54,47,55,62,63
+};
+
+static int JU16(Jpg *j)
+{
+    if (j->pos + 2 > j->n) { j->err = "the file is cut short"; return 0; }
+    int v = j->p[j->pos] << 8 | j->p[j->pos + 1];
+    j->pos += 2;
+    return v;
+}
+
+static unsigned JBit(Jpg *j)
+{
+    if (j->nbits == 0) {
+        unsigned b = 0;
+        if (!j->marker && j->pos < j->n) {
+            b = j->p[j->pos++];
+            if (b == 0xFF) {
+                unsigned nx = j->pos < j->n ? j->p[j->pos] : 0;
+                if (nx == 0x00) j->pos++;                      /* a real 0xFF byte */
+                else { j->marker = true; j->pos--; b = 0; }    /* a marker: stop here */
+            }
+        }
+        j->cur = b;
+        j->nbits = 8;
+    }
+    j->nbits--;
+    return (j->cur >> j->nbits) & 1;
+}
+static int JBits(Jpg *j, int n) { int v = 0; while (n--) v = (v << 1) | (int)JBit(j); return v; }
+static int JExtend(int v, int s) { return s == 0 ? 0 : (v < (1 << (s - 1)) ? v - (1 << s) + 1 : v); }
+
+static void JBuildHuff(JHuff *t)
+{
+    int code = 0, k = 0;
+    for (int l = 1; l <= 16; l++) {
+        t->valptr[l]  = k;
+        t->mincode[l] = code;
+        code += t->counts[l];
+        k    += t->counts[l];
+        t->maxcode[l] = t->counts[l] ? code - 1 : -1;
+        code <<= 1;
+    }
+    t->ok = true;
+}
+static int JDecode(Jpg *j, JHuff *t)
+{
+    int code = 0;
+    for (int l = 1; l <= 16; l++) {
+        code = (code << 1) | (int)JBit(j);
+        if (t->maxcode[l] >= 0 && code <= t->maxcode[l]) return t->vals[t->valptr[l] + code - t->mincode[l]];
+    }
+    j->err = "the picture data is damaged";
+    return 0;
+}
+
+static float idctTab[8][8];   /* idctTab[x][u] = C(u) * cos((2x+1) u pi / 16) / 2 */
+static void JInitIdct(void)
+{
+    for (int x = 0; x < 8; x++)
+        for (int u = 0; u < 8; u++)
+            idctTab[x][u] = (u == 0 ? 0.70710678f : 1.0f) * cosf((2 * x + 1) * u * 3.14159265f / 16.0f) / 2.0f;
+}
+
+/* Read one 8x8 block and write its pixels into the component's plane. */
+static void JBlock(Jpg *j, JComp *c, int bx, int by)
+{
+    float coef[64] = {0}, tmp[64];
+    uint16_t *q = j->q[c->tq];
+    int t = JDecode(j, &j->dc[c->td]);
+    c->pred += t ? JExtend(JBits(j, t), t) : 0;
+    coef[0] = (float)(c->pred * q[0]);
+    for (int k = 1; k < 64; ) {
+        int rs = JDecode(j, &j->ac[c->ta]), r = rs >> 4, s = rs & 15;
+        if (j->err) return;
+        if (s == 0) { if (r == 15) { k += 16; continue; } break; }
+        k += r;
+        if (k > 63) break;
+        coef[ZIGZAG[k]] = (float)(JExtend(JBits(j, s), s) * q[k]);
+        k++;
+    }
+    /* turn frequencies back into pixels: rows first, then columns */
+    for (int v = 0; v < 8; v++)
+        for (int x = 0; x < 8; x++) {
+            float s = 0;
+            for (int u = 0; u < 8; u++) s += coef[v * 8 + u] * idctTab[x][u];
+            tmp[v * 8 + x] = s;
+        }
+    int stride = c->bw * 8;
+    for (int y = 0; y < 8; y++)
+        for (int x = 0; x < 8; x++) {
+            float s = 128.0f;
+            for (int v = 0; v < 8; v++) s += idctTab[y][v] * tmp[v * 8 + x];
+            int px = bx * 8 + x, py = by * 8 + y;
+            if (px < stride && py < c->bh * 8)
+                c->pix[py * stride + px] = (uint8_t)(s < 0 ? 0 : s > 255 ? 255 : (int)(s + 0.5f));
+        }
+}
+
+/* After every "restart interval", the file has a marker and the DC differences start over. */
+static void JRestart(Jpg *j)
+{
+    j->nbits = 0;
+    j->marker = false;
+    while (j->pos + 1 < j->n) {
+        if (j->p[j->pos] == 0xFF && j->p[j->pos + 1] >= 0xD0 && j->p[j->pos + 1] <= 0xD7) { j->pos += 2; break; }
+        j->pos++;
+    }
+    for (int i = 0; i < j->ncomp; i++) j->comp[i].pred = 0;
+}
+
+static void JScan(Jpg *j)
+{
+    int len = JU16(j), ns = j->pos < j->n ? j->p[j->pos++] : 0;
+    JComp *sc[3];
+    if (ns < 1 || ns > 3) { j->err = "the picture data is damaged"; return; }
+    for (int i = 0; i < ns; i++) {
+        int id = j->p[j->pos++], tables = j->p[j->pos++];
+        sc[i] = NULL;
+        for (int k = 0; k < j->ncomp; k++) if (j->comp[k].id == id) sc[i] = &j->comp[k];
+        if (!sc[i]) { j->err = "the picture data is damaged"; return; }
+        sc[i]->td = (tables >> 4) & 3;
+        sc[i]->ta = tables & 3;
+        if (!j->dc[sc[i]->td].ok || !j->ac[sc[i]->ta].ok) { j->err = "the picture data is damaged"; return; }
+    }
+    j->pos += 3;                                   /* spectral selection: always 0..63 in baseline */
+    (void)len;
+    for (int i = 0; i < j->ncomp; i++) j->comp[i].pred = 0;
+    j->nbits = 0;
+    j->marker = false;
+
+    int count = 0;
+    if (ns == 1) {                                 /* one component on its own: blocks in plain order */
+        JComp *c = sc[0];
+        int cw = (j->w * c->h + j->hmax - 1) / j->hmax, ch = (j->h * c->v + j->vmax - 1) / j->vmax;
+        int nx = (cw + 7) / 8, ny = (ch + 7) / 8;
+        for (int by = 0; by < ny && !j->err; by++)
+            for (int bx = 0; bx < nx && !j->err; bx++) {
+                if (j->restart && count && count % j->restart == 0) JRestart(j);
+                JBlock(j, c, bx, by);
+                count++;
+            }
+    } else {                                       /* interleaved: each "MCU" holds h*v blocks of every component */
+        int mx = (j->w + 8 * j->hmax - 1) / (8 * j->hmax), my = (j->h + 8 * j->vmax - 1) / (8 * j->vmax);
+        for (int y = 0; y < my && !j->err; y++)
+            for (int x = 0; x < mx && !j->err; x++) {
+                if (j->restart && count && count % j->restart == 0) JRestart(j);
+                for (int i = 0; i < ns; i++)
+                    for (int v = 0; v < sc[i]->v; v++)
+                        for (int h = 0; h < sc[i]->h; h++)
+                            JBlock(j, sc[i], x * sc[i]->h + h, y * sc[i]->v + v);
+                count++;
+            }
+    }
+    /* move on to the next marker */
+    j->marker = false;
+    while (j->pos + 1 < j->n && !(j->p[j->pos] == 0xFF && j->p[j->pos + 1] != 0x00 &&
+                                  !(j->p[j->pos + 1] >= 0xD0 && j->p[j->pos + 1] <= 0xD7))) j->pos++;
+}
+
+/* Phones store photos sideways plus a note (EXIF "orientation") saying how to turn them. */
+static void JReadExif(Jpg *j, size_t start, size_t len)
+{
+    const uint8_t *d = j->p + start;
+    if (len < 14 || memcmp(d, "Exif\0\0", 6) != 0) return;
+    const uint8_t *t = d + 6;
+    size_t tl = len - 6;
+    bool le = t[0] == 'I';
+#define RD16(o) ((o) + 2 <= tl ? (le ? (t[o] | t[(o)+1] << 8) : (t[o] << 8 | t[(o)+1])) : 0)
+#define RD32(o) ((o) + 4 <= tl ? (le ? (uint32_t)(t[o] | t[(o)+1] << 8 | t[(o)+2] << 16 | (uint32_t)t[(o)+3] << 24) \
+                                     : (uint32_t)((uint32_t)t[o] << 24 | t[(o)+1] << 16 | t[(o)+2] << 8 | t[(o)+3])) : 0)
+    uint32_t ifd = RD32(4);
+    int entries = RD16(ifd);
+    for (int e = 0; e < entries && e < 200; e++) {
+        size_t o = ifd + 2 + (size_t)e * 12;
+        if (RD16(o) == 0x0112) { j->orientation = RD16(o + 8); break; }
+    }
+#undef RD16
+#undef RD32
+}
+
+static Image DecodeJpg(const uint8_t *data, int size, const char **err)
+{
+    Image img = {0};
+    Jpg *j = calloc(1, sizeof(Jpg));
+    if (!j) { *err = "out of memory"; return img; }
+    j->p = data; j->n = (size_t)size; j->orientation = 1;
+    if (size < 4 || data[0] != 0xFF || data[1] != 0xD8) { *err = "it isn't a JPG file"; free(j); return img; }
+    j->pos = 2;
+    JInitIdct();
+    bool sawFrame = false, sawScan = false;
+
+    while (!j->err && j->pos + 4 <= j->n) {
+        if (j->p[j->pos] != 0xFF) { j->pos++; continue; }
+        int m = j->p[j->pos + 1];
+        j->pos += 2;
+        if (m == 0xFF || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) { if (m == 0xFF) j->pos--; continue; }
+        if (m == 0xD9) break;                                   /* end of picture */
+        if (m == 0xDA) {                                        /* start of scan */
+            if (!sawFrame) { j->err = "the picture data is damaged"; break; }
+            JScan(j);
+            sawScan = true;
+            continue;
+        }
+        size_t segStart = j->pos;
+        int len = JU16(j);
+        if (len < 2 || segStart + (size_t)len > j->n) { j->err = "the file is cut short"; break; }
+        size_t segEnd = segStart + (size_t)len;
+
+        if (m == 0xDB) {                                        /* quantisation tables */
+            while (j->pos < segEnd) {
+                int pq = j->p[j->pos] >> 4, tq = j->p[j->pos] & 3;
+                j->pos++;
+                for (int k = 0; k < 64; k++) {
+                    if (pq) { j->q[tq][k] = (uint16_t)(j->p[j->pos] << 8 | j->p[j->pos + 1]); j->pos += 2; }
+                    else      j->q[tq][k] = j->p[j->pos++];
+                }
+            }
+        } else if (m == 0xC4) {                                 /* Huffman tables */
+            while (j->pos < segEnd) {
+                int tc = j->p[j->pos] >> 4, th = j->p[j->pos] & 3, total = 0;
+                j->pos++;
+                JHuff *t = tc ? &j->ac[th] : &j->dc[th];
+                for (int l = 1; l <= 16; l++) { t->counts[l] = j->p[j->pos++]; total += t->counts[l]; }
+                if (total > 256 || j->pos + (size_t)total > segEnd) { j->err = "the picture data is damaged"; break; }
+                memcpy(t->vals, j->p + j->pos, (size_t)total);
+                j->pos += (size_t)total;
+                JBuildHuff(t);
+            }
+        } else if (m == 0xC0 || m == 0xC1) {                    /* frame header: size and colour layout */
+            j->pos++;                                           /* bits per sample: always 8 here */
+            j->h = JU16(j);
+            j->w = JU16(j);
+            j->ncomp = j->p[j->pos++];
+            if (j->ncomp != 1 && j->ncomp != 3) { j->err = "CMYK JPG files aren't supported"; break; }
+            if (j->w <= 0 || j->h <= 0 || j->w > 16384 || j->h > 16384) { j->err = "the picture is too big"; break; }
+            j->hmax = j->vmax = 1;
+            for (int i = 0; i < j->ncomp; i++) {
+                JComp *c = &j->comp[i];
+                c->id = j->p[j->pos++];
+                c->h = j->p[j->pos] >> 4; c->v = j->p[j->pos] & 15; j->pos++;
+                c->tq = j->p[j->pos++] & 3;
+                if (c->h < 1 || c->h > 4 || c->v < 1 || c->v > 4) { j->err = "the picture data is damaged"; break; }
+                if (c->h > j->hmax) j->hmax = c->h;
+                if (c->v > j->vmax) j->vmax = c->v;
+            }
+            int mx = (j->w + 8 * j->hmax - 1) / (8 * j->hmax), my = (j->h + 8 * j->vmax - 1) / (8 * j->vmax);
+            for (int i = 0; i < j->ncomp && !j->err; i++) {
+                JComp *c = &j->comp[i];
+                c->bw = mx * c->h;
+                c->bh = my * c->v;
+                c->pix = calloc((size_t)c->bw * 8 * (size_t)c->bh * 8, 1);
+                if (!c->pix) j->err = "out of memory";
+            }
+            sawFrame = true;
+        } else if (m == 0xC2 || m == 0xC6 || m == 0xCA) {
+            j->err = "\"progressive\" JPG files aren't supported - try saving it again as PNG";
+        } else if (m >= 0xC3 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC) {
+            j->err = "this kind of JPG isn't supported - try saving it again as PNG";
+        } else if (m == 0xDD) {                                 /* restart interval */
+            j->restart = JU16(j);
+        } else if (m == 0xE1) {
+            JReadExif(j, j->pos, segEnd - j->pos);
+        }
+        j->pos = segEnd;
+    }
+    if (!j->err && !sawScan) j->err = "the picture data is damaged";
+
+    if (!j->err) {
+        uint8_t *out = malloc((size_t)j->w * (size_t)j->h * 3);
+        if (!out) j->err = "out of memory";
+        else {
+            for (int y = 0; y < j->h; y++)
+                for (int x = 0; x < j->w; x++) {
+                    float s[3];
+                    for (int i = 0; i < j->ncomp; i++) {
+                        JComp *c = &j->comp[i];
+                        int sx = x * c->h / j->hmax, sy = y * c->v / j->vmax;
+                        s[i] = c->pix[sy * c->bw * 8 + sx];
+                    }
+                    uint8_t *o = out + ((size_t)y * j->w + x) * 3;
+                    if (j->ncomp == 1) { o[0] = o[1] = o[2] = (uint8_t)s[0]; continue; }
+                    float Y = s[0], cb = s[1] - 128, cr = s[2] - 128;
+                    float rgb[3] = {Y + 1.402f * cr, Y - 0.344136f * cb - 0.714136f * cr, Y + 1.772f * cb};
+                    for (int k = 0; k < 3; k++) o[k] = (uint8_t)(rgb[k] < 0 ? 0 : rgb[k] > 255 ? 255 : (int)(rgb[k] + 0.5f));
+                }
+            img.data = out;
+            img.width = j->w;
+            img.height = j->h;
+            img.mipmaps = 1;
+            img.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8;
+            /* turn it the right way up */
+            switch (j->orientation) {
+            case 2: ImageFlipHorizontal(&img); break;
+            case 3: ImageRotate(&img, 180); break;
+            case 4: ImageFlipVertical(&img); break;
+            case 5: ImageRotateCW(&img); ImageFlipHorizontal(&img); break;
+            case 6: ImageRotateCW(&img); break;
+            case 7: ImageRotateCCW(&img); ImageFlipHorizontal(&img); break;
+            case 8: ImageRotateCCW(&img); break;
+            default: break;
+            }
+        }
+    }
+    for (int i = 0; i < 3; i++) free(j->comp[i].pix);
+    *err = j->err;
+    free(j);
+    return img;
+}
+
+/* ------------------------------------------------------------------ */
+/* Profile pictures                                                   */
+/*                                                                    */
+/* A picture is cropped to a square, shrunk to 192x192, given a round */
+/* see-through edge, saved as PNG, and kept inside minigithub.dat as  */
+/* base64 text (a way of writing any bytes using only letters, digits */
+/* and + /). So there are no extra files to lose.                     */
+/* ------------------------------------------------------------------ */
+#define AVATAR_PX 192
+
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char *ToBase64(const uint8_t *d, int n)
+{
+    char *o = malloc((size_t)(n + 2) / 3 * 4 + 1);
+    if (!o) return NULL;
+    int j = 0;
+    for (int i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)d[i] << 16 | (i + 1 < n ? d[i + 1] << 8 : 0) | (i + 2 < n ? d[i + 2] : 0);
+        o[j++] = B64[v >> 18 & 63];
+        o[j++] = B64[v >> 12 & 63];
+        o[j++] = i + 1 < n ? B64[v >> 6 & 63] : '=';
+        o[j++] = i + 2 < n ? B64[v & 63] : '=';
+    }
+    o[j] = 0;
+    return o;
+}
+
+static uint8_t *FromBase64(const char *s, int *outLen)
+{
+    int n = (int)strlen(s), j = 0, bits = 0;
+    uint32_t acc = 0;
+    uint8_t *o = malloc((size_t)n * 3 / 4 + 3);
+    if (!o) return NULL;
+    for (int i = 0; i < n; i++) {
+        const char *p = strchr(B64, s[i]);
+        if (!p || !s[i]) continue;                       /* skips '=' and anything odd */
+        acc = acc << 6 | (uint32_t)(p - B64);
+        bits += 6;
+        if (bits >= 8) { bits -= 8; o[j++] = (uint8_t)(acc >> bits); }
+    }
+    *outLen = j;
+    return o;
+}
+
+static void FreeAvatarTex(User *u)
+{
+    if (u->texState == 1) UnloadTexture(u->tex);
+    u->texState = 0;
+}
+
+/* The picture as something raylib can draw, made the first time it's needed. */
+static bool AvatarTex(User *u)
+{
+    if (!u->avatar || u->texState == -1) return false;
+    if (u->texState == 1) return true;
+    int n = 0;
+    uint8_t *png = FromBase64(u->avatar, &n);
+    Image img = png ? LoadImageFromMemory(".png", png, n) : (Image){0};
+    free(png);
+    if (!img.data || img.width <= 0) { u->texState = -1; return false; }
+    u->tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+    GenTextureMipmaps(&u->tex);                          /* keeps it smooth when drawn small */
+    SetTextureFilter(u->tex, TEXTURE_FILTER_TRILINEAR);
+    u->texState = 1;
+    return true;
+}
+
+/* Returns NULL on success, or a message saying what went wrong. */
+static const char *ImportAvatar(User *u, const char *raw)
+{
+    /* tidy the path: "Copy as path" on Windows adds quotes */
+    char path[1024];
+    while (*raw == ' ' || *raw == '"' || *raw == '\'') raw++;
+    snprintf(path, sizeof path, "%s", raw);
+    int n = (int)strlen(path);
+    while (n > 0 && (path[n - 1] == ' ' || path[n - 1] == '"' || path[n - 1] == '\'')) path[--n] = 0;
+    if (!n)                return "Type or paste the picture's file path first";
+    if (!FileExists(path)) return "Couldn't find a file at that path";
+
+    int size = 0;
+    unsigned char *d = LoadFileData(path, &size);
+    if (!d || size <= 0) return "Couldn't open that file";
+    if (size > 40 * 1024 * 1024) { UnloadFileData(d); return "That picture is too big (over 40 MB)"; }
+
+    Image img = {0};
+    const char *err = NULL;
+    if (size > 8 && memcmp(d, "\x89PNG", 4) == 0)                    img = LoadImageFromMemory(".png", d, size);
+    else if (size > 3 && d[0] == 0xFF && d[1] == 0xD8)               img = DecodeJpg(d, size, &err);
+    else if (size > 6 && memcmp(d, "GIF8", 4) == 0)                  img = LoadImageFromMemory(".gif", d, size);
+    else if (size > 4 && memcmp(d, "qoif", 4) == 0)                  img = LoadImageFromMemory(".qoi", d, size);
+    else if (size > 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "WEBP", 4) == 0)
+        err = "WEBP pictures aren't supported - save it as PNG or JPG first";
+    else if (size > 12 && memcmp(d + 4, "ftyp", 4) == 0)
+        err = "HEIC pictures (from iPhones) aren't supported - save it as PNG or JPG first";
+    else err = "that isn't a picture this program can read - use PNG or JPG";
+    UnloadFileData(d);
+    if (err) { if (img.data) UnloadImage(img); return TextFormat("Couldn't use it: %s", err); }
+    if (!img.data || img.width <= 0 || img.height <= 0) return "Couldn't read that picture - it may be damaged";
+
+    /* square crop from the middle, shrink, round edge */
+    ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
+    int side = img.width < img.height ? img.width : img.height;
+    ImageCrop(&img, (Rectangle){(float)((img.width - side) / 2), (float)((img.height - side) / 2), (float)side, (float)side});
+    ImageResize(&img, AVATAR_PX, AVATAR_PX);
+    Color *px = (Color *)img.data;
+    float c = (AVATAR_PX - 1) / 2.0f, rad = AVATAR_PX / 2.0f;
+    for (int y = 0; y < AVATAR_PX; y++)
+        for (int x = 0; x < AVATAR_PX; x++) {
+            float dist = sqrtf((x - c) * (x - c) + (y - c) * (y - c));
+            float a = rad - dist;                       /* 1 inside, 0 outside, smooth in between */
+            if (a < 0) a = 0;
+            if (a > 1) a = 1;
+            px[y * AVATAR_PX + x].a = (unsigned char)(px[y * AVATAR_PX + x].a * a);
+        }
+
+    int pngSize = 0;
+    unsigned char *png = ExportImageToMemory(img, ".png", &pngSize);
+    UnloadImage(img);
+    if (!png || pngSize <= 0) return "Couldn't convert the picture";
+    char *b64 = ToBase64(png, pngSize);
+    MemFree(png);
+    if (!b64) return "Out of memory";
+
+    FreeAvatarTex(u);
+    free(u->avatar);
+    u->avatar = b64;
+    MarkDirty();
+    return NULL;
+}
+
+static void RemoveAvatar(User *u)
+{
+    FreeAvatarTex(u);
+    free(u->avatar);
+    u->avatar = NULL;
+    MarkDirty();
+}
+
+/* Colours for people without a picture. 0 in avatarColor means "pick one for me". */
+static const Color AVATAR_COLORS[8] = {
+    {137, 87, 229, 255}, { 31, 111, 235, 255}, { 35, 134,  54, 255}, {191, 135,  0, 255},
+    {207,  34,  46, 255}, {219,  97, 162, 255}, { 20, 150, 160, 255}, {110, 118, 129, 255}
+};
+static Color AvatarColor(int id)
+{
+    User *u = FindUserById(id);
+    if (u && u->avatarColor >= 1 && u->avatarColor <= 8) return AVATAR_COLORS[u->avatarColor - 1];
+    return AVATAR_COLORS[(id < 0 ? 0 : id) % 6];
+}
+
+/* The user's picture, or a coloured circle with the first letter of their name. */
+static void DrawAvatar(int id, int cx, int cy, int radius)
+{
+    User *u = FindUserById(id);
+    if (u && AvatarTex(u)) {
+        DrawTexturePro(u->tex, (Rectangle){0, 0, (float)u->tex.width, (float)u->tex.height},
+                       (Rectangle){(float)(cx - radius), (float)(cy - radius), (float)radius * 2, (float)radius * 2},
+                       (Vector2){0, 0}, 0, WHITE);
+        return;
+    }
+    const char *n = UserName(id);
+    char letter[2] = {(char)toupper((unsigned char)n[0]), 0};
+    int fs = radius >= 40 ? 60 : radius >= 24 ? 30 : 20;
+    DrawCircle(cx, cy, (float)radius, AvatarColor(id));
+    DrawText(letter, cx - MeasureText(letter, fs) / 2, cy - fs / 2 + 1, fs, UI_TEXT);
+}
+
+static int UserTheme(int id)
+{
+    User *u = FindUserById(id);
+    return u && u->theme >= 0 && u->theme < THEME_COUNT ? u->theme : THEME_CLASSIC;
+}
+
+/* Word-wrapped text. Returns how many lines it used. */
+static int DrawWrapped(const char *s, int x, int y, int maxW, int maxLines, Color c)
+{
+    char line[256];
+    int lines = 0;
+    const char *p = s;
+    while (*p && lines < maxLines) {
+        while (*p == ' ') p++;
+        int best = 0, i = 0;
+        for (;;) {                                       /* take as many whole words as fit */
+            while (p[i] && p[i] != ' ') i++;
+            if (i > 250) i = 250;
+            if (MeasureText(Slice(p, i), FS) > maxW) break;
+            best = i;
+            if (!p[i] || i >= 250) break;
+            i++;
+        }
+        if (best == 0) {                                 /* one very long word: cut it */
+            best = 1;
+            while (p[best] && MeasureText(Slice(p, best + 1), FS) <= maxW) best++;
+        }
+        bool last = lines == maxLines - 1 && p[best];
+        snprintf(line, sizeof line, "%.*s%s", best, p, last ? "..." : "");
+        if (last) DrawFit(line, x, y + lines * 24, FS, maxW, c);
+        else      DrawText(line, x, y + lines * 24, FS, c);
+        lines++;
+        p += best;
+    }
+    return lines;
+}
+
+/* ------------------------------------------------------------------ */
 /* Navigation                                                         */
 /* ------------------------------------------------------------------ */
 static void Unfocus(void)
 {
     tfSearch.active = tfName.active = tfDesc.active = false;
     tfNewFile.active = tfCommit.active = tfIssue.active = false;
-    tfUser.active = tfPass.active = tfPass2.active = false;
+    tfUser.active = tfPass.active = tfPass2.active = tfCode.active = false;
     tfOldPass.active = tfNewPass.active = tfNewPass2.active = tfDelPass.active = false;
     ed.focused = false;
     armedId = 0;
 }
 
-/* Wipe every password box so passwords don't sit around in memory or on screen. */
+/* Wipe every password box so passwords don't sit around in memory or on
+   screen, and close every "eye" so they start hidden again. */
 static void ClearSecrets(void)
 {
-    TextField *s[] = {&tfPass, &tfPass2, &tfOldPass, &tfNewPass, &tfNewPass2, &tfDelPass};
-    for (int i = 0; i < 6; i++) { memset(s[i]->buf, 0, sizeof s[i]->buf); s[i]->len = 0; }
+    TextField *s[] = {&tfPass, &tfPass2, &tfOldPass, &tfNewPass, &tfNewPass2, &tfDelPass, &tfCode};
+    int n = (int)(sizeof s / sizeof s[0]);
+    for (int i = 0; i < n; i++) { memset(s[i]->buf, 0, sizeof s[i]->buf); s[i]->len = 0; s[i]->reveal = false; }
 }
 
 static void PrefillUser(void)
@@ -1574,6 +2582,25 @@ static void GoRegister(void)
     optExample = true;
     screen = SCR_REGISTER;
     tfUser.active = true;
+}
+
+static void GoForgot(void)
+{
+    Unfocus();
+    ClearSecrets();
+    PrefillUser();
+    screen = SCR_FORGOT;
+    if (tfUser.len) tfCode.active = true; else tfUser.active = true;
+}
+
+/* Shows a freshly made recovery code (it's only ever shown once). */
+static void ShowRecoveryCode(User *u, bool afterReset)
+{
+    Unfocus();
+    NewRecoveryCode(u, shownCode);
+    codeAfterReset = afterReset;
+    MarkDirty();
+    screen = SCR_RECOVERY;
 }
 
 static void GoHome(void)
@@ -1609,14 +2636,37 @@ static void SignOut(void)
 
 static void OpenAccount(void)
 {
+    User *u = FindUserById(curUser);
     Unfocus();
     ClearSecrets();
+    settingsTab = 0;
+    scSettings = 0;
+    TF_Clear(&tfAvatar);
+    snprintf(tfBio.buf, TEXT_LEN, "%s", u ? u->bio : "");
+    tfBio.len = (int)strlen(tfBio.buf);
     screen = SCR_ACCOUNT;
 }
 
-static void OpenDay(long long day)
+static void OpenProfile(int id)
+{
+    if (!FindUserById(id)) { GoHome(); return; }
+    Unfocus();
+    viewUser = id;
+    scProfile = 0;
+    screen = SCR_PROFILE;
+}
+
+static void OpenPeople(void)
 {
     Unfocus();
+    scPeople = 0;
+    screen = SCR_PEOPLE;
+}
+
+static void OpenDay(int uid, long long day)
+{
+    Unfocus();
+    dayUser = uid;
     curDay = day;
     scDay = scDayRepos = 0;
     screen = SCR_DAY;
@@ -1688,8 +2738,10 @@ static void DoLogin(void)
     }
     char nm[NAME_LEN];
     snprintf(nm, NAME_LEN, "%s", u->name);
+    bool noCode = !HasRecoveryCode(u);
     SignIn(u->id);
-    Toast(TextFormat("Welcome back, %s", nm));
+    Toast(noCode ? "Tip: make a recovery code in Account settings in case you forget your password"
+                 : TextFormat("Welcome back, %s", nm));
 }
 
 static void DoRegister(void)
@@ -1703,7 +2755,7 @@ static void DoRegister(void)
     User *u = &users[userCount++];
     memset(u, 0, sizeof *u);
     u->id = nextUserId++;
-    snprintf(u->name, NAME_LEN, "%s", tfUser.buf);
+    snprintf(u->name, NAME_LEN, "%.*s", NAME_LEN - 1, tfUser.buf);   /* already checked to be short */
     u->created = (long long)time(NULL);
     SetPassword(u, tfPass.buf);
 
@@ -1714,8 +2766,49 @@ static void DoRegister(void)
     int claimed = ClaimOrphans(uid);
     if (optExample && !claimed) SeedExample(uid);
     MarkDirty();
+    ShowRecoveryCode(FindUserById(uid), false);
     Toast(claimed ? TextFormat("Welcome, %s - your existing repositories are now yours", nm)
                   : TextFormat("Welcome to Mini GitHub, %s!", nm));
+}
+
+/* "Forgot password": username + recovery code -> choose a new password. */
+static void DoResetPassword(void)
+{
+    if (lockT > 0) { Toast(TextFormat("Too many wrong attempts - wait %d seconds", (int)lockT + 1)); return; }
+    char norm[CODE_CHARS + 1];
+    const char *err = NULL;
+    if (!tfUser.buf[0])                                       err = "Enter your username";
+    else if (NormalizeCode(tfCode.buf, norm) != CODE_CHARS)   err = "Recovery codes have 16 letters and numbers, like K7QM-2XWD-9PRT-H4NC";
+    else if ((int)strlen(tfNewPass.buf) < MIN_PASS)           err = TextFormat("New passwords need at least %d characters", MIN_PASS);
+    else if (strcmp(tfNewPass.buf, tfNewPass2.buf) != 0)      err = "The two new passwords don't match";
+    if (err) { Toast(err); return; }
+
+    User *u = FindUserByName(tfUser.buf);
+    bool ok;
+    if (u) ok = CheckRecoveryCode(u, tfCode.buf);
+    else {
+        char dummy[65];   /* same slow work, so a wrong username looks the same as a wrong code */
+        HashPassword(norm, "00000000000000000000000000000000", dummy);
+        ok = false;
+    }
+    if (!ok) {
+        memset(tfCode.buf, 0, sizeof tfCode.buf);
+        tfCode.len = 0;
+        if (++failedLogins >= 5) {
+            failedLogins = 0;
+            lockT = 30;
+            Toast("Too many wrong attempts - paused for 30 seconds");
+        } else Toast("That username and recovery code don't match");
+        Unfocus();
+        tfCode.active = true;
+        return;
+    }
+
+    SetPassword(u, tfNewPass.buf);
+    int uid = u->id;
+    SignIn(uid);                                  /* also wipes the password boxes */
+    ShowRecoveryCode(FindUserById(uid), true);    /* the old code is used up: here's a new one */
+    Toast("Password changed - you're signed in");
 }
 
 static void DoChangePassword(void)
@@ -1755,25 +2848,6 @@ static void DoDeleteAccount(void)
 /* ------------------------------------------------------------------ */
 /* Screens                                                            */
 /* ------------------------------------------------------------------ */
-static Color AvatarColor(int id)
-{
-    static const Color pal[6] = {
-        {137, 87, 229, 255}, { 31, 111, 235, 255}, { 35, 134,  54, 255},
-        {191, 135,  0, 255}, {207,  34,  46, 255}, {219,  97, 162, 255}
-    };
-    return pal[(id < 0 ? 0 : id) % 6];
-}
-
-/* A coloured circle with the first letter of the user's name. */
-static void DrawAvatar(int id, int cx, int cy, int radius)
-{
-    const char *n = UserName(id);
-    char letter[2] = {(char)toupper((unsigned char)n[0]), 0};
-    int fs = radius >= 40 ? 60 : radius >= 24 ? 30 : 20;
-    DrawCircle(cx, cy, (float)radius, AvatarColor(id));
-    DrawText(letter, cx - MeasureText(letter, fs) / 2, cy - fs / 2 + 1, fs, UI_TEXT);
-}
-
 static void DrawLogo(int cx, int cy)
 {
     DrawCircle(cx, cy, 18, UI_TEXT);
@@ -1798,7 +2872,7 @@ static void DrawHeader(void)
 
     if (Button((Rectangle){(float)W - 130, 10, 112, 36}, "Sign out", UI_BTN)) { SignOut(); return; }
 
-    /* name + avatar: click to open account settings */
+    /* name + avatar: click to open your profile */
     const char *nm = UserName(curUser);
     int nw = MeasureText(nm, FS);
     int bw = nw + 8 + 12 + 32 + 8;
@@ -1809,7 +2883,7 @@ static void DrawHeader(void)
     }
     DrawText(nm, (int)acct.x + 8, 18, FS, UI_TEXT);
     DrawAvatar(curUser, (int)acct.x + 8 + nw + 12 + 16, 28, 16);
-    if (Clicked(acct)) OpenAccount();
+    if (Clicked(acct)) OpenProfile(curUser);
 }
 
 static Color Heat(int c)
@@ -1868,7 +2942,7 @@ static void DrawContributions(Rectangle area, int uid, long long *hoverDay)
         wantCursor = MOUSE_CURSOR_POINTING_HAND;
         long long day = AddDays(today, hovered - todayPos);
         *hoverDay = day;
-        if (Clicked((Rectangle){cell.x - 1, cell.y - 1, 15, 15})) OpenDay(day);
+        if (Clicked((Rectangle){cell.x - 1, cell.y - 1, 15, 15})) OpenDay(uid, day);
     }
 
     int lx = (int)(area.x + area.width) - 200, ly = (int)(area.y + area.height) - 30;
@@ -1896,6 +2970,137 @@ static bool SwitchBox(float x, float y, float w, const char *question, const cha
     return Clicked(hit);
 }
 
+/* Draws text broken into lines no wider than maxW (breaking at spaces), any length.
+   With draw = false it only measures. Returns the height used. */
+static int WrapText(const char *s, int x, int y, int maxW, int fs, Color c, bool draw)
+{
+    char line[300] = "", trial[300];
+    int  lines = 0, step = fs + 8;
+    const char *p = s;
+    while (*p) {
+        const char *w = p;
+        while (*p && *p != ' ') p++;
+        int wl = (int)(p - w);
+        if (line[0]) snprintf(trial, sizeof trial, "%s %.*s", line, wl, w);
+        else         snprintf(trial, sizeof trial, "%.*s", wl, w);
+        if (line[0] && MeasureText(trial, fs) > maxW) {          /* doesn't fit: start a new line */
+            if (draw) DrawText(line, x, y + lines * step, fs, c);
+            lines++;
+            snprintf(line, sizeof line, "%.*s", wl, w);
+        } else snprintf(line, sizeof line, "%s", trial);
+        while (*p == ' ') p++;
+    }
+    if (line[0]) { if (draw) DrawText(line, x, y + lines * step, fs, c); lines++; }
+    return lines * step;
+}
+
+/* Blue clickable text. rightAlign: x is where the text ends. */
+static bool LinkText(const char *t, float x, float y, bool rightAlign)
+{
+    int w = MeasureText(t, FS);
+    if (rightAlign) x -= (float)w;
+    Rectangle hit = {x, y - 4, (float)w, FS + 8};
+    bool hot = Hover(hit);
+    if (hot) { wantCursor = MOUSE_CURSOR_POINTING_HAND; DrawLine((int)x, (int)y + FS + 1, (int)x + w, (int)y + FS + 1, UI_LINK); }
+    DrawText(t, (int)x, (int)y, FS, UI_LINK);
+    return Clicked(hit);
+}
+
+static void ScreenForgot(void)
+{
+    TextField *order[] = {&tfUser, &tfCode, &tfNewPass, &tfNewPass2};
+    TabCycle(order, 4);
+
+    float pw = 480, px = ((float)W - pw) / 2;
+    DrawCentered("Reset your password", 76, 30, UI_TEXT);
+
+    Rectangle p = {px, 124, pw, 452};
+    DrawRectangleRec(p, UI_PANEL);
+    DrawRectangleLinesEx(p, 1, UI_BORDER);
+    float x = px + 24, y = p.y, fw = pw - 48;
+
+    WrapText("Use the recovery code you saved when you created your account.", (int)x, (int)y + 18, (int)fw, FS, UI_MUTED, true);
+
+    DrawText("Username", (int)x, (int)y + 80, FS, UI_TEXT);
+    bool e1 = TextFieldUI(&tfUser, (Rectangle){x, y + 104, fw, 40}, "your-username");
+
+    DrawText("Recovery code", (int)x, (int)y + 156, FS, UI_TEXT);
+    bool e2 = TextFieldUI(&tfCode, (Rectangle){x, y + 180, fw, 40}, "XXXX-XXXX-XXXX-XXXX");
+
+    DrawText("New password", (int)x, (int)y + 232, FS, UI_TEXT);
+    const char *rule = TextFormat("at least %d characters", MIN_PASS);
+    DrawText(rule, (int)(x + fw) - MeasureText(rule, FS), (int)y + 232, FS, tfNewPass.len >= MIN_PASS ? UI_GREENT : UI_MUTED);
+    bool e3 = TextFieldUI(&tfNewPass, (Rectangle){x, y + 256, fw, 40}, "");
+
+    DrawText("Confirm new password", (int)x, (int)y + 308, FS, UI_TEXT);
+    if (tfNewPass2.len) {
+        bool same = strcmp(tfNewPass.buf, tfNewPass2.buf) == 0;
+        const char *m = same ? "matches" : "doesn't match";
+        DrawText(m, (int)(x + fw) - MeasureText(m, FS), (int)y + 308, FS, same ? UI_GREENT : UI_REDT);
+    }
+    bool e4 = TextFieldUI(&tfNewPass2, (Rectangle){x, y + 332, fw, 40}, "");
+
+    if (lockT > 0) DrawText(TextFormat("Paused - try again in %d s", (int)lockT + 1), (int)x, (int)y + 378, FS, UI_REDT);
+    bool go = Button((Rectangle){x, y + 392, fw, 44}, "Reset password", UI_GREEN);
+
+    /* Enter moves to the next empty box, and resets once everything is filled in */
+    TextField *empty = !tfUser.len ? &tfUser : !tfCode.len ? &tfCode : !tfNewPass.len ? &tfNewPass : !tfNewPass2.len ? &tfNewPass2 : NULL;
+    if ((e1 || e2 || e3 || e4) && empty) { Unfocus(); empty->active = true; }
+    else if (go || e1 || e2 || e3 || e4) DoResetPassword();
+
+    if (SwitchBox(px, 592, pw, "Remembered it? ", "Back to sign in")) GoLogin();
+}
+
+/* Shown once after sign-up, after a reset, or when you make a new code. */
+static void ScreenRecovery(void)
+{
+    float pw = 600, px = ((float)W - pw) / 2;
+    float x = px + 28, iw = pw - 56;                      /* inner width: text never goes past it */
+    const char *intro = codeAfterReset
+        ? "Your old code has been used up, so here is a new one. Keep it somewhere safe, like the old one."
+        : "If you ever forget your password, this code lets you choose a new one on the \"Forgot password?\" page.";
+    const char *warn  = "This is the only time it will be shown.";
+    const char *tip   = "Write it down or copy it into a safe place.";
+    const char *later = "Lost it? You can make a new one any time in Account settings.";
+
+    /* measure first, so the panel is exactly as tall as what's inside it */
+    int hIntro = WrapText(intro, 0, 0, (int)iw, FS, UI_TEXT, false);
+    int hWarn  = WrapText(warn,  0, 0, (int)iw, FS, UI_TEXT, false);
+    int hTip   = WrapText(tip,   0, 0, (int)iw, FS, UI_TEXT, false);
+    int hLater = WrapText(later, 0, 0, (int)iw, FS, UI_TEXT, false);
+    float ph = 24 + hIntro + 16 + 80 + 20 + hWarn + hTip + 20 + 44 + 20 + hLater + 16;
+
+    DrawCentered("Save your recovery code", 90, 30, UI_TEXT);
+    Rectangle p = {px, 144, pw, ph};
+    DrawRectangleRec(p, UI_PANEL);
+    DrawRectangleLinesEx(p, 1, UI_YELLOW);
+
+    float y = p.y + 24;
+    y += WrapText(intro, (int)x, (int)y, (int)iw, FS, UI_TEXT, true) + 16;
+
+    Rectangle box = {x, y, iw, 80};
+    DrawRectangleRec(box, UI_BG);
+    DrawRectangleLinesEx(box, 1, UI_BORDER);
+    int cfs = 40;                                         /* as big as fits in the box */
+    while (cfs > FS && MeasureText(shownCode, cfs) > (int)box.width - 40) cfs -= 2;
+    int cw = MeasureText(shownCode, cfs), cy = (int)(box.y + (box.height - (float)cfs) / 2);
+    DrawText(shownCode, (int)(box.x + (box.width - (float)cw) / 2), cy, cfs, UI_TEXT);
+    DrawText(shownCode, (int)(box.x + (box.width - (float)cw) / 2) + 1, cy, cfs, UI_TEXT);
+    y += 80 + 20;
+
+    y += WrapText(warn, (int)x, (int)y, (int)iw, FS, UI_YELLOW, true);
+    y += WrapText(tip,  (int)x, (int)y, (int)iw, FS, UI_MUTED,  true) + 20;
+
+    if (Button((Rectangle){x, y, 200, 44}, "Copy code", UI_BTN)) {
+        SetClipboardText(shownCode);
+        Toast("Recovery code copied to the clipboard");
+    }
+    bool done = Button((Rectangle){x + iw - 280, y, 280, 44}, "I've saved it - continue", UI_GREEN);
+    y += 44 + 20;
+    WrapText(later, (int)x, (int)y, (int)iw, FS, UI_MUTED, true);
+
+    if (done || IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) GoHome();
+}
 static void ScreenLogin(void)
 {
     TextField *order[] = {&tfUser, &tfPass};
@@ -1912,6 +3117,7 @@ static void ScreenLogin(void)
     DrawText("Username", (int)x, (int)y + 24, FS, UI_TEXT);
     bool e1 = TextFieldUI(&tfUser, (Rectangle){x, y + 50, fw, 40}, "your-username");
     DrawText("Password", (int)x, (int)y + 108, FS, UI_TEXT);
+    if (LinkText("Forgot password?", x + fw, y + 108, true)) { GoForgot(); return; }
     bool e2 = TextFieldUI(&tfPass, (Rectangle){x, y + 134, fw, 40}, "");
     if (lockT > 0) DrawText(TextFormat("Paused - try again in %d s", (int)lockT + 1), (int)x, (int)y + 188, FS, UI_REDT);
     bool go = Button((Rectangle){x, y + 226, fw, 44}, "Sign in", UI_GREEN);
@@ -1963,49 +3169,322 @@ static void ScreenRegister(void)
     if (userCount > 0 && SwitchBox(px, 554, pw, "Already have an account? ", "Sign in")) GoLogin();
 }
 
-/* ---------------- account settings ---------------- */
-static void ScreenAccount(void)
+/* ---------------- settings: profile, password and account ---------------- */
+
+/* Overlap of two rectangles (used so theme previews stay inside a scrolling list). */
+static Rectangle Intersect(Rectangle a, Rectangle b)
 {
-    User *u = FindUserById(curUser);
-    if (!u) { SignOut(); return; }
+    float x0 = a.x > b.x ? a.x : b.x, y0 = a.y > b.y ? a.y : b.y;
+    float x1 = a.x + a.width < b.x + b.width ? a.x + a.width : b.x + b.width;
+    float y1 = a.y + a.height < b.y + b.height ? a.y + a.height : b.y + b.height;
+    return (Rectangle){x0, y0, x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0};
+}
+
+static void UseAvatarPath(User *u, const char *path)
+{
+    const char *err = ImportAvatar(u, path);
+    if (err) Toast(err);
+    else { TF_Clear(&tfAvatar); tfAvatar.active = false; Toast("Profile picture updated"); }
+}
+
+static void SettingsProfileTab(User *u, float top)
+{
+    /* ---- left: picture, colour, bio ---- */
+    Rectangle a = {20, top, 460, (float)H - 20 - top};
+    DrawRectangleRec(a, UI_PANEL);
+    DrawRectangleLinesEx(a, 1, UI_BORDER);
+    float x = a.x + 24, y = top, fw = a.width - 48;
+
+    DrawBold("Profile picture", (int)x, (int)y + 18, FS, UI_TEXT);
+    DrawCircle((int)x + 56, (int)y + 112, 60, THEMES[UserTheme(u->id)].accent);
+    DrawAvatar(u->id, (int)x + 56, (int)y + 112, 56);
+    int tx = (int)x + 136;
+    DrawText("Drag a PNG or JPG picture",  tx, (int)y + 62, FS, UI_MUTED);
+    DrawText("onto this window, or paste", tx, (int)y + 86, FS, UI_MUTED);
+    DrawText("its file path below.",       tx, (int)y + 110, FS, UI_MUTED);
+    if (u->avatar && Button((Rectangle){(float)tx, y + 142, 180, 34}, "Remove picture", UI_BTN)) {
+        RemoveAvatar(u);
+        Toast("Profile picture removed");
+    }
+    bool enter = TextFieldUI(&tfAvatar, (Rectangle){x, y + 190, fw - 100, 40}, "e.g. C:/Users/jo/Pictures/me.jpg");
+    if (Button((Rectangle){x + fw - 90, y + 190, 90, 40}, "Use", UI_GREEN) || enter) UseAvatarPath(u, tfAvatar.buf);
+
+    DrawText("Circle colour (when there's no picture)", (int)x, (int)y + 248, FS, UI_TEXT);
+    for (int i = 0; i <= 8; i++) {
+        Vector2 c = {x + 16 + i * 44.0f, y + 292};
+        Rectangle hit = {c.x - 18, c.y - 18, 36, 36};
+        bool sel = u->avatarColor == i;
+        if (sel) DrawCircleV(c, 19, UI_TEXT);
+        if (i == 0) {                                   /* "Auto": the colour picked for you */
+            DrawCircleV(c, 16, AVATAR_COLORS[u->id % 6]);
+            DrawText("A", (int)c.x - MeasureText("A", FS) / 2, (int)c.y - 10, FS, UI_TEXT);
+        } else DrawCircleV(c, 16, AVATAR_COLORS[i - 1]);
+        if (Hover(hit)) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        if (Clicked(hit)) { u->avatarColor = i; MarkDirty(); }
+    }
+
+    DrawText("Bio", (int)x, (int)y + 336, FS, UI_TEXT);
+    const char *cnt = TextFormat("%d / %d", tfBio.len, BIO_LEN);
+    DrawText(cnt, (int)(x + fw) - MeasureText(cnt, FS), (int)y + 336, FS, tfBio.len > BIO_LEN ? UI_REDT : UI_MUTED);
+    bool bioEnter = TextFieldUI(&tfBio, (Rectangle){x, y + 362, fw, 40}, "A few words about you");
+    bool changed = strcmp(tfBio.buf, u->bio) != 0;
+    if (ButtonEx((Rectangle){x, y + 414, 140, 38}, "Save bio", changed ? UI_GREEN : UI_BTN, changed) || (bioEnter && changed)) {
+        if (tfBio.len > BIO_LEN) Toast(TextFormat("Bios can be at most %d characters", BIO_LEN));
+        else { snprintf(u->bio, sizeof u->bio, "%s", tfBio.buf); MarkDirty(); Toast("Bio saved"); }
+    }
+    if (changed) DrawText("not saved yet", (int)x + 156, (int)y + 423, FS, UI_YELLOW);
+
+    /* ---- right: theme picker ---- */
+    Rectangle b = {500, top, (float)W - 520, (float)H - 20 - top};
+    DrawRectangleRec(b, UI_PANEL);
+    DrawRectangleLinesEx(b, 1, UI_BORDER);
+    DrawBold("Theme", (int)b.x + 24, (int)top + 18, FS, UI_TEXT);
+    DrawFit("Shown behind the app while you're signed in, and on your profile page.",
+            (int)b.x + 24, (int)top + 46, FS, (int)b.width - 48, UI_MUTED);
+
+    Rectangle la = {b.x + 1, top + 84, b.width - 2, b.height - 86};
+    float inner = la.width - 46;
+    int cols = (int)((inner + 14) / (170 + 14));
+    if (cols < 2) cols = 2;
+    float cw = (inner - (cols - 1) * 14) / cols, chh = cw * 0.5f;
+    if (chh > 100) chh = 100;
+    float rowH = chh + 66;
+    int rows = (THEME_COUNT + cols - 1) / cols;
+    ScrollArea(la, &scSettings, rows * rowH);
+
+    for (int i = 0; i < THEME_COUNT; i++) {
+        float cx = la.x + 23 + (i % cols) * (cw + 14), cy = la.y + (i / cols) * rowH - scSettings;
+        Rectangle card = {cx, cy, cw, chh};
+        Rectangle vis = Intersect(card, la);
+        if (vis.height <= 0) continue;
+        DrawRectangleRec(vis, UI_BASE);
+        DrawThemeClip(i, card, vis, 1.0f);
+        BeginScissorMode((int)vis.x, (int)vis.y, (int)vis.width, (int)vis.height);
+        bool sel = u->theme == i, hot = Hover(la) && Hover(card);
+        DrawRectangleLinesEx(card, sel ? 3.0f : 1.0f, sel ? THEMES[i].accent : hot ? UI_TEXT : UI_BORDER);
+        EndScissorMode();
+        if (cy + chh + 50 <= la.y + la.height && cy + chh >= la.y) {
+            DrawBold(THEMES[i].name, (int)cx, (int)(cy + chh + 8), FS, sel ? THEMES[i].accent : UI_TEXT);
+            DrawFit(THEMES[i].blurb, (int)cx, (int)(cy + chh + 32), FS, (int)cw, UI_MUTED);
+        }
+        if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        if (Hover(la) && Clicked(card) && !sel) {
+            u->theme = i;
+            MarkDirty();
+            Toast(TextFormat("Theme changed to %s", THEMES[i].name));
+        }
+    }
+    DrawScrollbar(la, scSettings, rows * rowH);
+}
+
+static void SettingsAccountTab(User *u, float top)
+{
     TextField *order[] = {&tfOldPass, &tfNewPass, &tfNewPass2, &tfDelPass};
     TabCycle(order, 4);
-
-    DrawAvatar(u->id, 60, 112, 40);
-    DrawBold(u->name, 120, 84, 30, UI_TEXT);
     int owned = ReposOwnedBy(u->id);
-    DrawText(TextFormat("Joined %s   |   %d repositor%s", TimeAgo(u->created), owned, owned == 1 ? "y" : "ies"),
-             120, 120, FS, UI_MUTED);
-    if (Button((Rectangle){(float)W - 160, 88, 140, 40}, "Back", UI_BTN)) { GoHome(); return; }
 
     float pw = ((float)W - 60) / 2;
-    Rectangle a = {20, 176, pw, 380}, b = {40 + pw, 176, pw, 380};
+    Rectangle a = {20, top, pw, 336}, b = {40 + pw, top, pw, 336};
     float fw = pw - 48;
 
     /* change password */
     DrawRectangleRec(a, UI_PANEL);
     DrawRectangleLinesEx(a, 1, UI_BORDER);
     float x = a.x + 24, y = a.y;
-    DrawBold("Change password", (int)x, (int)y + 20, FS, UI_TEXT);
-    DrawText("Current password", (int)x, (int)y + 64, FS, UI_MUTED);
-    bool c1 = TextFieldUI(&tfOldPass, (Rectangle){x, y + 90, fw, 40}, "");
-    DrawText("New password", (int)x, (int)y + 144, FS, UI_MUTED);
-    bool c2 = TextFieldUI(&tfNewPass, (Rectangle){x, y + 170, fw, 40}, "");
-    DrawText("Confirm new password", (int)x, (int)y + 224, FS, UI_MUTED);
-    bool c3 = TextFieldUI(&tfNewPass2, (Rectangle){x, y + 250, fw, 40}, "");
-    if (Button((Rectangle){x, y + 312, 220, 44}, "Update password", UI_GREEN) || c1 || c2 || c3) DoChangePassword();
+    DrawBold("Change password", (int)x, (int)y + 18, FS, UI_TEXT);
+    DrawText("Current password", (int)x, (int)y + 54, FS, UI_MUTED);
+    bool c1 = TextFieldUI(&tfOldPass, (Rectangle){x, y + 78, fw, 40}, "");
+    DrawText("New password", (int)x, (int)y + 126, FS, UI_MUTED);
+    bool c2 = TextFieldUI(&tfNewPass, (Rectangle){x, y + 150, fw, 40}, "");
+    DrawText("Confirm new password", (int)x, (int)y + 198, FS, UI_MUTED);
+    bool c3 = TextFieldUI(&tfNewPass2, (Rectangle){x, y + 222, fw, 40}, "");
+    if (Button((Rectangle){x, y + 276, 220, 44}, "Update password", UI_GREEN) || c1 || c2 || c3) DoChangePassword();
 
     /* delete account */
     DrawRectangleRec(b, UI_PANEL);
     DrawRectangleLinesEx(b, 1, UI_DANGER);
     x = b.x + 24; y = b.y;
-    DrawBold("Delete account", (int)x, (int)y + 20, FS, UI_REDT);
-    DrawText("This permanently deletes your account", (int)x, (int)y + 64, FS, UI_MUTED);
-    DrawText(TextFormat("and all %d of your repositories.", owned), (int)x, (int)y + 90, FS, UI_MUTED);
-    DrawText("This can't be undone.", (int)x, (int)y + 116, FS, UI_MUTED);
-    DrawText("Type your password to confirm", (int)x, (int)y + 224, FS, UI_TEXT);
-    TextFieldUI(&tfDelPass, (Rectangle){x, y + 250, fw, 40}, "");
-    if (ConfirmButton((Rectangle){x, y + 312, 260, 44}, "Delete my account", "Click again to delete", 4)) DoDeleteAccount();
+    DrawBold("Delete account", (int)x, (int)y + 18, FS, UI_REDT);
+    DrawText("This permanently deletes your account", (int)x, (int)y + 54, FS, UI_MUTED);
+    DrawText(TextFormat("and all %d of your repositories.", owned), (int)x, (int)y + 80, FS, UI_MUTED);
+    DrawText("This can't be undone.", (int)x, (int)y + 106, FS, UI_MUTED);
+    DrawText("Type your password to confirm", (int)x, (int)y + 198, FS, UI_TEXT);
+    TextFieldUI(&tfDelPass, (Rectangle){x, y + 222, fw, 40}, "");
+    if (ConfirmButton((Rectangle){x, y + 276, 260, 44}, "Delete my account", "Click again to delete", 4)) { DoDeleteAccount(); return; }
+
+    /* recovery code */
+    bool has = HasRecoveryCode(u);
+    Rectangle c = {20, top + 352, (float)W - 40, 88};
+    Rectangle bt = {c.x + c.width - 24 - 340, c.y + 22, 340, 44};
+    int textW = (int)(bt.x - (c.x + 24) - 24);             /* stop before the button */
+    DrawRectangleRec(c, UI_PANEL);
+    DrawRectangleLinesEx(c, 1, has ? UI_BORDER : UI_YELLOW);
+    DrawBold("Recovery code", (int)c.x + 24, (int)c.y + 14, FS, UI_TEXT);
+    WrapText(has ? "Use it if you ever forget your password."
+                 : "None yet - you need one to reset a lost password.",
+             (int)c.x + 24, (int)c.y + 44, textW, FS, has ? UI_MUTED : UI_YELLOW, true);
+    bool make = has ? ConfirmButton(bt, "Make a new code", "Click again - old code stops working", 5)
+                    : Button(bt, "Create recovery code", UI_GREEN);
+    if (make) ShowRecoveryCode(u, false);
+}
+
+static void ScreenAccount(void)
+{
+    User *u = FindUserById(curUser);
+    if (!u) { SignOut(); return; }
+
+    DrawAvatar(u->id, 60, 112, 40);
+    DrawBold(u->name, 120, 84, 30, UI_TEXT);
+    DrawText("Your settings", 120, 120, FS, UI_MUTED);
+    if (Button((Rectangle){(float)W - 160, 88, 140, 40}, "Back", UI_BTN)) { GoHome(); return; }
+    if (Button((Rectangle){(float)W - 330, 88, 160, 40}, "View profile", UI_BTN)) { OpenProfile(u->id); return; }
+
+    int tx = 20;
+    const char *labels[2] = {"Profile", "Password & account"};
+    for (int t = 0; t < 2; t++) {
+        int w = MeasureText(labels[t], FS) + 28;
+        Rectangle tr = {(float)tx, 156, (float)w, 38};
+        bool on = settingsTab == t;
+        if (Hover(tr)) {
+            wantCursor = MOUSE_CURSOR_POINTING_HAND;
+            if (!on) DrawRectangleRounded((Rectangle){(float)tx, 158, (float)w, 30}, 0.3f, 6, UI_HOVER);
+        }
+        DrawText(labels[t], tx + 14, 164, FS, on ? UI_TEXT : UI_MUTED);
+        if (on) DrawRectangle(tx, 191, w, 3, uiAccent);
+        if (Clicked(tr) && !on) { Unfocus(); ClearSecrets(); settingsTab = t; }
+        tx += w + 6;
+    }
+    DrawLine(0, 194, W, 194, UI_BORDER);
+
+    if (settingsTab == 0) SettingsProfileTab(u, 210);
+    else                  SettingsAccountTab(u, 210);
+}
+
+/* ---------------- someone's profile page ---------------- */
+static void ScreenProfile(void)
+{
+    User *u = FindUserById(viewUser);
+    if (!u) { GoHome(); return; }
+    int theme = UserTheme(u->id);
+    Color acc = THEMES[theme].accent;
+
+    Rectangle banner = {0, 57, (float)W, 150};
+    DrawRectangleRec(banner, UI_BASE);
+    DrawTheme(theme, banner, 1.0f);
+    DrawLine(0, 207, W, 207, UI_BORDER);
+
+    if (u->id == curUser) {
+        if (Button((Rectangle){(float)W - 180, 221, 160, 40}, "Edit profile", UI_BTN)) { OpenAccount(); return; }
+    }
+    if (Button((Rectangle){(float)W - (u->id == curUser ? 330 : 160), 221, 140, 40}, "People", UI_BTN)) { OpenPeople(); return; }
+
+    /* left column: picture, name, bio, numbers */
+    int cx = 96, cy = 207;
+    DrawCircle(cx, cy, 80, UI_BASE);
+    DrawCircle(cx, cy, 77, acc);
+    DrawAvatar(u->id, cx, cy, 72);
+    DrawFit(u->name, 20, 292, 30, 290, UI_TEXT);
+    DrawText(TextFormat("Joined %s", TimeAgo(u->created)), 20, 328, FS, UI_MUTED);
+    int y = 362;
+    if (u->bio[0]) y += DrawWrapped(u->bio, 20, y, 290, 6, UI_TEXT) * 24 + 12;
+
+    int nRepos = 0, nCommits = 0, nStars = 0, nIssues = 0;
+    for (int i = 0; i < repoCount; i++) {
+        Repo *r = &repos[i];
+        if (r->owner == u->id) { nRepos++; nStars += r->starCount; }
+        for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author == u->id) nCommits++;
+        for (int k = 0; k < r->issueCount;  k++) if (r->issues[k].author  == u->id) nIssues++;
+    }
+    DrawLine(20, y, 300, y, UI_BORDER);
+    DrawText(TextFormat("%d repositor%s",     nRepos,   nRepos == 1 ? "y" : "ies"), 20, y + 14, FS, UI_TEXT);
+    DrawText(TextFormat("%d commit%s",        nCommits, nCommits == 1 ? "" : "s"),  20, y + 42, FS, UI_TEXT);
+    DrawText(TextFormat("%d star%s received", nStars,   nStars == 1 ? "" : "s"),    20, y + 70, FS, UI_TEXT);
+    DrawText(TextFormat("%d issue%s opened",  nIssues,  nIssues == 1 ? "" : "s"),   20, y + 98, FS, UI_TEXT);
+    DrawText(TextFormat("Theme: %s", THEMES[theme].name), 20, y + 138, FS, acc);
+
+    /* right column: contributions and repositories */
+    float mx = 340, mw = (float)W - 360;
+    long long hoverDay = 0;
+    DrawContributions((Rectangle){mx, 276, mw, 160}, u->id, &hoverDay);
+    if (screen != SCR_PROFILE) return;
+
+    DrawBold(u->id == curUser ? "Your repositories" : TextFormat("%s's repositories", u->name), (int)mx, 452, FS, UI_TEXT);
+    int order[MAX_REPOS], n = 0;
+    for (int i = 0; i < repoCount; i++) if (repos[i].owner == u->id) order[n++] = i;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+            if (LastActivity(&repos[order[b]]) > LastActivity(&repos[order[a]])) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+
+    Rectangle la = {mx, 484, mw, (float)H - 504};
+    float rowH = 84;
+    ScrollArea(la, &scProfile, n * rowH - 10);
+    if (!n) DrawText("No repositories yet.", (int)la.x, (int)la.y + 6, FS, UI_MUTED);
+    BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
+    for (int k = 0; k < n; k++) {
+        Repo *r = &repos[order[k]];
+        Rectangle card = {la.x, la.y + k * rowH - scProfile, la.width - 12, rowH - 10};
+        if (card.y > la.y + la.height || card.y + card.height < la.y) continue;
+        bool hot = Hover(la) && Hover(card);
+        if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        DrawRectangleRec(card, hot ? UI_HOVER : UI_PANEL);
+        DrawRectangleLinesEx(card, 1, UI_BORDER);
+        DrawBold(r->name, (int)card.x + 18, (int)card.y + 12, FS, UI_LINK);
+        DrawFit(TextFormat("%s   |   %d commit%s   |   %d star%s   |   updated %s",
+                           r->desc[0] ? r->desc : "No description",
+                           r->commitCount, r->commitCount == 1 ? "" : "s",
+                           r->starCount, r->starCount == 1 ? "" : "s", TimeAgo(LastActivity(r))),
+                (int)card.x + 18, (int)card.y + 40, FS, (int)card.width - 36, UI_MUTED);
+        if (Hover(la) && Clicked(card)) { EndScissorMode(); OpenRepo(order[k]); return; }
+    }
+    EndScissorMode();
+    DrawScrollbar(la, scProfile, n * rowH - 10);
+
+    if (hoverDay) DrawDayTooltip(u->id, hoverDay);
+}
+
+/* ---------------- everyone on this computer ---------------- */
+static void ScreenPeople(void)
+{
+    DrawBold("People on this computer", 20, 80, 30, UI_TEXT);
+    DrawText("Click someone to see their profile.", 20, 118, FS, UI_MUTED);
+    if (Button((Rectangle){(float)W - 160, 80, 140, 40}, "Back", UI_BTN)) { GoHome(); return; }
+
+    Rectangle la = {20, 160, (float)W - 40, (float)H - 180};
+    float rowH = 104;
+    ScrollArea(la, &scPeople, userCount * rowH - 10);
+    BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
+    for (int i = 0; i < userCount; i++) {
+        User *u = &users[i];
+        Rectangle card = {la.x, la.y + i * rowH - scPeople, la.width - 12, rowH - 10};
+        if (card.y > la.y + la.height || card.y + card.height < la.y) continue;
+        bool hot = Hover(la) && Hover(card);
+        if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        DrawRectangleRec(card, hot ? UI_HOVER : UI_PANEL);
+
+        /* a strip of their theme along the right-hand side */
+        float sw = card.width * 0.3f;
+        Rectangle strip = {card.x + card.width - sw, card.y, sw, card.height};
+        Rectangle vis = Intersect(strip, la);
+        if (vis.height > 0) {
+            DrawRectangleRec(vis, UI_BASE);
+            DrawThemeClip(UserTheme(u->id), strip, vis, 1.0f);   /* this ends the list's clipping... */
+            BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);   /* ...so turn it back on */
+        }
+        DrawRectangleLinesEx(card, 1, UI_BORDER);
+
+        DrawAvatar(u->id, (int)card.x + 50, (int)(card.y + card.height / 2), 32);
+        int tx = (int)card.x + 100, tw = (int)(card.width - sw) - 120;
+        DrawBold(u->name, tx, (int)card.y + 12, FS, UI_LINK);
+        if (u->id == curUser) DrawText("(you)", tx + MeasureText(u->name, FS) + 12, (int)card.y + 12, FS, UI_MUTED);
+        DrawFit(u->bio[0] ? u->bio : "No bio yet", tx, (int)card.y + 38, FS, tw, u->bio[0] ? UI_TEXT : UI_MUTED);
+        int owned = ReposOwnedBy(u->id);
+        DrawFit(TextFormat("%d repositor%s   |   joined %s   |   theme: %s", owned, owned == 1 ? "y" : "ies",
+                           TimeAgo(u->created), THEMES[UserTheme(u->id)].name),
+                tx, (int)card.y + 64, FS, tw, UI_MUTED);
+        if (Hover(la) && Clicked(card)) { int id = u->id; EndScissorMode(); OpenProfile(id); return; }
+    }
+    EndScissorMode();
+    DrawScrollbar(la, scPeople, userCount * rowH - 10);
 }
 
 /* ---------------- home ---------------- */
@@ -2016,9 +3495,17 @@ static void ScreenHome(void)
 
     /* sidebar: who you are and your numbers */
     int sx = 20, sy = 76;
+    DrawCircle(sx + 64, sy + 64, 63, uiAccent);
     DrawAvatar(curUser, sx + 64, sy + 64, 60);
+    Rectangle me1 = {(float)sx, (float)sy, 128, 128};
+    if (Hover(me1)) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+    if (Clicked(me1)) { OpenProfile(curUser); return; }
     DrawFit(me->name, sx, sy + 140, 30, 280, UI_TEXT);
-    DrawText(TextFormat("Joined %s", TimeAgo(me->created)), sx, sy + 176, FS, UI_MUTED);
+    int by = sy + 176;
+    if (me->bio[0]) by += DrawWrapped(me->bio, sx, by, 280, 3, UI_TEXT) * 24 + 6;
+    else { DrawText(TextFormat("Joined %s", TimeAgo(me->created)), sx, by, FS, UI_MUTED); by += 30; }
+    if (Button((Rectangle){(float)sx, (float)by, 260, 34}, "Edit profile", UI_BTN)) { OpenAccount(); return; }
+    sy = by - 214 + 52;                     /* push everything below down to make room */
 
     int myRepos = 0, myCommits = 0, myStars = 0, myIssues = 0;
     for (int i = 0; i < repoCount; i++) {
@@ -2032,7 +3519,12 @@ static void ScreenHome(void)
     DrawText(TextFormat("%d commit%s",     myCommits, myCommits == 1 ? "" : "s"),  sx, sy + 260, FS, UI_TEXT);
     DrawText(TextFormat("%d starred",      myStars),                                sx, sy + 290, FS, UI_TEXT);
     DrawText(TextFormat("%d open issue%s", myIssues,  myIssues == 1 ? "" : "s"),    sx, sy + 320, FS, UI_TEXT);
-    DrawText(TextFormat("%d user%s on this computer", userCount, userCount == 1 ? "" : "s"), sx, sy + 366, FS, UI_MUTED);
+    const char *ppl = TextFormat("%d user%s on this computer", userCount, userCount == 1 ? "" : "s");
+    Rectangle pplHit = {(float)sx, (float)sy + 362, (float)MeasureText(ppl, FS), 28};
+    bool pplHot = Hover(pplHit);
+    DrawText(ppl, sx, sy + 366, FS, pplHot ? UI_LINK : UI_MUTED);
+    if (pplHot) { wantCursor = MOUSE_CURSOR_POINTING_HAND; DrawLine(sx, sy + 388, sx + (int)pplHit.width, sy + 388, UI_LINK); }
+    if (Clicked(pplHit)) { OpenPeople(); return; }
 
     /* main column */
     float mx = 320, mw = (float)W - 340;
@@ -2107,7 +3599,7 @@ static void ScreenHome(void)
     EndScissorMode();
     DrawScrollbar(la, scHome, n * rowH - 10);
 
-    if (hoverDay) DrawDayTooltip(hoverDay);          /* last, so it sits on top of everything */
+    if (hoverDay) DrawDayTooltip(curUser, hoverDay);          /* last, so it sits on top of everything */
 }
 
 static void TryCreateRepo(void)
@@ -2172,7 +3664,7 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
     DrawRectangleRounded(pill, 0.5f, 6, UI_BTN);
     DrawText(badge, (int)pill.x + 10, (int)pill.y + 3, FS, UI_MUTED);
     DrawFit(r->desc[0] ? r->desc : "No description", x, y + 40, FS, W - 400, UI_MUTED);
-    if (Clicked(ownerHit)) { GoHome(); return true; }
+    if (Clicked(ownerHit)) { OpenProfile(r->owner); return true; }
 
     bool starred = HasStarred(r, curUser);
     if (Button((Rectangle){(float)W - 170, (float)y, 150, 38},
@@ -2203,7 +3695,7 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
             if (!on) DrawRectangleRounded((Rectangle){(float)tx, 134, (float)w, 30}, 0.3f, 6, UI_HOVER);
         }
         DrawText(label, tx + 14, 140, FS, on ? UI_TEXT : UI_MUTED);
-        if (on) DrawRectangle(tx, 167, w, 3, UI_ORANGE);
+        if (on) DrawRectangle(tx, 167, w, 3, uiAccent);
         if (Clicked(tr)) { Unfocus(); tab = (Tab)t; screen = SCR_REPO; }
         tx += w + 6;
     }
@@ -2557,7 +4049,8 @@ static void ScreenDay(void)
 {
     long long today = DayStart((long long)time(NULL));
 
-    if (Button((Rectangle){20, 72, 110, 38}, "< Back", UI_BTN)) { GoHome(); return; }
+    bool mine = dayUser == curUser;
+    if (Button((Rectangle){20, 72, 110, 38}, "< Back", UI_BTN)) { if (mine) GoHome(); else OpenProfile(dayUser); return; }
     if (Button((Rectangle){(float)W - 380, 72, 175, 38}, "< Earlier day", UI_BTN)) { curDay = AddDays(curDay, -1); scDay = scDayRepos = 0; }
     bool canLater = curDay < today;
     if (ButtonEx((Rectangle){(float)W - 195, 72, 175, 38}, "Later day >", canLater ? UI_BTN : UI_PANEL, canLater)) {
@@ -2566,16 +4059,18 @@ static void ScreenDay(void)
     }
 
     char title[96];
-    snprintf(title, sizeof title, "%s%s", FormatDay(curDay, true), curDay == today ? "  (today)" : "");
+    if (mine) snprintf(title, sizeof title, "%s%s", FormatDay(curDay, true), curDay == today ? "  (today)" : "");
+    else      snprintf(title, sizeof title, "%s on %s", UserName(dayUser), FormatDay(curDay, true));
     DrawFit(title, 150, 75, 30, W - 560, UI_TEXT);
 
-    GatherDay(curUser, curDay);
+    GatherDay(dayUser, curDay);
 
     /* one-line summary */
     char b1[48], b2[48];
     int sy = 124;
     if (actTotal == 0) {
-        DrawText("You didn't make any commits or open any issues on this day.", 20, sy, FS, UI_MUTED);
+        DrawText(TextFormat("%s didn't make any commits or open any issues on this day.", mine ? "You" : UserName(dayUser)),
+                 20, sy, FS, UI_MUTED);
     } else {
         const char *s = TextFormat("%s in %s   |   ", Count(b1, actTotal, "contribution", "contributions"),
                                    Count(b2, tallyCount, "repository", "repositories"));
@@ -2749,29 +4244,58 @@ int main(void)
         if (lockT > 0)  lockT  -= dt;
         if (armedId && (armedT -= dt) <= 0) armedId = 0;
 
+        /* the signed-in user's theme: its colour, and see-through panels if it draws a background */
+        int bgTheme = curUser >= 0 ? UserTheme(curUser) : THEME_CLASSIC;
+        uiAccent = THEMES[bgTheme].accent;
+        unsigned char see = bgTheme == THEME_CLASSIC ? 255 : 215;
+        UI_PANEL.a = see;
+        UI_HOVER.a = see;
+        UI_BG.a    = bgTheme == THEME_CLASSIC ? 255 : 230;
+
+        /* a picture dropped onto the window */
+        if (IsFileDropped()) {
+            FilePathList dropped = LoadDroppedFiles();
+            User *me = FindUserById(curUser);
+            if (me && screen == SCR_ACCOUNT && dropped.count > 0) {
+                settingsTab = 0;
+                UseAvatarPath(me, dropped.paths[0]);
+            } else if (me) Toast("To change your profile picture, open Edit profile and drop it there");
+            UnloadDroppedFiles(dropped);
+        }
+
         /* every screen except sign-in / sign-up needs someone signed in */
-        if (curUser < 0 && screen != SCR_LOGIN && screen != SCR_REGISTER) GoLogin();
+        if (curUser < 0 && screen != SCR_LOGIN && screen != SCR_REGISTER && screen != SCR_FORGOT) GoLogin();
+        /* the recovery code only stays in memory while its screen is open */
+        if (screen != SCR_RECOVERY && shownCode[0]) memset(shownCode, 0, sizeof shownCode);
 
         if (IsKeyPressed(KEY_ESCAPE)) {
             bool anyFocus = ed.focused || tfSearch.active || tfName.active || tfDesc.active ||
                             tfNewFile.active || tfCommit.active || tfIssue.active || tfUser.active ||
                             tfPass.active || tfPass2.active || tfOldPass.active || tfNewPass.active ||
-                            tfNewPass2.active || tfDelPass.active;
+                            tfNewPass2.active || tfDelPass.active || tfBio.active || tfAvatar.active || tfCode.active;
             if (anyFocus) Unfocus();
-            else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT || screen == SCR_DAY) GoHome();
+            else if (screen == SCR_FORGOT) GoLogin();
+            else if (screen == SCR_RECOVERY) GoHome();
+            else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT || screen == SCR_PROFILE || screen == SCR_PEOPLE) GoHome();
+            else if (screen == SCR_DAY) { if (dayUser == curUser) GoHome(); else OpenProfile(dayUser); }
             else if (screen == SCR_COMMIT && fromDay) screen = SCR_DAY;
             else if (screen == SCR_COMMIT) { screen = SCR_REPO; tab = TAB_COMMITS; }
         }
 
         BeginDrawing();
-        ClearBackground(UI_BG);
+        ClearBackground(UI_BASE);
+        if (bgTheme != THEME_CLASSIC) DrawTheme(bgTheme, (Rectangle){0, 0, (float)W, (float)H}, 0.55f);
         DrawHeader();
 
         switch (screen) {
         case SCR_LOGIN:    ScreenLogin();    break;
         case SCR_REGISTER: ScreenRegister(); break;
+        case SCR_FORGOT:   ScreenForgot();   break;
+        case SCR_RECOVERY: ScreenRecovery(); break;
         case SCR_ACCOUNT:  ScreenAccount();  break;
         case SCR_DAY:      ScreenDay();      break;
+        case SCR_PROFILE:  ScreenProfile();  break;
+        case SCR_PEOPLE:   ScreenPeople();   break;
         case SCR_HOME:     ScreenHome();     break;
         case SCR_NEW:      ScreenNew();      break;
         case SCR_REPO: {
@@ -2800,6 +4324,7 @@ int main(void)
     if (dirty) Save();
     ClearSecrets();
     for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);
+    for (int i = 0; i < userCount; i++) { FreeAvatarTex(&users[i]); free(users[i].avatar); }
     CloseWindow();
     return 0;
 }
