@@ -3,15 +3,19 @@
  * -----------
  * A tiny GitHub-style app that runs entirely on your own computer.
  *
- *   - Repositories you can create, star and delete
- *   - A built-in text editor for the files in each repository
- *   - Commits: a snapshot of every file, saved with a message
+ *   - User accounts: sign up, sign in, sign out, change password, delete account.
+ *     Passwords are never stored - only a salted PBKDF2-SHA256 hash of them.
+ *   - Repositories belong to a user: create, star and delete your own
+ *   - Browse everyone's repositories (read-only unless they're yours)
+ *   - A built-in text editor for the files in your repositories
+ *   - Commits: a snapshot of every file, saved with a message and an author
  *   - Commit history and line-by-line diffs (what was added / removed)
- *   - Issues: a simple bug / to-do list per repository
+ *   - Issues: anyone can open one; the repo owner or the issue's author can close it
  *   - A contribution graph of your commits over the last six months
  *
- * Everything is saved automatically to "minigithub.dat" in the folder
- * the program is run from.
+ * Everything is saved automatically to "minigithub.dat" in the folder the
+ * program is run from. A save file from before accounts existed is upgraded
+ * automatically: the first account created takes over its repositories.
  *
  * Language: C99    Library: raylib 5.x    One file, nothing else needed.
  */
@@ -27,7 +31,8 @@
 /* ------------------------------------------------------------------ */
 /* Limits                                                             */
 /* ------------------------------------------------------------------ */
-#define MAX_REPOS    32
+#define MAX_USERS    32
+#define MAX_REPOS    48
 #define MAX_FILES    32
 #define MAX_COMMITS  200
 #define MAX_BLOBS    1024
@@ -36,6 +41,9 @@
 #define TEXT_LEN     160
 #define MAX_DIFF     1500
 #define SAVE_FILE    "minigithub.dat"
+
+#define MIN_PASS     8       /* shortest password allowed                     */
+#define PBKDF2_ITER  60000   /* hashing rounds: makes password guessing slow   */
 
 #define FS 20   /* normal font size                 */
 #define LH 24   /* row height in the editor / diffs */
@@ -51,6 +59,7 @@ static const Color UI_TEXT   = {230, 237, 243, 255};
 static const Color UI_MUTED  = {125, 133, 144, 255};
 static const Color UI_LINK   = { 88, 166, 255, 255};
 static const Color UI_BTN    = { 33,  38,  45, 255};
+static const Color UI_BLUE   = { 31, 111, 235, 255};
 static const Color UI_GREEN  = { 35, 134,  54, 255};
 static const Color UI_GREENT = { 63, 185,  80, 255};
 static const Color UI_REDT   = {248,  81,  73, 255};
@@ -63,6 +72,16 @@ static const Color UI_ORANGE = {247, 129, 102, 255};
 /* Data                                                               */
 /* ------------------------------------------------------------------ */
 
+/* An account. The password itself is never kept: only a random "salt"
+   and the result of hashing salt + password many thousands of times. */
+typedef struct {
+    int       id;                    /* never reused, even after deletion */
+    char      name[NAME_LEN];
+    char      salt[33];              /* 16 random bytes as hex            */
+    char      hash[65];              /* 32-byte PBKDF2 result as hex      */
+    long long created;
+} User;
+
 /* A blob is one unique version of a file's contents. Identical
    contents are stored only once, just like real git. */
 typedef struct { uint32_t hash; char *data; } Blob;
@@ -72,26 +91,33 @@ typedef struct {
     char      id[8];                 /* short hash, e.g. "3fa9c1d" */
     char      message[TEXT_LEN];
     long long time;
+    int       author;                /* user id */
     int       fileCount;
     char      names[MAX_FILES][NAME_LEN];
     int       blobs[MAX_FILES];
 } Commit;
 
-/* A working file is the version you are editing right now. */
+/* A working file is the version the owner is editing right now. */
 typedef struct { char name[NAME_LEN]; char *text; int len, cap; } WorkFile;
 
-typedef struct { char title[TEXT_LEN]; bool open; long long time; } Issue;
+typedef struct { char title[TEXT_LEN]; bool open; long long time; int author; } Issue;
 
 typedef struct {
+    int       owner;                 /* user id, or -1 = not claimed yet */
     char      name[NAME_LEN];
     char      desc[TEXT_LEN];
-    bool      starred;
     long long created;
+    int       starCount;   int      starredBy[MAX_USERS];
     int       fileCount;   WorkFile files[MAX_FILES];
     int       commitCount; Commit   commits[MAX_COMMITS];
     int       blobCount;   Blob     blobs[MAX_BLOBS];
     int       issueCount;  Issue    issues[MAX_ISSUES];
 } Repo;
+
+static User users[MAX_USERS];
+static int  userCount = 0, nextUserId = 1;
+static int  curUser = -1;            /* id of the signed-in user, -1 = nobody */
+static char lastUser[NAME_LEN];      /* pre-fills the sign-in box             */
 
 static Repo repos[MAX_REPOS];
 static int  repoCount = 0;
@@ -99,20 +125,26 @@ static int  repoCount = 0;
 /* ------------------------------------------------------------------ */
 /* App state                                                          */
 /* ------------------------------------------------------------------ */
-typedef enum { SCR_HOME, SCR_NEW, SCR_REPO, SCR_COMMIT } Screen;
+typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_HOME, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT } Screen;
 typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES } Tab;
 
-typedef struct { char buf[TEXT_LEN]; int len; bool active; } TextField;
+typedef struct { char buf[TEXT_LEN]; int len; bool active; bool secret; } TextField;
 typedef struct { int cursor; float scrollY, scrollX; bool focused; } EditorState;
 
-static Screen screen = SCR_HOME;
+static Screen screen = SCR_LOGIN;
 static Tab    tab    = TAB_CODE;
 static int    curRepo = -1, curFile = -1, curCommit = -1, curChange = -1;
 
-static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue;
+static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser;
+static TextField tfPass    = {.secret = true}, tfPass2    = {.secret = true};
+static TextField tfOldPass = {.secret = true}, tfNewPass  = {.secret = true};
+static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
 static EditorState ed;
-static bool  optReadme = true;
+static bool  optReadme = true, optExample = true;
+static int   homeView;                /* 0 = your repositories, 1 = everyone's */
 static float scHome, scFiles, scCommits, scIssues, scChanges, scDiff;
+static int   failedLogins;
+static float lockT;                   /* sign-in paused after too many wrong passwords */
 
 static int   W, H;
 static bool  clickUsed;       /* stops one click triggering two things */
@@ -244,11 +276,12 @@ static void WF_Free(WorkFile *f) { free(f->text); f->text = NULL; f->len = f->ca
 /* ------------------------------------------------------------------ */
 /* Repositories, blobs and commits                                    */
 /* ------------------------------------------------------------------ */
-static Repo *NewRepo(const char *name, const char *desc)
+static Repo *NewRepo(int owner, const char *name, const char *desc)
 {
     if (repoCount >= MAX_REPOS) return NULL;
     Repo *r = &repos[repoCount++];
     memset(r, 0, sizeof *r);
+    r->owner = owner;
     snprintf(r->name, NAME_LEN, "%s", name);
     snprintf(r->desc, TEXT_LEN, "%s", desc);
     r->created = (long long)time(NULL);
@@ -364,9 +397,11 @@ static const char *DoCommit(Repo *r, const char *msg)
         h ^= r->blobs[b].hash; h *= 16777619u;
     }
     c.fileCount = r->fileCount;
+    c.author = curUser;
     snprintf(c.message, TEXT_LEN, "%s", msg);
     c.time = (long long)time(NULL);
     h = Fnv(msg, (int)strlen(msg), h);
+    h = Fnv((const char *)&c.author, (int)sizeof c.author, h);
     h = Fnv((const char *)&c.time, (int)sizeof c.time, h);
     if (r->commitCount) h = Fnv(Head(r)->id, 7, h);
     snprintf(c.id, sizeof c.id, "%07x", (unsigned)(h & 0xFFFFFFFu));
@@ -382,6 +417,277 @@ static void RestoreCommit(Repo *r, int ci)
     r->fileCount = 0;
     Commit *c = &r->commits[ci];
     for (int k = 0; k < c->fileCount; k++) AddFile(r, c->names[k], r->blobs[c->blobs[k]].data);
+}
+
+/* ------------------------------------------------------------------ */
+/* Users                                                              */
+/* ------------------------------------------------------------------ */
+static bool EqualsCI(const char *a, const char *b)
+{
+    while (*a && *b) {
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+        a++; b++;
+    }
+    return *a == *b;
+}
+
+static User *FindUserById(int id)
+{
+    for (int i = 0; i < userCount; i++) if (users[i].id == id) return &users[i];
+    return NULL;
+}
+static User *FindUserByName(const char *name)
+{
+    for (int i = 0; i < userCount; i++) if (EqualsCI(users[i].name, name)) return &users[i];
+    return NULL;
+}
+/* Deleted accounts show up as "ghost", like on GitHub. */
+static const char *UserName(int id) { User *u = FindUserById(id); return u ? u->name : "ghost"; }
+
+static bool IsMine(Repo *r) { return curUser >= 0 && r->owner == curUser; }
+
+static bool HasStarred(Repo *r, int uid)
+{
+    for (int i = 0; i < r->starCount; i++) if (r->starredBy[i] == uid) return true;
+    return false;
+}
+static void RemoveStar(Repo *r, int uid)
+{
+    for (int i = 0; i < r->starCount; i++)
+        if (r->starredBy[i] == uid) { r->starredBy[i] = r->starredBy[--r->starCount]; return; }
+}
+static void ToggleStar(Repo *r, int uid)
+{
+    if (HasStarred(r, uid)) RemoveStar(r, uid);
+    else if (r->starCount < MAX_USERS) r->starredBy[r->starCount++] = uid;
+}
+
+/* For someone else's repo you see their latest commit, not their unsaved edits. */
+static int ShownCount(Repo *r)
+{
+    if (IsMine(r)) return r->fileCount;
+    Commit *h = Head(r);
+    return h ? h->fileCount : 0;
+}
+
+/* Repos from an old (pre-accounts) save file go to the first account made. */
+static int ClaimOrphans(int uid)
+{
+    int n = 0;
+    for (int i = 0; i < repoCount; i++) {
+        Repo *r = &repos[i];
+        if (r->owner >= 0) continue;
+        r->owner = uid;
+        n++;
+        for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author < 0) r->commits[k].author = uid;
+        for (int k = 0; k < r->issueCount;  k++) if (r->issues[k].author  < 0) r->issues[k].author  = uid;
+    }
+    return n;
+}
+static int OrphanCount(void)
+{
+    int n = 0;
+    for (int i = 0; i < repoCount; i++) if (repos[i].owner < 0) n++;
+    return n;
+}
+
+static int ReposOwnedBy(int uid)
+{
+    int n = 0;
+    for (int i = 0; i < repoCount; i++) if (repos[i].owner == uid) n++;
+    return n;
+}
+
+/* Removes the account, all of its repositories, and its stars elsewhere.
+   Commits and issues it made in other people's repos stay (as "ghost"). */
+static void DeleteAccount(int uid)
+{
+    for (int i = repoCount - 1; i >= 0; i--) if (repos[i].owner == uid) DeleteRepo(i);
+    for (int i = 0; i < repoCount; i++) RemoveStar(&repos[i], uid);
+    for (int i = 0; i < userCount; i++)
+        if (users[i].id == uid) {
+            memmove(&users[i], &users[i + 1], (size_t)(userCount - i - 1) * sizeof(User));
+            userCount--;
+            memset(&users[userCount], 0, sizeof(User));
+            break;
+        }
+}
+
+static const char *ValidateUsername(const char *u)
+{
+    int n = (int)strlen(u);
+    if (n < 1)  return "Choose a username";
+    if (n > 39) return "Usernames can be at most 39 characters";
+    for (int i = 0; i < n; i++)
+        if (!isalnum((unsigned char)u[i]) && u[i] != '-' && u[i] != '_')
+            return "Usernames can only use letters, numbers, - and _";
+    if (FindUserByName(u)) return "That username is already taken";
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Password hashing                                                   */
+/*                                                                    */
+/* SHA-256 turns any input into a 32-byte "fingerprint" that can't be */
+/* reversed. PBKDF2 repeats it tens of thousands of times with a      */
+/* random salt, so even a stolen save file is slow to crack and two   */
+/* people with the same password get different hashes.               */
+/* ------------------------------------------------------------------ */
+typedef struct { uint32_t h[8]; uint8_t buf[64]; uint64_t len; int n; } Sha256;
+
+static const uint32_t K256[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+#define ROR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+static void ShaBlock(Sha256 *s, const uint8_t *p)
+{
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++)
+        w[i] = (uint32_t)p[4*i] << 24 | (uint32_t)p[4*i+1] << 16 | (uint32_t)p[4*i+2] << 8 | p[4*i+3];
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = ROR(w[i-15], 7) ^ ROR(w[i-15], 18) ^ (w[i-15] >> 3);
+        uint32_t s1 = ROR(w[i-2], 17) ^ ROR(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a = s->h[0], b = s->h[1], c = s->h[2], d = s->h[3];
+    uint32_t e = s->h[4], f = s->h[5], g = s->h[6], h = s->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t t1 = h + (ROR(e, 6) ^ ROR(e, 11) ^ ROR(e, 25)) + ((e & f) ^ (~e & g)) + K256[i] + w[i];
+        uint32_t t2 = (ROR(a, 2) ^ ROR(a, 13) ^ ROR(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+        h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
+    }
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d;
+    s->h[4] += e; s->h[5] += f; s->h[6] += g; s->h[7] += h;
+}
+static void ShaInit(Sha256 *s)
+{
+    static const uint32_t iv[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    memcpy(s->h, iv, sizeof iv);
+    s->len = 0;
+    s->n = 0;
+}
+static void ShaUpdate(Sha256 *s, const void *data, size_t len)
+{
+    const uint8_t *p = (const uint8_t *)data;
+    s->len += len;
+    while (len--) {
+        s->buf[s->n++] = *p++;
+        if (s->n == 64) { ShaBlock(s, s->buf); s->n = 0; }
+    }
+}
+static void ShaFinal(Sha256 *s, uint8_t out[32])
+{
+    uint64_t bits = s->len * 8;
+    uint8_t one = 0x80, zero = 0, lenBytes[8];
+    ShaUpdate(s, &one, 1);
+    while (s->n != 56) ShaUpdate(s, &zero, 1);
+    for (int i = 0; i < 8; i++) lenBytes[i] = (uint8_t)(bits >> (56 - 8 * i));
+    ShaUpdate(s, lenBytes, 8);
+    for (int i = 0; i < 8; i++) {
+        out[4*i]   = (uint8_t)(s->h[i] >> 24); out[4*i+1] = (uint8_t)(s->h[i] >> 16);
+        out[4*i+2] = (uint8_t)(s->h[i] >> 8);  out[4*i+3] = (uint8_t)(s->h[i]);
+    }
+}
+
+static void HmacSha256(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mlen, uint8_t out[32])
+{
+    uint8_t k[64] = {0}, ipad[64], opad[64], inner[32];
+    Sha256 s;
+    if (klen > 64) { ShaInit(&s); ShaUpdate(&s, key, klen); ShaFinal(&s, k); }
+    else memcpy(k, key, klen);
+    for (int i = 0; i < 64; i++) { ipad[i] = k[i] ^ 0x36; opad[i] = k[i] ^ 0x5c; }
+    ShaInit(&s); ShaUpdate(&s, ipad, 64); ShaUpdate(&s, msg, mlen); ShaFinal(&s, inner);
+    ShaInit(&s); ShaUpdate(&s, opad, 64); ShaUpdate(&s, inner, 32); ShaFinal(&s, out);
+}
+
+/* Standard PBKDF2-HMAC-SHA256, producing one 32-byte block. */
+static void Pbkdf2(const char *pass, const uint8_t *salt, int saltLen, int iter, uint8_t out[32])
+{
+    size_t plen = strlen(pass);
+    uint8_t msg[64 + 4], u[32], next[32];
+    memcpy(msg, salt, (size_t)saltLen);
+    msg[saltLen] = 0; msg[saltLen + 1] = 0; msg[saltLen + 2] = 0; msg[saltLen + 3] = 1;
+    HmacSha256((const uint8_t *)pass, plen, msg, (size_t)saltLen + 4, u);
+    memcpy(out, u, 32);
+    for (int i = 1; i < iter; i++) {
+        HmacSha256((const uint8_t *)pass, plen, u, 32, next);
+        memcpy(u, next, 32);
+        for (int j = 0; j < 32; j++) out[j] ^= u[j];
+    }
+}
+
+static void ToHex(const uint8_t *in, int n, char *out)
+{
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 0; i < n; i++) { out[2*i] = digits[in[i] >> 4]; out[2*i+1] = digits[in[i] & 15]; }
+    out[2 * n] = 0;
+}
+static int HexVal(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+static void FromHex(const char *in, uint8_t *out, int n)
+{
+    for (int i = 0; i < n; i++) out[i] = (uint8_t)(HexVal(in[2*i]) << 4 | HexVal(in[2*i+1]));
+}
+
+/* Random bytes for salts: the operating system's random source when there
+   is one (Linux / macOS), otherwise a mix of clocks and raylib's generator. */
+static void RandomBytes(uint8_t *out, int n)
+{
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) {
+        size_t got = fread(out, 1, (size_t)n, f);
+        fclose(f);
+        if ((int)got == n) return;
+    }
+    Sha256 s;
+    uint8_t d[32];
+    long long t = (long long)time(NULL);
+    clock_t c = clock();
+    double g = GetTime();
+    void *addr = &s;
+    ShaInit(&s);
+    ShaUpdate(&s, &t, sizeof t); ShaUpdate(&s, &c, sizeof c);
+    ShaUpdate(&s, &g, sizeof g); ShaUpdate(&s, &addr, sizeof addr);
+    for (int i = 0; i < 16; i++) { int v = GetRandomValue(0, 0x7fffffff); ShaUpdate(&s, &v, sizeof v); }
+    ShaFinal(&s, d);
+    for (int i = 0; i < n; i++) out[i] = d[i % 32] ^ (uint8_t)GetRandomValue(0, 255);
+}
+
+static void HashPassword(const char *pass, const char *saltHex, char outHex[65])
+{
+    uint8_t salt[16], dk[32];
+    FromHex(saltHex, salt, 16);
+    Pbkdf2(pass, salt, 16, PBKDF2_ITER, dk);
+    ToHex(dk, 32, outHex);
+}
+static void SetPassword(User *u, const char *pass)
+{
+    uint8_t salt[16];
+    RandomBytes(salt, 16);
+    ToHex(salt, 16, u->salt);
+    HashPassword(pass, u->salt, u->hash);
+}
+/* Compares every character (no early exit) so timing gives nothing away. */
+static bool CheckPassword(User *u, const char *pass)
+{
+    char h[65];
+    HashPassword(pass, u->salt, h);
+    unsigned diff = 0;
+    for (int i = 0; i < 64; i++) diff |= (unsigned)(h[i] ^ u->hash[i]);
+    return diff == 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -506,11 +812,20 @@ static void Save(void)
 {
     FILE *f = fopen(SAVE_FILE ".tmp", "wb");
     if (!f) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(f, "MINIGITHUB1\n");
+    fprintf(f, "MINIGITHUB2\n");
+    WI(f, nextUserId);
+    WS(f, lastUser);
+    WI(f, userCount);
+    for (int i = 0; i < userCount; i++) {
+        User *u = &users[i];
+        WI(f, u->id); WS(f, u->name); WS(f, u->salt); WS(f, u->hash); WI(f, u->created);
+    }
     WI(f, repoCount);
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
-        WS(f, r->name); WS(f, r->desc); WI(f, r->starred); WI(f, r->created);
+        WI(f, r->owner); WS(f, r->name); WS(f, r->desc); WI(f, r->created);
+        WI(f, r->starCount);
+        for (int k = 0; k < r->starCount; k++) WI(f, r->starredBy[k]);
         WI(f, r->fileCount);
         for (int k = 0; k < r->fileCount; k++) { WS(f, r->files[k].name); WS(f, r->files[k].text); }
         WI(f, r->blobCount);
@@ -518,34 +833,68 @@ static void Save(void)
         WI(f, r->commitCount);
         for (int k = 0; k < r->commitCount; k++) {
             Commit *c = &r->commits[k];
-            WS(f, c->id); WS(f, c->message); WI(f, c->time); WI(f, c->fileCount);
+            WS(f, c->id); WS(f, c->message); WI(f, c->time); WI(f, c->author); WI(f, c->fileCount);
             for (int j = 0; j < c->fileCount; j++) { WS(f, c->names[j]); WI(f, c->blobs[j]); }
         }
         WI(f, r->issueCount);
-        for (int k = 0; k < r->issueCount; k++) { WS(f, r->issues[k].title); WI(f, r->issues[k].open); WI(f, r->issues[k].time); }
+        for (int k = 0; k < r->issueCount; k++) {
+            Issue *is = &r->issues[k];
+            WS(f, is->title); WI(f, is->open); WI(f, is->time); WI(f, is->author);
+        }
     }
     fclose(f);
     remove(SAVE_FILE);
     rename(SAVE_FILE ".tmp", SAVE_FILE);
 }
 
+/* Reads version 2 (with accounts) and version 1 (before accounts). */
 static bool Load(void)
 {
     FILE *f = fopen(SAVE_FILE, "rb");
     if (!f) return false;
     loadErr = 0;
     char magic[32] = {0};
-    if (fscanf(f, "%31s", magic) != 1 || strcmp(magic, "MINIGITHUB1") != 0) loadErr = 1;
+    int ver = 0;
+    if (fscanf(f, "%31s", magic) == 1) {
+        if (strcmp(magic, "MINIGITHUB1") == 0) ver = 1;
+        if (strcmp(magic, "MINIGITHUB2") == 0) ver = 2;
+    }
+    if (!ver) loadErr = 1;
+
+    if (ver == 2) {
+        nextUserId = (int)RI(f);
+        RSInto(f, lastUser, NAME_LEN);
+        int uc = (int)RI(f);
+        if (uc < 0 || uc > MAX_USERS) loadErr = 1;
+        for (int i = 0; i < uc && !loadErr; i++) {
+            User *u = &users[userCount++];
+            memset(u, 0, sizeof *u);
+            u->id = (int)RI(f);
+            RSInto(f, u->name, NAME_LEN);
+            RSInto(f, u->salt, (int)sizeof u->salt);
+            RSInto(f, u->hash, (int)sizeof u->hash);
+            u->created = RI(f);
+            if (u->id <= 0 || strlen(u->salt) != 32 || strlen(u->hash) != 64) loadErr = 1;
+            if (u->id >= nextUserId) nextUserId = u->id + 1;
+        }
+    }
+
     int n = loadErr ? 0 : (int)RI(f);
     if (n < 0 || n > MAX_REPOS) loadErr = 1;
 
     for (int i = 0; i < n && !loadErr; i++) {
         Repo *r = &repos[repoCount++];
         memset(r, 0, sizeof *r);
+        r->owner = ver == 2 ? (int)RI(f) : -1;
         RSInto(f, r->name, NAME_LEN);
         RSInto(f, r->desc, TEXT_LEN);
-        r->starred = RI(f) != 0;
+        if (ver == 1) RI(f);                    /* old single-user "starred" flag: dropped */
         r->created = RI(f);
+        if (ver == 2) {
+            int sc = (int)RI(f);
+            if (sc < 0 || sc > MAX_USERS) { loadErr = 1; break; }
+            for (int k = 0; k < sc; k++) r->starredBy[r->starCount++] = (int)RI(f);
+        }
 
         int fc = (int)RI(f);
         if (fc < 0 || fc > MAX_FILES) { loadErr = 1; break; }
@@ -573,7 +922,8 @@ static bool Load(void)
             memset(c, 0, sizeof *c);
             RSInto(f, c->id, (int)sizeof c->id);
             RSInto(f, c->message, TEXT_LEN);
-            c->time = RI(f);
+            c->time   = RI(f);
+            c->author = ver == 2 ? (int)RI(f) : -1;
             int ff = (int)RI(f);
             if (ff < 0 || ff > MAX_FILES) { loadErr = 1; break; }
             c->fileCount = ff;
@@ -591,8 +941,9 @@ static bool Load(void)
         for (int k = 0; k < ic && !loadErr; k++) {
             Issue *is = &r->issues[r->issueCount++];
             RSInto(f, is->title, TEXT_LEN);
-            is->open = RI(f) != 0;
-            is->time = RI(f);
+            is->open   = RI(f) != 0;
+            is->time   = RI(f);
+            is->author = ver == 2 ? (int)RI(f) : -1;
         }
     }
     fclose(f);
@@ -600,7 +951,10 @@ static bool Load(void)
     if (loadErr) {
         for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);
         memset(repos, 0, sizeof repos);
-        repoCount = 0;
+        memset(users, 0, sizeof users);
+        repoCount = userCount = 0;
+        nextUserId = 1;
+        lastUser[0] = 0;
         remove(SAVE_FILE ".bak");
         rename(SAVE_FILE, SAVE_FILE ".bak");
         Toast("Save file was damaged - kept a copy as minigithub.dat.bak");
@@ -609,10 +963,11 @@ static bool Load(void)
     return true;
 }
 
-/* First run: an example repository so the app isn't empty. */
-static void Seed(void)
+/* An example repository for new accounts that want one. */
+static void SeedExample(int owner)
 {
-    Repo *r = NewRepo("hello-world", "My first repository on Mini GitHub");
+    Repo *r = NewRepo(owner, "hello-world", "An example repository to try things out");
+    if (!r) return;
     AddFile(r, "README.md",
         "# hello-world\n"
         "\n"
@@ -628,8 +983,6 @@ static void Seed(void)
         "    return 0;\n"
         "}\n");
     DoCommit(r, "Initial commit");
-    r->commits[0].time -= 2 * 86400;
-    r->created         -= 3 * 86400;
 
     WF_Set(&r->files[0],
         "# hello-world\n"
@@ -644,14 +997,12 @@ static void Seed(void)
         "2. Type a commit message and press Commit\n"
         "3. Open the Commits tab to see exactly what changed\n");
     DoCommit(r, "Add instructions to the README");
-    r->commits[1].time -= 3 * 3600;
 
     Issue *a = &r->issues[r->issueCount++];
     snprintf(a->title, TEXT_LEN, "%s", "Add a LICENSE file");
-    a->open = true;  a->time = (long long)time(NULL) - 86400;
-    Issue *b = &r->issues[r->issueCount++];
-    snprintf(b->title, TEXT_LEN, "%s", "Fix typo in README");
-    b->open = false; b->time = (long long)time(NULL) - 2 * 86400;
+    a->open = true;
+    a->time = (long long)time(NULL);
+    a->author = owner;
 }
 
 /* ------------------------------------------------------------------ */
@@ -682,6 +1033,31 @@ static bool ConfirmButton(Rectangle r, const char *label, const char *sure, int 
 
 static void TF_Clear(TextField *t) { t->buf[0] = 0; t->len = 0; }
 
+/* Tab / Shift+Tab moves between the text boxes on a form. */
+static void TabCycle(TextField **f, int n)
+{
+    if (!IsKeyPressed(KEY_TAB)) return;
+    int cur = -1;
+    for (int i = 0; i < n; i++) { if (f[i]->active) cur = i; f[i]->active = false; }
+    int dir = (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? -1 : 1;
+    f[cur < 0 ? 0 : (cur + dir + n) % n]->active = true;
+}
+
+static void Checkbox(bool *v, int x, int y, const char *label)
+{
+    Rectangle row = {(float)x, (float)y - 3, (float)(34 + MeasureText(label, FS)), 28};
+    Rectangle cb  = {(float)x, (float)y, 22, 22};
+    if (Hover(row)) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+    DrawRectangleRec(cb, *v ? UI_GREEN : UI_BG);
+    DrawRectangleLinesEx(cb, 1, *v ? UI_GREEN : UI_BORDER);
+    if (*v) {
+        DrawLineEx((Vector2){cb.x + 5, cb.y + 11}, (Vector2){cb.x + 9, cb.y + 16}, 3, UI_TEXT);
+        DrawLineEx((Vector2){cb.x + 9, cb.y + 16}, (Vector2){cb.x + 17, cb.y + 6}, 3, UI_TEXT);
+    }
+    DrawText(label, x + 34, y + 1, FS, UI_TEXT);
+    if (Clicked(row)) *v = !*v;
+}
+
 /* One-line text box. Returns true when Enter is pressed in it. */
 static bool TextFieldUI(TextField *t, Rectangle r, const char *placeholder)
 {
@@ -698,12 +1074,17 @@ static bool TextFieldUI(TextField *t, Rectangle r, const char *placeholder)
     DrawRectangleRec(r, UI_BG);
     DrawRectangleLinesEx(r, t->active ? 2.0f : 1.0f, t->active ? UI_LINK : UI_BORDER);
 
+    /* password boxes show one * per character instead of the text */
+    const char *shown = t->buf;
+    char masked[TEXT_LEN];
+    if (t->secret) { memset(masked, '*', (size_t)t->len); masked[t->len] = 0; shown = masked; }
+
     int tx = (int)r.x + 10, ty = (int)(r.y + (r.height - FS) / 2);
-    int textW = MeasureText(t->buf, FS);
+    int textW = MeasureText(shown, FS);
     int off = textW > (int)r.width - 30 ? textW - (int)r.width + 30 : 0;
     BeginScissorMode((int)r.x + 2, (int)r.y, (int)r.width - 4, (int)r.height);
     if (t->len == 0) DrawText(placeholder, tx, ty, FS, UI_MUTED);
-    else             DrawText(t->buf, tx - off, ty, FS, UI_TEXT);
+    else             DrawText(shown, tx - off, ty, FS, UI_TEXT);
     if (t->active && ((int)(GetTime() * 2) % 2) == 0)
         DrawRectangle(tx - off + textW + (t->len ? 2 : 0), ty - 2, 2, FS + 4, UI_TEXT);
     EndScissorMode();
@@ -749,8 +1130,9 @@ static int XToCol(const char *line, int lineLen, float x)
 
 static void SelectFile(int i) { curFile = i; ed.cursor = 0; ed.scrollX = ed.scrollY = 0; }
 
-/* Draws and runs the editor. Returns true if the text was changed. */
-static bool EditorUI(WorkFile *f, Rectangle area)
+/* Draws and runs the editor. Returns true if the text was changed.
+   In read-only mode you can still click, scroll and move the cursor. */
+static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
 {
     bool changed = false, moved = false;
     float gutter = 58, textX = area.x + gutter + 12, top = area.y + 8;
@@ -765,9 +1147,9 @@ static bool EditorUI(WorkFile *f, Rectangle area)
     if (ed.focused) {
         int ch;
         while ((ch = GetCharPressed()) > 0)
-            if (ch >= 32 && ch < 127) { char c = (char)ch; WF_Insert(f, ed.cursor, &c, 1); ed.cursor++; changed = true; }
+            if (!readOnly && ch >= 32 && ch < 127) { char c = (char)ch; WF_Insert(f, ed.cursor, &c, 1); ed.cursor++; changed = true; }
 
-        if (KeyRep(KEY_ENTER) || KeyRep(KEY_KP_ENTER)) {          /* new line, keeping indentation */
+        if (!readOnly && (KeyRep(KEY_ENTER) || KeyRep(KEY_KP_ENTER))) {   /* new line, keeping indentation */
             int ls = LineStart(f->text, ed.cursor), ind = 0;
             while (ls + ind < ed.cursor && f->text[ls + ind] == ' ' && ind < 100) ind++;
             char buf[128];
@@ -777,9 +1159,9 @@ static bool EditorUI(WorkFile *f, Rectangle area)
             ed.cursor += ind + 1;
             changed = true;
         }
-        if (KeyRep(KEY_TAB))                          { WF_Insert(f, ed.cursor, "    ", 4); ed.cursor += 4; changed = true; }
-        if (KeyRep(KEY_BACKSPACE) && ed.cursor > 0)   { WF_Delete(f, ed.cursor - 1, 1); ed.cursor--; changed = true; }
-        if (KeyRep(KEY_DELETE) && ed.cursor < f->len) { WF_Delete(f, ed.cursor, 1); changed = true; }
+        if (!readOnly && KeyRep(KEY_TAB))             { WF_Insert(f, ed.cursor, "    ", 4); ed.cursor += 4; changed = true; }
+        if (!readOnly && KeyRep(KEY_BACKSPACE) && ed.cursor > 0)   { WF_Delete(f, ed.cursor - 1, 1); ed.cursor--; changed = true; }
+        if (!readOnly && KeyRep(KEY_DELETE) && ed.cursor < f->len) { WF_Delete(f, ed.cursor, 1); changed = true; }
         if (KeyRep(KEY_LEFT) && ed.cursor > 0)        { ed.cursor--; moved = true; }
         if (KeyRep(KEY_RIGHT) && ed.cursor < f->len)  { ed.cursor++; moved = true; }
         if (IsKeyPressed(KEY_HOME))                   { ed.cursor = LineStart(f->text, ed.cursor); moved = true; }
@@ -878,10 +1260,80 @@ static void Unfocus(void)
 {
     tfSearch.active = tfName.active = tfDesc.active = false;
     tfNewFile.active = tfCommit.active = tfIssue.active = false;
+    tfUser.active = tfPass.active = tfPass2.active = false;
+    tfOldPass.active = tfNewPass.active = tfNewPass2.active = tfDelPass.active = false;
     ed.focused = false;
     armedId = 0;
 }
-static void GoHome(void) { Unfocus(); screen = SCR_HOME; curRepo = -1; }
+
+/* Wipe every password box so passwords don't sit around in memory or on screen. */
+static void ClearSecrets(void)
+{
+    TextField *s[] = {&tfPass, &tfPass2, &tfOldPass, &tfNewPass, &tfNewPass2, &tfDelPass};
+    for (int i = 0; i < 6; i++) { memset(s[i]->buf, 0, sizeof s[i]->buf); s[i]->len = 0; }
+}
+
+static void PrefillUser(void)
+{
+    snprintf(tfUser.buf, TEXT_LEN, "%s", lastUser);
+    tfUser.len = (int)strlen(tfUser.buf);
+}
+
+static void GoLogin(void)
+{
+    Unfocus();
+    ClearSecrets();
+    PrefillUser();
+    screen = SCR_LOGIN;
+    if (tfUser.len) tfPass.active = true; else tfUser.active = true;
+}
+static void GoRegister(void)
+{
+    Unfocus();
+    ClearSecrets();
+    TF_Clear(&tfUser);
+    optExample = true;
+    screen = SCR_REGISTER;
+    tfUser.active = true;
+}
+
+static void GoHome(void)
+{
+    if (curUser < 0) { GoLogin(); return; }
+    Unfocus();
+    screen = SCR_HOME;
+    curRepo = -1;
+}
+
+static void SignIn(int id)
+{
+    User *u = FindUserById(id);
+    if (!u) return;
+    curUser = id;
+    snprintf(lastUser, NAME_LEN, "%s", u->name);
+    ClearSecrets();
+    TF_Clear(&tfSearch);
+    homeView = 0;
+    scHome = 0;
+    failedLogins = 0;
+    MarkDirty();
+    GoHome();
+}
+
+static void SignOut(void)
+{
+    curUser = -1;
+    curRepo = -1;
+    GoLogin();
+    Toast("You've signed out");
+}
+
+static void OpenAccount(void)
+{
+    Unfocus();
+    ClearSecrets();
+    screen = SCR_ACCOUNT;
+}
 
 static void OpenRepo(int i)
 {
@@ -889,7 +1341,7 @@ static void OpenRepo(int i)
     curRepo = i;
     screen  = SCR_REPO;
     tab     = TAB_CODE;
-    SelectFile(repos[i].fileCount ? 0 : -1);
+    SelectFile(ShownCount(&repos[i]) ? 0 : -1);
     scFiles = scCommits = scIssues = 0;
     TF_Clear(&tfCommit);
     TF_Clear(&tfNewFile);
@@ -917,29 +1369,158 @@ static void OpenCommit(int ci)
 }
 
 /* ------------------------------------------------------------------ */
+/* Account actions                                                    */
+/* ------------------------------------------------------------------ */
+static void DoLogin(void)
+{
+    if (lockT > 0) { Toast(TextFormat("Too many wrong attempts - wait %d seconds", (int)lockT + 1)); return; }
+    if (!tfUser.buf[0] || !tfPass.buf[0]) { Toast("Enter your username and password"); return; }
+
+    User *u = FindUserByName(tfUser.buf);
+    bool ok;
+    if (u) ok = CheckPassword(u, tfPass.buf);
+    else {
+        /* do the same slow work anyway, so you can't tell "no such user" from "wrong password" */
+        char dummy[65];
+        HashPassword(tfPass.buf, "00000000000000000000000000000000", dummy);
+        ok = false;
+    }
+    ClearSecrets();
+
+    if (!ok) {
+        if (++failedLogins >= 5) {
+            failedLogins = 0;
+            lockT = 30;
+            Toast("Too many wrong attempts - sign-in is paused for 30 seconds");
+        } else Toast("Incorrect username or password");
+        Unfocus();
+        tfPass.active = true;
+        return;
+    }
+    char nm[NAME_LEN];
+    snprintf(nm, NAME_LEN, "%s", u->name);
+    SignIn(u->id);
+    Toast(TextFormat("Welcome back, %s", nm));
+}
+
+static void DoRegister(void)
+{
+    const char *err = ValidateUsername(tfUser.buf);
+    if (!err && (int)strlen(tfPass.buf) < MIN_PASS) err = TextFormat("Passwords need at least %d characters", MIN_PASS);
+    if (!err && strcmp(tfPass.buf, tfPass2.buf) != 0) err = "The two passwords don't match";
+    if (!err && userCount >= MAX_USERS) err = "This computer has reached the maximum number of accounts";
+    if (err) { Toast(err); return; }
+
+    User *u = &users[userCount++];
+    memset(u, 0, sizeof *u);
+    u->id = nextUserId++;
+    snprintf(u->name, NAME_LEN, "%s", tfUser.buf);
+    u->created = (long long)time(NULL);
+    SetPassword(u, tfPass.buf);
+
+    int  uid = u->id;
+    char nm[NAME_LEN];
+    snprintf(nm, NAME_LEN, "%s", u->name);
+    SignIn(uid);
+    int claimed = ClaimOrphans(uid);
+    if (optExample && !claimed) SeedExample(uid);
+    MarkDirty();
+    Toast(claimed ? TextFormat("Welcome, %s - your existing repositories are now yours", nm)
+                  : TextFormat("Welcome to Mini GitHub, %s!", nm));
+}
+
+static void DoChangePassword(void)
+{
+    User *u = FindUserById(curUser);
+    if (!u) return;
+    const char *msg = NULL;
+    if (!CheckPassword(u, tfOldPass.buf))                 msg = "Your current password is wrong";
+    else if ((int)strlen(tfNewPass.buf) < MIN_PASS)      msg = TextFormat("New passwords need at least %d characters", MIN_PASS);
+    else if (strcmp(tfNewPass.buf, tfNewPass2.buf) != 0) msg = "The two new passwords don't match";
+    else {
+        SetPassword(u, tfNewPass.buf);
+        MarkDirty();
+        msg = "Password updated";
+    }
+    ClearSecrets();
+    Unfocus();
+    Toast(msg);
+}
+
+static void DoDeleteAccount(void)
+{
+    User *u = FindUserById(curUser);
+    if (!u) return;
+    if (!CheckPassword(u, tfDelPass.buf)) { ClearSecrets(); Toast("Wrong password - your account was not deleted"); return; }
+    char nm[NAME_LEN];
+    snprintf(nm, NAME_LEN, "%s", u->name);
+    int id = curUser;
+    curUser = -1;
+    DeleteAccount(id);
+    if (EqualsCI(lastUser, nm)) lastUser[0] = 0;
+    MarkDirty();
+    if (userCount) GoLogin(); else GoRegister();
+    Toast(TextFormat("The account %s has been deleted", nm));
+}
+
+/* ------------------------------------------------------------------ */
 /* Screens                                                            */
 /* ------------------------------------------------------------------ */
+static Color AvatarColor(int id)
+{
+    static const Color pal[6] = {
+        {137, 87, 229, 255}, { 31, 111, 235, 255}, { 35, 134,  54, 255},
+        {191, 135,  0, 255}, {207,  34,  46, 255}, {219,  97, 162, 255}
+    };
+    return pal[(id < 0 ? 0 : id) % 6];
+}
+
+/* A coloured circle with the first letter of the user's name. */
+static void DrawAvatar(int id, int cx, int cy, int radius)
+{
+    const char *n = UserName(id);
+    char letter[2] = {(char)toupper((unsigned char)n[0]), 0};
+    int fs = radius >= 40 ? 60 : radius >= 24 ? 30 : 20;
+    DrawCircle(cx, cy, (float)radius, AvatarColor(id));
+    DrawText(letter, cx - MeasureText(letter, fs) / 2, cy - fs / 2 + 1, fs, UI_TEXT);
+}
+
+static void DrawLogo(int cx, int cy)
+{
+    DrawCircle(cx, cy, 18, UI_TEXT);
+    DrawLineEx((Vector2){(float)cx - 6, (float)cy - 10}, (Vector2){(float)cx - 6, (float)cy + 10}, 3, UI_BG);
+    DrawLineEx((Vector2){(float)cx + 6, (float)cy - 6},  (Vector2){(float)cx - 6, (float)cy + 4},  3, UI_BG);
+    DrawCircle(cx - 6, cy - 10, 4, UI_BG);
+    DrawCircle(cx - 6, cy + 10, 4, UI_BG);
+    DrawCircle(cx + 6, cy - 6, 4, UI_BG);
+}
+
 static void DrawHeader(void)
 {
     DrawRectangle(0, 0, W, 56, UI_PANEL);
     DrawLine(0, 56, W, 56, UI_BORDER);
-
-    /* logo: a little "branch" icon */
-    DrawCircle(38, 28, 18, UI_TEXT);
-    DrawLineEx((Vector2){32, 18}, (Vector2){32, 38}, 3, UI_BG);
-    DrawLineEx((Vector2){44, 22}, (Vector2){32, 32}, 3, UI_BG);
-    DrawCircle(32, 18, 4, UI_BG);
-    DrawCircle(32, 38, 4, UI_BG);
-    DrawCircle(44, 22, 4, UI_BG);
+    DrawLogo(38, 28);
     DrawBold("Mini GitHub", 68, 18, FS, UI_TEXT);
+    if (curUser < 0) return;
 
     Rectangle home = {18, 8, 200, 40};
     if (Hover(home)) wantCursor = MOUSE_CURSOR_POINTING_HAND;
     if (Clicked(home)) GoHome();
 
-    DrawCircle(W - 36, 28, 16, UI_PURPLE);
-    DrawText("Y", W - 41, 19, FS, UI_TEXT);
-    DrawText("you", W - 64 - MeasureText("you", FS), 18, FS, UI_MUTED);
+    if (Button((Rectangle){(float)W - 130, 10, 112, 36}, "Sign out", UI_BTN)) { SignOut(); return; }
+
+    /* name + avatar: click to open account settings */
+    const char *nm = UserName(curUser);
+    int nw = MeasureText(nm, FS);
+    int bw = nw + 8 + 12 + 32 + 8;
+    Rectangle acct = {(float)(W - 146 - bw), 8, (float)bw, 40};
+    if (Hover(acct)) {
+        wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        DrawRectangleRounded(acct, 0.3f, 6, UI_HOVER);
+    }
+    DrawText(nm, (int)acct.x + 8, 18, FS, UI_TEXT);
+    DrawAvatar(curUser, (int)acct.x + 8 + nw + 12 + 16, 28, 16);
+    if (Clicked(acct)) OpenAccount();
 }
 
 static Color Heat(int c)
@@ -951,7 +1532,8 @@ static Color Heat(int c)
     return             (Color){ 57, 211,  83, 255};
 }
 
-static void DrawContributions(Rectangle area)
+/* Squares for the last 26 weeks, coloured by how many commits uid made that day. */
+static void DrawContributions(Rectangle area, int uid)
 {
     enum { WEEKS = 26 };
     int counts[WEEKS * 7] = {0}, total = 0;
@@ -964,6 +1546,7 @@ static void DrawContributions(Rectangle area)
 
     for (int i = 0; i < repoCount; i++)
         for (int k = 0; k < repos[i].commitCount; k++) {
+            if (repos[i].commits[k].author != uid) continue;
             long long t = repos[i].commits[k].time;
             int daysAgo = t >= (long long)midnight ? 0 : (int)(((long long)midnight - t - 1) / 86400) + 1;
             int pos = todayPos - daysAgo;
@@ -986,33 +1569,169 @@ static void DrawContributions(Rectangle area)
     DrawText("More", lx + 138, ly, FS, UI_MUTED);
 }
 
+/* ---------------- sign in / create account ---------------- */
+static void DrawCentered(const char *t, int y, int fs, Color c) { DrawText(t, W / 2 - MeasureText(t, fs) / 2, y, fs, c); }
+
+/* A grey box under the form with "question  link". Returns true when the link is clicked. */
+static bool SwitchBox(float x, float y, float w, const char *question, const char *link)
+{
+    Rectangle q = {x, y, w, 56};
+    DrawRectangleRec(q, UI_BG);
+    DrawRectangleLinesEx(q, 1, UI_BORDER);
+    int aw = MeasureText(question, FS), lw = MeasureText(link, FS);
+    int sx = (int)(x + w / 2) - (aw + lw) / 2;
+    DrawText(question, sx, (int)y + 18, FS, UI_MUTED);
+    DrawText(link, sx + aw, (int)y + 18, FS, UI_LINK);
+    Rectangle hit = {(float)(sx + aw), y + 12, (float)lw, 32};
+    if (Hover(hit)) { wantCursor = MOUSE_CURSOR_POINTING_HAND; DrawLine(sx + aw, (int)y + 40, sx + aw + lw, (int)y + 40, UI_LINK); }
+    return Clicked(hit);
+}
+
+static void ScreenLogin(void)
+{
+    TextField *order[] = {&tfUser, &tfPass};
+    TabCycle(order, 2);
+
+    float pw = 440, px = ((float)W - pw) / 2;
+    DrawCentered("Sign in to Mini GitHub", 96, 30, UI_TEXT);
+
+    Rectangle p = {px, 150, pw, 296};
+    DrawRectangleRec(p, UI_PANEL);
+    DrawRectangleLinesEx(p, 1, UI_BORDER);
+    float x = px + 24, y = p.y, fw = pw - 48;
+
+    DrawText("Username", (int)x, (int)y + 24, FS, UI_TEXT);
+    bool e1 = TextFieldUI(&tfUser, (Rectangle){x, y + 50, fw, 40}, "your-username");
+    DrawText("Password", (int)x, (int)y + 108, FS, UI_TEXT);
+    bool e2 = TextFieldUI(&tfPass, (Rectangle){x, y + 134, fw, 40}, "");
+    if (lockT > 0) DrawText(TextFormat("Paused - try again in %d s", (int)lockT + 1), (int)x, (int)y + 188, FS, UI_REDT);
+    bool go = Button((Rectangle){x, y + 226, fw, 44}, "Sign in", UI_GREEN);
+
+    if (e1 && !tfPass.len) { Unfocus(); tfPass.active = true; }   /* Enter in username: jump to password */
+    else if (go || e1 || e2) DoLogin();
+
+    if (SwitchBox(px, 466, pw, "New to Mini GitHub? ", "Create an account")) GoRegister();
+    if (userCount == 0) DrawCentered("No accounts exist yet - create the first one.", 546, FS, UI_MUTED);
+}
+
+static void ScreenRegister(void)
+{
+    TextField *order[] = {&tfUser, &tfPass, &tfPass2};
+    TabCycle(order, 3);
+
+    float pw = 460, px = ((float)W - pw) / 2;
+    DrawCentered("Create your account", 80, 30, UI_TEXT);
+
+    Rectangle p = {px, 130, pw, 404};
+    DrawRectangleRec(p, UI_PANEL);
+    DrawRectangleLinesEx(p, 1, UI_BORDER);
+    float x = px + 24, y = p.y, fw = pw - 48;
+
+    DrawText("Username", (int)x, (int)y + 22, FS, UI_TEXT);
+    bool e1 = TextFieldUI(&tfUser, (Rectangle){x, y + 48, fw, 40}, "letters, numbers, - and _");
+
+    DrawText("Password", (int)x, (int)y + 104, FS, UI_TEXT);
+    const char *rule = TextFormat("at least %d characters", MIN_PASS);
+    DrawText(rule, (int)(x + fw) - MeasureText(rule, FS), (int)y + 104, FS, tfPass.len >= MIN_PASS ? UI_GREENT : UI_MUTED);
+    bool e2 = TextFieldUI(&tfPass, (Rectangle){x, y + 130, fw, 40}, "");
+
+    DrawText("Confirm password", (int)x, (int)y + 186, FS, UI_TEXT);
+    if (tfPass2.len) {
+        bool same = strcmp(tfPass.buf, tfPass2.buf) == 0;
+        const char *m = same ? "matches" : "doesn't match";
+        DrawText(m, (int)(x + fw) - MeasureText(m, FS), (int)y + 186, FS, same ? UI_GREENT : UI_REDT);
+    }
+    bool e3 = TextFieldUI(&tfPass2, (Rectangle){x, y + 212, fw, 40}, "");
+
+    if (OrphanCount() > 0 && userCount == 0)
+        DrawText("Your existing repositories will move here.", (int)x, (int)y + 272, FS, UI_YELLOW);
+    else
+        Checkbox(&optExample, (int)x, (int)y + 272, "Start with an example repository");
+
+    bool go = Button((Rectangle){x, y + 328, fw, 44}, "Create account", UI_GREEN);
+    if (go || e1 || e2 || e3) DoRegister();
+
+    if (userCount > 0 && SwitchBox(px, 554, pw, "Already have an account? ", "Sign in")) GoLogin();
+}
+
+/* ---------------- account settings ---------------- */
+static void ScreenAccount(void)
+{
+    User *u = FindUserById(curUser);
+    if (!u) { SignOut(); return; }
+    TextField *order[] = {&tfOldPass, &tfNewPass, &tfNewPass2, &tfDelPass};
+    TabCycle(order, 4);
+
+    DrawAvatar(u->id, 60, 112, 40);
+    DrawBold(u->name, 120, 84, 30, UI_TEXT);
+    int owned = ReposOwnedBy(u->id);
+    DrawText(TextFormat("Joined %s   |   %d repositor%s", TimeAgo(u->created), owned, owned == 1 ? "y" : "ies"),
+             120, 120, FS, UI_MUTED);
+    if (Button((Rectangle){(float)W - 160, 88, 140, 40}, "Back", UI_BTN)) { GoHome(); return; }
+
+    float pw = ((float)W - 60) / 2;
+    Rectangle a = {20, 176, pw, 380}, b = {40 + pw, 176, pw, 380};
+    float fw = pw - 48;
+
+    /* change password */
+    DrawRectangleRec(a, UI_PANEL);
+    DrawRectangleLinesEx(a, 1, UI_BORDER);
+    float x = a.x + 24, y = a.y;
+    DrawBold("Change password", (int)x, (int)y + 20, FS, UI_TEXT);
+    DrawText("Current password", (int)x, (int)y + 64, FS, UI_MUTED);
+    bool c1 = TextFieldUI(&tfOldPass, (Rectangle){x, y + 90, fw, 40}, "");
+    DrawText("New password", (int)x, (int)y + 144, FS, UI_MUTED);
+    bool c2 = TextFieldUI(&tfNewPass, (Rectangle){x, y + 170, fw, 40}, "");
+    DrawText("Confirm new password", (int)x, (int)y + 224, FS, UI_MUTED);
+    bool c3 = TextFieldUI(&tfNewPass2, (Rectangle){x, y + 250, fw, 40}, "");
+    if (Button((Rectangle){x, y + 312, 220, 44}, "Update password", UI_GREEN) || c1 || c2 || c3) DoChangePassword();
+
+    /* delete account */
+    DrawRectangleRec(b, UI_PANEL);
+    DrawRectangleLinesEx(b, 1, UI_DANGER);
+    x = b.x + 24; y = b.y;
+    DrawBold("Delete account", (int)x, (int)y + 20, FS, UI_REDT);
+    DrawText("This permanently deletes your account", (int)x, (int)y + 64, FS, UI_MUTED);
+    DrawText(TextFormat("and all %d of your repositories.", owned), (int)x, (int)y + 90, FS, UI_MUTED);
+    DrawText("This can't be undone.", (int)x, (int)y + 116, FS, UI_MUTED);
+    DrawText("Type your password to confirm", (int)x, (int)y + 224, FS, UI_TEXT);
+    TextFieldUI(&tfDelPass, (Rectangle){x, y + 250, fw, 40}, "");
+    if (ConfirmButton((Rectangle){x, y + 312, 260, 44}, "Delete my account", "Click again to delete", 4)) DoDeleteAccount();
+}
+
+/* ---------------- home ---------------- */
 static void ScreenHome(void)
 {
-    /* sidebar */
-    int sx = 20, sy = 76;
-    DrawCircle(sx + 64, sy + 64, 60, UI_PURPLE);
-    DrawText("Y", sx + 64 - MeasureText("Y", 60) / 2, sy + 36, 60, UI_TEXT);
-    DrawBold("you", sx, sy + 140, 30, UI_TEXT);
-    DrawText("Local developer", sx, sy + 176, FS, UI_MUTED);
+    User *me = FindUserById(curUser);
+    if (!me) { SignOut(); return; }
 
-    int commits = 0, stars = 0, issues = 0;
+    /* sidebar: who you are and your numbers */
+    int sx = 20, sy = 76;
+    DrawAvatar(curUser, sx + 64, sy + 64, 60);
+    DrawFit(me->name, sx, sy + 140, 30, 280, UI_TEXT);
+    DrawText(TextFormat("Joined %s", TimeAgo(me->created)), sx, sy + 176, FS, UI_MUTED);
+
+    int myRepos = 0, myCommits = 0, myStars = 0, myIssues = 0;
     for (int i = 0; i < repoCount; i++) {
-        commits += repos[i].commitCount;
-        stars   += repos[i].starred;
-        issues  += OpenIssues(&repos[i]);
+        Repo *r = &repos[i];
+        if (r->owner == curUser) { myRepos++; myIssues += OpenIssues(r); }
+        if (HasStarred(r, curUser)) myStars++;
+        for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author == curUser) myCommits++;
     }
     DrawLine(sx, sy + 214, sx + 260, sy + 214, UI_BORDER);
-    DrawText(TextFormat("%d repositor%s",  repoCount, repoCount == 1 ? "y" : "ies"), sx, sy + 230, FS, UI_TEXT);
-    DrawText(TextFormat("%d commit%s",     commits,   commits == 1 ? "" : "s"),      sx, sy + 260, FS, UI_TEXT);
-    DrawText(TextFormat("%d starred",      stars),                                    sx, sy + 290, FS, UI_TEXT);
-    DrawText(TextFormat("%d open issue%s", issues,    issues == 1 ? "" : "s"),        sx, sy + 320, FS, UI_TEXT);
+    DrawText(TextFormat("%d repositor%s",  myRepos,   myRepos == 1 ? "y" : "ies"), sx, sy + 230, FS, UI_TEXT);
+    DrawText(TextFormat("%d commit%s",     myCommits, myCommits == 1 ? "" : "s"),  sx, sy + 260, FS, UI_TEXT);
+    DrawText(TextFormat("%d starred",      myStars),                                sx, sy + 290, FS, UI_TEXT);
+    DrawText(TextFormat("%d open issue%s", myIssues,  myIssues == 1 ? "" : "s"),    sx, sy + 320, FS, UI_TEXT);
+    DrawText(TextFormat("%d user%s on this computer", userCount, userCount == 1 ? "" : "s"), sx, sy + 366, FS, UI_MUTED);
 
     /* main column */
     float mx = 320, mw = (float)W - 340;
-    DrawContributions((Rectangle){mx, 72, mw, 160});
+    DrawContributions((Rectangle){mx, 72, mw, 160}, curUser);
 
-    DrawBold("Repositories", (int)mx, 258, FS, UI_TEXT);
-    TextFieldUI(&tfSearch, (Rectangle){mx + 160, 248, mw - 160 - 130, 40}, "Find a repository...");
+    if (ButtonEx((Rectangle){mx, 248, 100, 40}, "Yours", homeView == 0 ? UI_BLUE : UI_BTN, true))       { homeView = 0; scHome = 0; }
+    if (ButtonEx((Rectangle){mx + 106, 248, 120, 40}, "Everyone", homeView == 1 ? UI_BLUE : UI_BTN, true)) { homeView = 1; scHome = 0; }
+    TextFieldUI(&tfSearch, (Rectangle){mx + 240, 248, mw - 240 - 130, 40}, "Find a repository...");
     if (Button((Rectangle){mx + mw - 120, 248, 120, 40}, "New", UI_GREEN)) {
         Unfocus();
         TF_Clear(&tfName);
@@ -1023,9 +1742,14 @@ static void ScreenHome(void)
         return;
     }
 
-    /* newest activity first, filtered by the search box */
+    /* which repos to list: filter, then newest activity first */
     int order[MAX_REPOS], n = 0;
-    for (int i = 0; i < repoCount; i++) if (ContainsCI(repos[i].name, tfSearch.buf)) order[n++] = i;
+    for (int i = 0; i < repoCount; i++) {
+        Repo *r = &repos[i];
+        if (homeView == 0 && r->owner != curUser) continue;
+        if (!ContainsCI(r->name, tfSearch.buf) && !ContainsCI(UserName(r->owner), tfSearch.buf)) continue;
+        order[n++] = i;
+    }
     for (int a = 0; a < n; a++)
         for (int b = a + 1; b < n; b++)
             if (LastActivity(&repos[order[b]]) > LastActivity(&repos[order[a]])) { int t = order[a]; order[a] = order[b]; order[b] = t; }
@@ -1033,9 +1757,12 @@ static void ScreenHome(void)
     Rectangle la = {mx, 302, mw, (float)H - 322};
     float rowH = 110;
     ScrollArea(la, &scHome, n * rowH - 10);
-    if (n == 0)
-        DrawText(repoCount ? "No repositories match your search." : "No repositories yet - press New to make one.",
-                 (int)la.x, (int)la.y + 10, FS, UI_MUTED);
+    if (n == 0) {
+        const char *m = tfSearch.len ? "No repositories match your search."
+                      : homeView == 0 ? "You have no repositories yet - press New to make one."
+                                      : "Nobody has made a repository yet.";
+        DrawText(m, (int)la.x, (int)la.y + 10, FS, UI_MUTED);
+    }
 
     BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
     for (int k = 0; k < n; k++) {
@@ -1046,14 +1773,24 @@ static void ScreenHome(void)
         if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
         DrawRectangleRec(card, hot ? UI_HOVER : UI_PANEL);
         DrawRectangleLinesEx(card, 1, UI_BORDER);
-        DrawBold(r->name, (int)card.x + 18, (int)card.y + 14, FS, UI_LINK);
-        if (r->starred) DrawText("starred", (int)card.x + 34 + MeasureText(r->name, FS), (int)card.y + 14, FS, UI_YELLOW);
+
+        int tx = (int)card.x + 18;
+        if (homeView == 1) {                       /* show "owner / name" when browsing everyone */
+            const char *own = TextFormat("%s / ", UserName(r->owner));
+            DrawText(own, tx, (int)card.y + 14, FS, UI_LINK);
+            tx += MeasureText(own, FS);
+        }
+        DrawBold(r->name, tx, (int)card.y + 14, FS, UI_LINK);
+        tx += MeasureText(r->name, FS) + 16;
+        if (HasStarred(r, curUser)) DrawText("starred", tx, (int)card.y + 14, FS, UI_YELLOW);
+
         DrawFit(r->desc[0] ? r->desc : "No description", (int)card.x + 18, (int)card.y + 42, FS, (int)card.width - 36, UI_MUTED);
-        DrawText(TextFormat("%d commit%s   |   %d open issue%s   |   updated %s",
-                            r->commitCount, r->commitCount == 1 ? "" : "s",
-                            OpenIssues(r), OpenIssues(r) == 1 ? "" : "s",
-                            TimeAgo(LastActivity(r))),
-                 (int)card.x + 18, (int)card.y + 70, FS, UI_MUTED);
+        DrawFit(TextFormat("%d commit%s   |   %d open issue%s   |   %d star%s   |   updated %s",
+                           r->commitCount, r->commitCount == 1 ? "" : "s",
+                           OpenIssues(r), OpenIssues(r) == 1 ? "" : "s",
+                           r->starCount, r->starCount == 1 ? "" : "s",
+                           TimeAgo(LastActivity(r))),
+                (int)card.x + 18, (int)card.y + 70, FS, (int)card.width - 36, UI_MUTED);
         if (Hover(la) && Clicked(card)) OpenRepo(order[k]);
     }
     EndScissorMode();
@@ -1066,9 +1803,9 @@ static void TryCreateRepo(void)
     SanitizeName(tfName.buf, nm);
     if (!nm[0]) { Toast("Please give the repository a name"); return; }
     for (int i = 0; i < repoCount; i++)
-        if (strcmp(repos[i].name, nm) == 0) { Toast("You already have a repository with that name"); return; }
-    Repo *r = NewRepo(nm, tfDesc.buf);
-    if (!r) { Toast("You've reached the maximum number of repositories"); return; }
+        if (repos[i].owner == curUser && EqualsCI(repos[i].name, nm)) { Toast("You already have a repository with that name"); return; }
+    Repo *r = NewRepo(curUser, nm, tfDesc.buf);
+    if (!r) { Toast("This computer has reached the maximum number of repositories"); return; }
     if (optReadme) {
         AddFile(r, "README.md", TextFormat("# %s\n\n%s\n", nm, tfDesc.buf[0] ? tfDesc.buf : "A new project."));
         DoCommit(r, "Initial commit");
@@ -1080,30 +1817,22 @@ static void TryCreateRepo(void)
 
 static void ScreenNew(void)
 {
+    TextField *order[] = {&tfName, &tfDesc};
+    TabCycle(order, 2);
+
     Rectangle p = {(float)W / 2 - 310, 100, 620, 430};
     DrawRectangleRec(p, UI_PANEL);
     DrawRectangleLinesEx(p, 1, UI_BORDER);
     int x = (int)p.x + 30, y = (int)p.y;
 
     DrawBold("Create a new repository", x, y + 28, 30, UI_TEXT);
-    DrawText("A repository holds your files and their full history.", x, y + 70, FS, UI_MUTED);
+    DrawText(TextFormat("Owner: %s", UserName(curUser)), x, y + 70, FS, UI_MUTED);
 
     DrawText("Repository name", x, y + 116, FS, UI_TEXT);
     bool e1 = TextFieldUI(&tfName, (Rectangle){(float)x, (float)y + 142, 560, 40}, "e.g. my-project");
     DrawText("Description (optional)", x, y + 198, FS, UI_TEXT);
     bool e2 = TextFieldUI(&tfDesc, (Rectangle){(float)x, (float)y + 224, 560, 40}, "What is this project about?");
-
-    Rectangle cbRow = {(float)x, (float)y + 284, 280, 28};
-    Rectangle cb    = {(float)x, (float)y + 287, 22, 22};
-    if (Hover(cbRow)) wantCursor = MOUSE_CURSOR_POINTING_HAND;
-    DrawRectangleRec(cb, optReadme ? UI_GREEN : UI_BG);
-    DrawRectangleLinesEx(cb, 1, optReadme ? UI_GREEN : UI_BORDER);
-    if (optReadme) {
-        DrawLineEx((Vector2){cb.x + 5, cb.y + 11}, (Vector2){cb.x + 9, cb.y + 16}, 3, UI_TEXT);
-        DrawLineEx((Vector2){cb.x + 9, cb.y + 16}, (Vector2){cb.x + 17, cb.y + 6}, 3, UI_TEXT);
-    }
-    DrawText("Add a README file", x + 34, y + 288, FS, UI_TEXT);
-    if (Clicked(cbRow)) optReadme = !optReadme;
+    Checkbox(&optReadme, x, y + 287, "Add a README file");
 
     bool create = Button((Rectangle){p.x + p.width - 230, (float)y + 350, 200, 44}, "Create repository", UI_GREEN);
     bool cancel = Button((Rectangle){p.x + p.width - 360, (float)y + 350, 120, 44}, "Cancel", UI_BTN);
@@ -1111,28 +1840,35 @@ static void ScreenNew(void)
     if (create || e1 || e2) TryCreateRepo();
 }
 
+/* ---------------- repository pages ---------------- */
+
 /* Returns true if the repository was deleted or we left it (so stop drawing it). */
 static bool DrawRepoHeader(Repo *r, int activeTab)
 {
     int x = 20, y = 72;
-    int w1 = MeasureText("you", 30), w2 = MeasureText(" / ", 30), w3 = MeasureText(r->name, 30);
-    Rectangle owner = {(float)x, (float)y, (float)w1, 30};
-    if (Hover(owner)) wantCursor = MOUSE_CURSOR_POINTING_HAND;
-    DrawText("you", x, y, 30, UI_LINK);
+    const char *owner = UserName(r->owner);
+    int w1 = MeasureText(owner, 30), w2 = MeasureText(" / ", 30), w3 = MeasureText(r->name, 30);
+    Rectangle ownerHit = {(float)x, (float)y, (float)w1, 30};
+    if (Hover(ownerHit)) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+    DrawText(owner, x, y, 30, UI_LINK);
     DrawText(" / ", x + w1, y, 30, UI_MUTED);
     DrawBold(r->name, x + w1 + w2, y, 30, UI_TEXT);
-    Rectangle pill = {(float)(x + w1 + w2 + w3 + 16), (float)y + 2, 70, 26};
+    bool mine = IsMine(r);
+    const char *badge = mine ? "Yours" : "Read-only";
+    Rectangle pill = {(float)(x + w1 + w2 + w3 + 16), (float)y + 2, (float)MeasureText(badge, FS) + 20, 26};
     DrawRectangleRounded(pill, 0.5f, 6, UI_BTN);
-    DrawText("Local", (int)pill.x + 10, (int)pill.y + 3, FS, UI_MUTED);
+    DrawText(badge, (int)pill.x + 10, (int)pill.y + 3, FS, UI_MUTED);
     DrawFit(r->desc[0] ? r->desc : "No description", x, y + 40, FS, W - 400, UI_MUTED);
-    if (Clicked(owner)) { GoHome(); return true; }
+    if (Clicked(ownerHit)) { GoHome(); return true; }
 
-    if (Button((Rectangle){(float)W - 150, (float)y, 130, 38}, r->starred ? "Starred" : "Star",
-               r->starred ? (Color){110, 80, 20, 255} : UI_BTN)) {
-        r->starred = !r->starred;
+    bool starred = HasStarred(r, curUser);
+    if (Button((Rectangle){(float)W - 170, (float)y, 150, 38},
+               TextFormat("%s  %d", starred ? "Starred" : "Star", r->starCount),
+               starred ? (Color){110, 80, 20, 255} : UI_BTN)) {
+        ToggleStar(r, curUser);
         MarkDirty();
     }
-    if (ConfirmButton((Rectangle){(float)W - 340, (float)y, 180, 38}, "Delete repo", "Really delete?", 1)) {
+    if (mine && ConfirmButton((Rectangle){(float)W - 360, (float)y, 180, 38}, "Delete repo", "Really delete?", 1)) {
         int i = curRepo;
         GoHome();
         DeleteRepo(i);
@@ -1143,7 +1879,7 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
 
     int tx = 20;
     for (int t = 0; t < 3; t++) {
-        const char *label = t == 0 ? TextFormat("Code  %d", r->fileCount)
+        const char *label = t == 0 ? TextFormat("Code  %d", ShownCount(r))
                           : t == 1 ? TextFormat("Commits  %d", r->commitCount)
                                    : TextFormat("Issues  %d", OpenIssues(r));
         int w = MeasureText(label, FS) + 28;
@@ -1162,8 +1898,48 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
     return false;
 }
 
+/* File list on the left. Names come from the working files (yours) or the latest commit (theirs). */
+static void DrawFileList(Repo *r, Rectangle la)
+{
+    bool mine = IsMine(r);
+    int n = ShownCount(r);
+    float rowH = 30;
+    ScrollArea(la, &scFiles, n * rowH);
+    if (!n) DrawText(mine ? "No files yet" : "Nothing committed yet", (int)la.x + 14, (int)la.y + 6, FS, UI_MUTED);
+    BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
+    for (int i = 0; i < n; i++) {
+        Rectangle row = {la.x, la.y + i * rowH - scFiles, la.width, rowH};
+        bool hot = Hover(la) && Hover(row);
+        if (i == curFile) DrawRectangleRec(row, (Color){56, 139, 253, 40});
+        else if (hot)     DrawRectangleRec(row, UI_HOVER);
+        if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        const char *name = mine ? r->files[i].name : Head(r)->names[i];
+        DrawFit(name, (int)row.x + 14, (int)row.y + 5, FS, (int)row.width - 54, UI_TEXT);
+        if (mine) {
+            char st = FileStatus(r, i);
+            if (st) DrawText(st == 'A' ? "A" : "M", (int)(row.x + row.width - 28), (int)row.y + 5, FS, st == 'A' ? UI_GREENT : UI_YELLOW);
+        }
+        if (Hover(la) && Clicked(row)) SelectFile(i);
+    }
+    EndScissorMode();
+    DrawScrollbar(la, scFiles, n * rowH);
+}
+
+static void DrawFileHeader(Rectangle fh, const char *name, const char *tag, Color tagColor, WorkFile *f)
+{
+    DrawRectangleRec(fh, UI_PANEL);
+    DrawRectangleLinesEx(fh, 1, UI_BORDER);
+    DrawBold(name, (int)fh.x + 14, (int)fh.y + 11, FS, UI_TEXT);
+    if (tag) DrawText(tag, (int)fh.x + 30 + MeasureText(name, FS), (int)fh.y + 11, FS, tagColor);
+    int ls = LineStart(f->text, ed.cursor);
+    const char *info = TextFormat("Ln %d, Col %d   |   %d lines",
+                                  LineOf(f->text, ed.cursor) + 1, ed.cursor - ls + 1, LineOf(f->text, f->len) + 1);
+    DrawText(info, (int)(fh.x + fh.width) - 14 - MeasureText(info, FS), (int)fh.y + 11, FS, UI_MUTED);
+}
+
 static void TabCode(Repo *r)
 {
+    bool mine = IsMine(r);
     float top = 186, bottom = (float)H - 20;
 
     /* ---- left: file list ---- */
@@ -1171,86 +1947,81 @@ static void TabCode(Repo *r)
     DrawRectangleRec(lp, UI_PANEL);
     DrawRectangleLinesEx(lp, 1, UI_BORDER);
     DrawBold("Files", (int)lp.x + 14, (int)top + 12, FS, UI_TEXT);
+    DrawFileList(r, (Rectangle){lp.x + 1, top + 44, lp.width - 2, lp.height - 44 - (mine ? 156 : 4)});
 
-    Rectangle la = {lp.x + 1, top + 44, lp.width - 2, lp.height - 44 - 156};
-    float rowH = 30;
-    ScrollArea(la, &scFiles, r->fileCount * rowH);
-    if (!r->fileCount) DrawText("No files yet", (int)la.x + 14, (int)la.y + 6, FS, UI_MUTED);
-    BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
-    for (int i = 0; i < r->fileCount; i++) {
-        Rectangle row = {la.x, la.y + i * rowH - scFiles, la.width, rowH};
-        bool hot = Hover(la) && Hover(row);
-        if (i == curFile) DrawRectangleRec(row, (Color){56, 139, 253, 40});
-        else if (hot)     DrawRectangleRec(row, UI_HOVER);
-        if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
-        DrawFit(r->files[i].name, (int)row.x + 14, (int)row.y + 5, FS, (int)row.width - 54, UI_TEXT);
-        char st = FileStatus(r, i);
-        if (st) DrawText(st == 'A' ? "A" : "M", (int)(row.x + row.width - 28), (int)row.y + 5, FS, st == 'A' ? UI_GREENT : UI_YELLOW);
-        if (Hover(la) && Clicked(row)) SelectFile(i);
-    }
-    EndScissorMode();
-    DrawScrollbar(la, scFiles, r->fileCount * rowH);
-
-    float by = lp.y + lp.height - 148;
-    DrawLine((int)lp.x, (int)by - 10, (int)(lp.x + lp.width), (int)by - 10, UI_BORDER);
-    bool addEnter = TextFieldUI(&tfNewFile, (Rectangle){lp.x + 12, by, lp.width - 24, 38}, "new-file.txt");
-    if (Button((Rectangle){lp.x + 12, by + 46, 114, 36}, "Add file", UI_GREEN) || addEnter) {
-        char nm[NAME_LEN];
-        SanitizeName(tfNewFile.buf, nm);
-        if (!nm[0])                    Toast("Type a file name first, e.g. notes.txt");
-        else if (FindFile(r, nm) >= 0) Toast("A file with that name already exists");
-        else {
-            int idx = AddFile(r, nm, "");
-            if (idx < 0) Toast("This repository can't hold any more files");
+    if (mine) {
+        float by = lp.y + lp.height - 148;
+        DrawLine((int)lp.x, (int)by - 10, (int)(lp.x + lp.width), (int)by - 10, UI_BORDER);
+        bool addEnter = TextFieldUI(&tfNewFile, (Rectangle){lp.x + 12, by, lp.width - 24, 38}, "new-file.txt");
+        if (Button((Rectangle){lp.x + 12, by + 46, 114, 36}, "Add file", UI_GREEN) || addEnter) {
+            char nm[NAME_LEN];
+            SanitizeName(tfNewFile.buf, nm);
+            if (!nm[0])                    Toast("Type a file name first, e.g. notes.txt");
+            else if (FindFile(r, nm) >= 0) Toast("A file with that name already exists");
             else {
-                SelectFile(idx);
-                Unfocus();
-                ed.focused = true;
-                TF_Clear(&tfNewFile);
-                MarkDirty();
+                int idx = AddFile(r, nm, "");
+                if (idx < 0) Toast("This repository can't hold any more files");
+                else {
+                    SelectFile(idx);
+                    Unfocus();
+                    ed.focused = true;
+                    TF_Clear(&tfNewFile);
+                    MarkDirty();
+                }
             }
         }
+        if (curFile >= 0 && ConfirmButton((Rectangle){lp.x + lp.width - 126, by + 46, 114, 36}, "Delete", "Sure?", 3)) {
+            int was = curFile;
+            RemoveFile(r, was);
+            SelectFile(r->fileCount == 0 ? -1 : (was < r->fileCount ? was : r->fileCount - 1));
+            MarkDirty();
+            Toast("File deleted - commit to record it in the history");
+        }
+        int nch = ChangeCount(r);
+        DrawText(nch ? TextFormat("%d change%s to commit", nch, nch == 1 ? "" : "s") : "All changes committed",
+                 (int)lp.x + 14, (int)by + 100, FS, nch ? UI_YELLOW : UI_MUTED);
     }
-    if (curFile >= 0 && ConfirmButton((Rectangle){lp.x + lp.width - 126, by + 46, 114, 36}, "Delete", "Sure?", 3)) {
-        int was = curFile;
-        RemoveFile(r, was);
-        SelectFile(r->fileCount == 0 ? -1 : (was < r->fileCount ? was : r->fileCount - 1));
-        MarkDirty();
-        Toast("File deleted - commit to record it in the history");
-    }
-    int nch = ChangeCount(r);
-    DrawText(nch ? TextFormat("%d change%s to commit", nch, nch == 1 ? "" : "s") : "All changes committed",
-             (int)lp.x + 14, (int)by + 100, FS, nch ? UI_YELLOW : UI_MUTED);
 
-    /* ---- right: editor + commit bar ---- */
+    /* ---- right: editor (or read-only viewer) + bottom bar ---- */
     Rectangle rp  = {300, top, (float)W - 320, bottom - top};
     Rectangle fh  = {rp.x, rp.y, rp.width, 42};
     Rectangle edr = {rp.x, rp.y + 42, rp.width, rp.height - 42 - 62};
     Rectangle cb  = {rp.x, rp.y + rp.height - 48, rp.width, 48};
 
-    if (curFile >= 0 && curFile < r->fileCount) {
-        WorkFile *f = &r->files[curFile];
-        if (EditorUI(f, edr)) MarkDirty();
-        DrawRectangleLinesEx(edr, 1, UI_BORDER);
-
-        DrawRectangleRec(fh, UI_PANEL);
-        DrawRectangleLinesEx(fh, 1, UI_BORDER);
-        DrawBold(f->name, (int)fh.x + 14, (int)fh.y + 11, FS, UI_TEXT);
-        char st = FileStatus(r, curFile);
-        if (st) DrawText(st == 'A' ? "new file" : "modified", (int)fh.x + 30 + MeasureText(f->name, FS), (int)fh.y + 11, FS,
-                         st == 'A' ? UI_GREENT : UI_YELLOW);
-        int ls = LineStart(f->text, ed.cursor);
-        const char *info = TextFormat("Ln %d, Col %d   |   %d lines",
-                                      LineOf(f->text, ed.cursor) + 1, ed.cursor - ls + 1, LineOf(f->text, f->len) + 1);
-        DrawText(info, (int)(fh.x + fh.width) - 14 - MeasureText(info, FS), (int)fh.y + 11, FS, UI_MUTED);
+    if (curFile >= 0 && curFile < ShownCount(r)) {
+        if (mine) {
+            WorkFile *f = &r->files[curFile];
+            if (EditorUI(f, edr, false)) MarkDirty();
+            DrawRectangleLinesEx(edr, 1, UI_BORDER);
+            char st = FileStatus(r, curFile);
+            DrawFileHeader(fh, f->name, st == 'A' ? "new file" : st == 'M' ? "modified" : NULL,
+                           st == 'A' ? UI_GREENT : UI_YELLOW, f);
+        } else {
+            /* show the committed version through a temporary, never-modified WorkFile */
+            static WorkFile view;
+            Commit *h = Head(r);
+            snprintf(view.name, NAME_LEN, "%s", h->names[curFile]);
+            view.text = (char *)BlobText(r, h->blobs[curFile]);
+            view.len  = (int)strlen(view.text);
+            view.cap  = 0;
+            EditorUI(&view, edr, true);
+            DrawRectangleLinesEx(edr, 1, UI_BORDER);
+            DrawFileHeader(fh, view.name, TextFormat("as of commit %s", h->id), UI_MUTED, &view);
+        }
     } else {
         Rectangle e = {rp.x, rp.y, rp.width, rp.height - 62};
         DrawRectangleRec(e, UI_PANEL);
         DrawRectangleLinesEx(e, 1, UI_BORDER);
-        const char *m = "Pick a file on the left, or add a new one.";
+        const char *m = mine ? "Pick a file on the left, or add a new one." : "This repository has no committed files yet.";
         DrawText(m, (int)(e.x + e.width / 2) - MeasureText(m, FS) / 2, (int)(e.y + e.height / 2) - 10, FS, UI_MUTED);
     }
 
+    if (!mine) {
+        const char *o = UserName(r->owner);
+        DrawFit(TextFormat("You're viewing %s's latest commit. Only %s can change this repository.", o, o),
+                (int)cb.x, (int)cb.y + 14, FS, (int)cb.width, UI_MUTED);
+        return;
+    }
     bool enter = TextFieldUI(&tfCommit, (Rectangle){cb.x, cb.y + 4, cb.width - 156, 42}, "Describe your changes (the commit message)");
     if (Button((Rectangle){cb.x + cb.width - 146, cb.y + 4, 146, 42}, "Commit", UI_GREEN) || enter) {
         const char *err = DoCommit(r, tfCommit.buf);
@@ -1272,7 +2043,7 @@ static void TabCommits(Repo *r)
     ScrollArea(la, &scCommits, n * rowH);
     if (!n) {
         DrawText("No commits yet.", 20, 196, FS, UI_TEXT);
-        DrawText("Edit some files in the Code tab, write a message, then press Commit.", 20, 226, FS, UI_MUTED);
+        if (IsMine(r)) DrawText("Edit some files in the Code tab, write a message, then press Commit.", 20, 226, FS, UI_MUTED);
         return;
     }
     BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
@@ -1285,8 +2056,9 @@ static void TabCommits(Repo *r)
         if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
         DrawRectangleRec(row, hot ? UI_HOVER : UI_PANEL);
         DrawRectangleLinesEx(row, 1, UI_BORDER);
-        DrawFit(c->message, (int)row.x + 18, (int)row.y + 14, FS, (int)row.width - 260, UI_TEXT);
-        DrawText(TextFormat("you committed %s", TimeAgo(c->time)), (int)row.x + 18, (int)row.y + 42, FS, UI_MUTED);
+        DrawAvatar(c->author, (int)row.x + 36, (int)row.y + 37, 18);
+        DrawFit(c->message, (int)row.x + 70, (int)row.y + 14, FS, (int)row.width - 310, UI_TEXT);
+        DrawText(TextFormat("%s committed %s", UserName(c->author), TimeAgo(c->time)), (int)row.x + 70, (int)row.y + 42, FS, UI_MUTED);
 
         Rectangle idPill = {row.x + row.width - 120, row.y + 20, 102, 34};
         DrawRectangleRounded(idPill, 0.3f, 6, UI_BTN);
@@ -1311,8 +2083,9 @@ static void TabIssues(Repo *r)
         else {
             Issue *is = &r->issues[r->issueCount++];
             snprintf(is->title, TEXT_LEN, "%s", tfIssue.buf);
-            is->open = true;
-            is->time = (long long)time(NULL);
+            is->open   = true;
+            is->time   = (long long)time(NULL);
+            is->author = curUser;
             TF_Clear(&tfIssue);
             MarkDirty();
             Toast(TextFormat("Opened issue #%d", r->issueCount));
@@ -1348,9 +2121,13 @@ static void TabIssues(Repo *r)
         DrawText(state, (int)(pill.x + pill.width / 2) - MeasureText(state, FS) / 2, (int)pill.y + 5, FS, UI_TEXT);
 
         DrawFit(is->title, (int)row.x + 124, (int)row.y + 12, FS, (int)row.width - 290, is->open ? UI_TEXT : UI_MUTED);
-        DrawText(TextFormat("#%d opened %s", i + 1, TimeAgo(is->time)), (int)row.x + 124, (int)row.y + 38, FS, UI_MUTED);
+        DrawText(TextFormat("#%d opened %s by %s", i + 1, TimeAgo(is->time), UserName(is->author)),
+                 (int)row.x + 124, (int)row.y + 38, FS, UI_MUTED);
 
-        if (ButtonEx((Rectangle){row.x + row.width - 140, row.y + 16, 124, 36}, is->open ? "Close" : "Reopen", UI_BTN, Hover(la))) {
+        /* only the repo owner or whoever opened the issue may close / reopen it */
+        bool canManage = IsMine(r) || is->author == curUser;
+        if (canManage &&
+            ButtonEx((Rectangle){row.x + row.width - 140, row.y + 16, 124, 36}, is->open ? "Close" : "Reopen", UI_BTN, Hover(la))) {
             is->open = !is->open;
             MarkDirty();
         }
@@ -1391,7 +2168,8 @@ static void ScreenCommit(Repo *r)
     Commit *c = &r->commits[curCommit];
 
     if (Button((Rectangle){20, 186, 170, 38}, "< All commits", UI_BTN)) { Unfocus(); screen = SCR_REPO; tab = TAB_COMMITS; return; }
-    if (ConfirmButton((Rectangle){(float)W - 330, 186, 310, 38}, "Restore files from here", "Click again to confirm", 2)) {
+    if (IsMine(r) &&
+        ConfirmButton((Rectangle){(float)W - 330, 186, 310, 38}, "Restore files from here", "Click again to confirm", 2)) {
         RestoreCommit(r, curCommit);
         SelectFile(r->fileCount ? 0 : -1);
         MarkDirty();
@@ -1403,8 +2181,8 @@ static void ScreenCommit(Repo *r)
     }
 
     DrawFit(c->message, 20, 238, 30, W - 40, UI_TEXT);
-    const char *meta = TextFormat("you committed %s   |   commit %s   |   %d file%s changed   ",
-                                  TimeAgo(c->time), c->id, changeCount, changeCount == 1 ? "" : "s");
+    const char *meta = TextFormat("%s committed %s   |   commit %s   |   %d file%s changed   ",
+                                  UserName(c->author), TimeAgo(c->time), c->id, changeCount, changeCount == 1 ? "" : "s");
     DrawText(meta, 20, 276, FS, UI_MUTED);
     int mx = 20 + MeasureText(meta, FS);
     const char *plus = TextFormat("+%d ", totalAdds);
@@ -1477,7 +2255,11 @@ int main(void)
     SetExitKey(KEY_NULL);            /* Esc goes "back" instead of quitting */
     SetTargetFPS(60);
 
-    if (!Load()) { Seed(); MarkDirty(); }
+    Load();
+    if (userCount == 0) {
+        GoRegister();
+        if (OrphanCount() > 0) Toast("Create an account to take over your existing repositories");
+    } else GoLogin();
 
     float saveTimer = 0;
     int   lastCursor = -1;
@@ -1489,14 +2271,20 @@ int main(void)
         wantCursor = MOUSE_CURSOR_DEFAULT;
         float dt = GetFrameTime();
         if (toastT > 0) toastT -= dt;
+        if (lockT > 0)  lockT  -= dt;
         if (armedId && (armedT -= dt) <= 0) armedId = 0;
+
+        /* every screen except sign-in / sign-up needs someone signed in */
+        if (curUser < 0 && screen != SCR_LOGIN && screen != SCR_REGISTER) GoLogin();
 
         if (IsKeyPressed(KEY_ESCAPE)) {
             bool anyFocus = ed.focused || tfSearch.active || tfName.active || tfDesc.active ||
-                            tfNewFile.active || tfCommit.active || tfIssue.active;
-            if (anyFocus)                                     Unfocus();
-            else if (screen == SCR_NEW || screen == SCR_REPO) GoHome();
-            else if (screen == SCR_COMMIT)                    { screen = SCR_REPO; tab = TAB_COMMITS; }
+                            tfNewFile.active || tfCommit.active || tfIssue.active || tfUser.active ||
+                            tfPass.active || tfPass2.active || tfOldPass.active || tfNewPass.active ||
+                            tfNewPass2.active || tfDelPass.active;
+            if (anyFocus) Unfocus();
+            else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT) GoHome();
+            else if (screen == SCR_COMMIT) { screen = SCR_REPO; tab = TAB_COMMITS; }
         }
 
         BeginDrawing();
@@ -1504,8 +2292,11 @@ int main(void)
         DrawHeader();
 
         switch (screen) {
-        case SCR_HOME: ScreenHome(); break;
-        case SCR_NEW:  ScreenNew();  break;
+        case SCR_LOGIN:    ScreenLogin();    break;
+        case SCR_REGISTER: ScreenRegister(); break;
+        case SCR_ACCOUNT:  ScreenAccount();  break;
+        case SCR_HOME:     ScreenHome();     break;
+        case SCR_NEW:      ScreenNew();      break;
         case SCR_REPO: {
             Repo *r = &repos[curRepo];
             if (DrawRepoHeader(r, tab)) break;
@@ -1530,6 +2321,7 @@ int main(void)
     }
 
     if (dirty) Save();
+    ClearSecrets();
     for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);
     CloseWindow();
     return 0;
