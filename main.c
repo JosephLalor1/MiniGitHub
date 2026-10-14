@@ -17,7 +17,9 @@
  *   - Issues: anyone can open one; the repo owner or the issue's author can close it
  *   - Profiles: a picture (PNG or JPG, dragged onto the window or by file path), a short
  *     bio, a circle colour, and a choice of animated themes (Classic is the plain look)
- *   - A People page and a profile page for every user
+ *   - A People page and a profile page for every user. Your own profile is your
+ *     home page: it's where you land after signing in, and it lists your
+ *     repositories (or everyone's), with a search box and a New button
  *   - A contribution graph of the last six months: hover a day to see what you
  *     did, click it to open a page listing every commit and issue from that day
  *
@@ -152,7 +154,7 @@ static int  repoCount = 0;
 /* ------------------------------------------------------------------ */
 /* App state                                                          */
 /* ------------------------------------------------------------------ */
-typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_FORGOT, SCR_RECOVERY, SCR_HOME, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY, SCR_PROFILE, SCR_PEOPLE } Screen;
+typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_FORGOT, SCR_RECOVERY, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY, SCR_PROFILE, SCR_PEOPLE } Screen;
 typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES } Tab;
 
 typedef struct { char buf[TEXT_LEN]; int len; bool active; bool secret; bool reveal; } TextField;
@@ -169,7 +171,7 @@ static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
 static EditorState ed;
 static bool  optReadme = true, optExample = true;
 static int   homeView;                /* 0 = your repositories, 1 = everyone's */
-static float scHome, scFiles, scCommits, scIssues, scChanges, scDiff, scDay, scDayRepos;
+static float scFiles, scCommits, scIssues, scChanges, scDiff, scDay, scDayRepos;
 static char  shownCode[24];           /* recovery code on screen right now (never saved) */
 static bool  codeAfterReset;          /* the code screen was reached by resetting a password */
 static float scProfile, scPeople, scSettings;
@@ -2603,11 +2605,12 @@ static void ShowRecoveryCode(User *u, bool afterReset)
     screen = SCR_RECOVERY;
 }
 
+static void OpenProfile(int id);
+
 static void GoHome(void)
 {
     if (curUser < 0) { GoLogin(); return; }
-    Unfocus();
-    screen = SCR_HOME;
+    OpenProfile(curUser);                          /* your profile is your home page */
     curRepo = -1;
 }
 
@@ -2620,7 +2623,7 @@ static void SignIn(int id)
     ClearSecrets();
     TF_Clear(&tfSearch);
     homeView = 0;
-    scHome = 0;
+    viewUser = -1;
     failedLogins = 0;
     MarkDirty();
     GoHome();
@@ -2649,10 +2652,13 @@ static void OpenAccount(void)
 
 static void OpenProfile(int id)
 {
-    if (!FindUserById(id)) { GoHome(); return; }
+    if (!FindUserById(id)) { if (curUser >= 0 && id != curUser) GoHome(); return; }
     Unfocus();
+    if (viewUser != id) {                        /* a different person: start at the top, no search */
+        scProfile = 0;
+        TF_Clear(&tfSearch);
+    }
     viewUser = id;
-    scProfile = 0;
     screen = SCR_PROFILE;
 }
 
@@ -2981,7 +2987,8 @@ static int WrapText(const char *s, int x, int y, int maxW, int fs, Color c, bool
         const char *w = p;
         while (*p && *p != ' ') p++;
         int wl = (int)(p - w);
-        if (line[0]) snprintf(trial, sizeof trial, "%s %.*s", line, wl, w);
+        if (wl > 120) wl = 120;                                  /* keeps every line inside the buffers */
+        if (line[0]) snprintf(trial, sizeof trial, "%.170s %.*s", line, wl, w);
         else         snprintf(trial, sizeof trial, "%.*s", wl, w);
         if (line[0] && MeasureText(trial, fs) > maxW) {          /* doesn't fit: start a new line */
             if (draw) DrawText(line, x, y + lines * step, fs, c);
@@ -3337,7 +3344,6 @@ static void ScreenAccount(void)
     DrawBold(u->name, 120, 84, 30, UI_TEXT);
     DrawText("Your settings", 120, 120, FS, UI_MUTED);
     if (Button((Rectangle){(float)W - 160, 88, 140, 40}, "Back", UI_BTN)) { GoHome(); return; }
-    if (Button((Rectangle){(float)W - 330, 88, 160, 40}, "View profile", UI_BTN)) { OpenProfile(u->id); return; }
 
     int tx = 20;
     const char *labels[2] = {"Profile", "Password & account"};
@@ -3360,65 +3366,117 @@ static void ScreenAccount(void)
     else                  SettingsAccountTab(u, 210);
 }
 
-/* ---------------- someone's profile page ---------------- */
+/* ---------------- profile pages ----------------
+   Everyone has one. Your own is also your home page: the first thing you
+   see after signing in, with your repositories, everyone else's, a search
+   box and the New button. Other people's profiles list their repositories. */
 static void ScreenProfile(void)
 {
     User *u = FindUserById(viewUser);
     if (!u) { GoHome(); return; }
+    bool mine = u->id == curUser;
     int theme = UserTheme(u->id);
     Color acc = THEMES[theme].accent;
 
-    Rectangle banner = {0, 57, (float)W, 150};
+    Rectangle banner = {0, 57, (float)W, 120};
     DrawRectangleRec(banner, UI_BASE);
     DrawTheme(theme, banner, 1.0f);
-    DrawLine(0, 207, W, 207, UI_BORDER);
+    DrawLine(0, 177, W, 177, UI_BORDER);
 
-    if (u->id == curUser) {
-        if (Button((Rectangle){(float)W - 180, 221, 160, 40}, "Edit profile", UI_BTN)) { OpenAccount(); return; }
-    }
-    if (Button((Rectangle){(float)W - (u->id == curUser ? 330 : 160), 221, 140, 40}, "People", UI_BTN)) { OpenPeople(); return; }
-
-    /* left column: picture, name, bio, numbers */
-    int cx = 96, cy = 207;
+    /* ---- left column: picture, name, bio, numbers ---- */
+    int cx = 96, cy = 177;
     DrawCircle(cx, cy, 80, UI_BASE);
     DrawCircle(cx, cy, 77, acc);
     DrawAvatar(u->id, cx, cy, 72);
-    DrawFit(u->name, 20, 292, 30, 290, UI_TEXT);
-    DrawText(TextFormat("Joined %s", TimeAgo(u->created)), 20, 328, FS, UI_MUTED);
-    int y = 362;
-    if (u->bio[0]) y += DrawWrapped(u->bio, 20, y, 290, 6, UI_TEXT) * 24 + 12;
+    DrawFit(u->name, 20, 264, 30, 290, UI_TEXT);
+    DrawText(TextFormat("Joined %s", TimeAgo(u->created)), 20, 298, FS, UI_MUTED);
+    int y = 330;
+    if (u->bio[0]) y += DrawWrapped(u->bio, 20, y, 290, H >= 760 ? 4 : 3, UI_TEXT) * 24 + 8;   /* shorter on small windows */
+    if (mine) {
+        if (Button((Rectangle){20, (float)y, 280, 36}, "Edit profile", UI_BTN)) { OpenAccount(); return; }
+        y += 48;
+    }
 
-    int nRepos = 0, nCommits = 0, nStars = 0, nIssues = 0;
+    int nRepos = 0, nCommits = 0, nStars = 0, nIssues = 0, nStarred = 0, nOpen = 0;
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
-        if (r->owner == u->id) { nRepos++; nStars += r->starCount; }
+        if (r->owner == u->id) { nRepos++; nStars += r->starCount; nOpen += OpenIssues(r); }
+        if (HasStarred(r, u->id)) nStarred++;
         for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author == u->id) nCommits++;
         for (int k = 0; k < r->issueCount;  k++) if (r->issues[k].author  == u->id) nIssues++;
     }
     DrawLine(20, y, 300, y, UI_BORDER);
-    DrawText(TextFormat("%d repositor%s",     nRepos,   nRepos == 1 ? "y" : "ies"), 20, y + 14, FS, UI_TEXT);
-    DrawText(TextFormat("%d commit%s",        nCommits, nCommits == 1 ? "" : "s"),  20, y + 42, FS, UI_TEXT);
-    DrawText(TextFormat("%d star%s received", nStars,   nStars == 1 ? "" : "s"),    20, y + 70, FS, UI_TEXT);
-    DrawText(TextFormat("%d issue%s opened",  nIssues,  nIssues == 1 ? "" : "s"),   20, y + 98, FS, UI_TEXT);
-    DrawText(TextFormat("Theme: %s", THEMES[theme].name), 20, y + 138, FS, acc);
+    y += 14;
+    DrawText(TextFormat("%d repositor%s",     nRepos,   nRepos == 1 ? "y" : "ies"), 20, y, FS, UI_TEXT); y += 28;
+    DrawText(TextFormat("%d commit%s",        nCommits, nCommits == 1 ? "" : "s"),  20, y, FS, UI_TEXT); y += 28;
+    DrawText(TextFormat("%d star%s received", nStars,   nStars == 1 ? "" : "s"),    20, y, FS, UI_TEXT); y += 28;
+    if (mine) {
+        DrawText(TextFormat("%d repositor%s starred", nStarred, nStarred == 1 ? "y" : "ies"), 20, y, FS, UI_TEXT); y += 28;
+        DrawFit(TextFormat("%d open issue%s in your repos", nOpen, nOpen == 1 ? "" : "s"), 20, y, FS, 300, UI_TEXT); y += 28;
+    } else {
+        DrawText(TextFormat("%d issue%s opened", nIssues, nIssues == 1 ? "" : "s"), 20, y, FS, UI_TEXT); y += 28;
+    }
+    y += 12;
+    const char *ppl = TextFormat("%d user%s on this computer", userCount, userCount == 1 ? "" : "s");
+    Rectangle pplHit = {20, (float)y - 4, (float)MeasureText(ppl, FS), 28};
+    bool pplHot = Hover(pplHit);
+    DrawText(ppl, 20, y, FS, pplHot ? UI_LINK : UI_MUTED);
+    if (pplHot) { wantCursor = MOUSE_CURSOR_POINTING_HAND; DrawLine(20, y + 22, 20 + (int)pplHit.width, y + 22, UI_LINK); }
+    if (Clicked(pplHit)) { OpenPeople(); return; }
+    if (y + 54 <= H) DrawText(TextFormat("Theme: %s", THEMES[theme].name), 20, y + 30, FS, acc);   /* only if there's room */
 
-    /* right column: contributions and repositories */
+    /* ---- right column: contributions ---- */
     float mx = 340, mw = (float)W - 360;
     long long hoverDay = 0;
-    DrawContributions((Rectangle){mx, 276, mw, 160}, u->id, &hoverDay);
-    if (screen != SCR_PROFILE) return;
+    DrawContributions((Rectangle){mx, 191, mw, 160}, u->id, &hoverDay);
+    if (screen != SCR_PROFILE) return;                       /* a day was clicked */
 
-    DrawBold(u->id == curUser ? "Your repositories" : TextFormat("%s's repositories", u->name), (int)mx, 452, FS, UI_TEXT);
+    /* ---- right column: repositories ---- */
+    float ty = 367;
+    if (mine) {
+        if (ButtonEx((Rectangle){mx, ty, 100, 40}, "Yours", homeView == 0 ? UI_BLUE : UI_BTN, true))       { homeView = 0; scProfile = 0; }
+        if (ButtonEx((Rectangle){mx + 106, ty, 120, 40}, "Everyone", homeView == 1 ? UI_BLUE : UI_BTN, true)) { homeView = 1; scProfile = 0; }
+        TextFieldUI(&tfSearch, (Rectangle){mx + 240, ty, mw - 240 - 130, 40}, "Find a repository...");
+        if (Button((Rectangle){mx + mw - 120, ty, 120, 40}, "New", UI_GREEN)) {
+            Unfocus();
+            TF_Clear(&tfName);
+            TF_Clear(&tfDesc);
+            optReadme = true;
+            screen = SCR_NEW;
+            tfName.active = true;
+            return;
+        }
+    } else {
+        const char *title = TextFormat("%s's repositories", u->name);
+        float sw = mw * 0.4f;
+        DrawFit(title, (int)mx, (int)ty + 10, FS, (int)(mw - sw - 20), UI_TEXT);
+        TextFieldUI(&tfSearch, (Rectangle){mx + mw - sw, ty, sw, 40}, "Find a repository...");
+    }
+    bool everyone = mine && homeView == 1;
+
+    /* which repos to list: filter, then newest activity first */
     int order[MAX_REPOS], n = 0;
-    for (int i = 0; i < repoCount; i++) if (repos[i].owner == u->id) order[n++] = i;
+    for (int i = 0; i < repoCount; i++) {
+        Repo *r = &repos[i];
+        if (!everyone && r->owner != u->id) continue;
+        if (!ContainsCI(r->name, tfSearch.buf) && !ContainsCI(UserName(r->owner), tfSearch.buf)) continue;
+        order[n++] = i;
+    }
     for (int a = 0; a < n; a++)
         for (int b = a + 1; b < n; b++)
             if (LastActivity(&repos[order[b]]) > LastActivity(&repos[order[a]])) { int t = order[a]; order[a] = order[b]; order[b] = t; }
 
-    Rectangle la = {mx, 484, mw, (float)H - 504};
-    float rowH = 84;
+    Rectangle la = {mx, ty + 54, mw, (float)H - 20 - (ty + 54)};
+    float rowH = 100;
     ScrollArea(la, &scProfile, n * rowH - 10);
-    if (!n) DrawText("No repositories yet.", (int)la.x, (int)la.y + 6, FS, UI_MUTED);
+    if (n == 0) {
+        const char *m = tfSearch.len ? "No repositories match your search."
+                      : everyone     ? "Nobody has made a repository yet."
+                      : mine         ? "You have no repositories yet - press New to make one."
+                                     : TextFormat("%s hasn't made any repositories yet.", u->name);
+        DrawText(m, (int)la.x, (int)la.y + 6, FS, UI_MUTED);
+    }
+
     BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
     for (int k = 0; k < n; k++) {
         Repo *r = &repos[order[k]];
@@ -3428,18 +3486,30 @@ static void ScreenProfile(void)
         if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
         DrawRectangleRec(card, hot ? UI_HOVER : UI_PANEL);
         DrawRectangleLinesEx(card, 1, UI_BORDER);
-        DrawBold(r->name, (int)card.x + 18, (int)card.y + 12, FS, UI_LINK);
-        DrawFit(TextFormat("%s   |   %d commit%s   |   %d star%s   |   updated %s",
-                           r->desc[0] ? r->desc : "No description",
+
+        int tx = (int)card.x + 18;
+        if (everyone) {                            /* show "owner / name" when browsing everyone */
+            const char *own = TextFormat("%s / ", UserName(r->owner));
+            DrawText(own, tx, (int)card.y + 12, FS, UI_LINK);
+            tx += MeasureText(own, FS);
+        }
+        DrawBold(r->name, tx, (int)card.y + 12, FS, UI_LINK);
+        tx += MeasureText(r->name, FS) + 16;
+        if (HasStarred(r, curUser)) DrawText("starred", tx, (int)card.y + 12, FS, UI_YELLOW);
+
+        DrawFit(r->desc[0] ? r->desc : "No description", (int)card.x + 18, (int)card.y + 38, FS, (int)card.width - 36, UI_MUTED);
+        DrawFit(TextFormat("%d commit%s   |   %d open issue%s   |   %d star%s   |   updated %s",
                            r->commitCount, r->commitCount == 1 ? "" : "s",
-                           r->starCount, r->starCount == 1 ? "" : "s", TimeAgo(LastActivity(r))),
-                (int)card.x + 18, (int)card.y + 40, FS, (int)card.width - 36, UI_MUTED);
+                           OpenIssues(r), OpenIssues(r) == 1 ? "" : "s",
+                           r->starCount, r->starCount == 1 ? "" : "s",
+                           TimeAgo(LastActivity(r))),
+                (int)card.x + 18, (int)card.y + 62, FS, (int)card.width - 36, UI_MUTED);
         if (Hover(la) && Clicked(card)) { EndScissorMode(); OpenRepo(order[k]); return; }
     }
     EndScissorMode();
     DrawScrollbar(la, scProfile, n * rowH - 10);
 
-    if (hoverDay) DrawDayTooltip(u->id, hoverDay);
+    if (hoverDay) DrawDayTooltip(u->id, hoverDay);          /* last, so it sits on top of everything */
 }
 
 /* ---------------- everyone on this computer ---------------- */
@@ -3485,121 +3555,6 @@ static void ScreenPeople(void)
     }
     EndScissorMode();
     DrawScrollbar(la, scPeople, userCount * rowH - 10);
-}
-
-/* ---------------- home ---------------- */
-static void ScreenHome(void)
-{
-    User *me = FindUserById(curUser);
-    if (!me) { SignOut(); return; }
-
-    /* sidebar: who you are and your numbers */
-    int sx = 20, sy = 76;
-    DrawCircle(sx + 64, sy + 64, 63, uiAccent);
-    DrawAvatar(curUser, sx + 64, sy + 64, 60);
-    Rectangle me1 = {(float)sx, (float)sy, 128, 128};
-    if (Hover(me1)) wantCursor = MOUSE_CURSOR_POINTING_HAND;
-    if (Clicked(me1)) { OpenProfile(curUser); return; }
-    DrawFit(me->name, sx, sy + 140, 30, 280, UI_TEXT);
-    int by = sy + 176;
-    if (me->bio[0]) by += DrawWrapped(me->bio, sx, by, 280, 3, UI_TEXT) * 24 + 6;
-    else { DrawText(TextFormat("Joined %s", TimeAgo(me->created)), sx, by, FS, UI_MUTED); by += 30; }
-    if (Button((Rectangle){(float)sx, (float)by, 260, 34}, "Edit profile", UI_BTN)) { OpenAccount(); return; }
-    sy = by - 214 + 52;                     /* push everything below down to make room */
-
-    int myRepos = 0, myCommits = 0, myStars = 0, myIssues = 0;
-    for (int i = 0; i < repoCount; i++) {
-        Repo *r = &repos[i];
-        if (r->owner == curUser) { myRepos++; myIssues += OpenIssues(r); }
-        if (HasStarred(r, curUser)) myStars++;
-        for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author == curUser) myCommits++;
-    }
-    DrawLine(sx, sy + 214, sx + 260, sy + 214, UI_BORDER);
-    DrawText(TextFormat("%d repositor%s",  myRepos,   myRepos == 1 ? "y" : "ies"), sx, sy + 230, FS, UI_TEXT);
-    DrawText(TextFormat("%d commit%s",     myCommits, myCommits == 1 ? "" : "s"),  sx, sy + 260, FS, UI_TEXT);
-    DrawText(TextFormat("%d starred",      myStars),                                sx, sy + 290, FS, UI_TEXT);
-    DrawText(TextFormat("%d open issue%s", myIssues,  myIssues == 1 ? "" : "s"),    sx, sy + 320, FS, UI_TEXT);
-    const char *ppl = TextFormat("%d user%s on this computer", userCount, userCount == 1 ? "" : "s");
-    Rectangle pplHit = {(float)sx, (float)sy + 362, (float)MeasureText(ppl, FS), 28};
-    bool pplHot = Hover(pplHit);
-    DrawText(ppl, sx, sy + 366, FS, pplHot ? UI_LINK : UI_MUTED);
-    if (pplHot) { wantCursor = MOUSE_CURSOR_POINTING_HAND; DrawLine(sx, sy + 388, sx + (int)pplHit.width, sy + 388, UI_LINK); }
-    if (Clicked(pplHit)) { OpenPeople(); return; }
-
-    /* main column */
-    float mx = 320, mw = (float)W - 340;
-    long long hoverDay = 0;
-    DrawContributions((Rectangle){mx, 72, mw, 160}, curUser, &hoverDay);
-    if (screen != SCR_HOME) return;                 /* a day was clicked */
-
-    if (ButtonEx((Rectangle){mx, 248, 100, 40}, "Yours", homeView == 0 ? UI_BLUE : UI_BTN, true))       { homeView = 0; scHome = 0; }
-    if (ButtonEx((Rectangle){mx + 106, 248, 120, 40}, "Everyone", homeView == 1 ? UI_BLUE : UI_BTN, true)) { homeView = 1; scHome = 0; }
-    TextFieldUI(&tfSearch, (Rectangle){mx + 240, 248, mw - 240 - 130, 40}, "Find a repository...");
-    if (Button((Rectangle){mx + mw - 120, 248, 120, 40}, "New", UI_GREEN)) {
-        Unfocus();
-        TF_Clear(&tfName);
-        TF_Clear(&tfDesc);
-        optReadme = true;
-        screen = SCR_NEW;
-        tfName.active = true;
-        return;
-    }
-
-    /* which repos to list: filter, then newest activity first */
-    int order[MAX_REPOS], n = 0;
-    for (int i = 0; i < repoCount; i++) {
-        Repo *r = &repos[i];
-        if (homeView == 0 && r->owner != curUser) continue;
-        if (!ContainsCI(r->name, tfSearch.buf) && !ContainsCI(UserName(r->owner), tfSearch.buf)) continue;
-        order[n++] = i;
-    }
-    for (int a = 0; a < n; a++)
-        for (int b = a + 1; b < n; b++)
-            if (LastActivity(&repos[order[b]]) > LastActivity(&repos[order[a]])) { int t = order[a]; order[a] = order[b]; order[b] = t; }
-
-    Rectangle la = {mx, 302, mw, (float)H - 322};
-    float rowH = 110;
-    ScrollArea(la, &scHome, n * rowH - 10);
-    if (n == 0) {
-        const char *m = tfSearch.len ? "No repositories match your search."
-                      : homeView == 0 ? "You have no repositories yet - press New to make one."
-                                      : "Nobody has made a repository yet.";
-        DrawText(m, (int)la.x, (int)la.y + 10, FS, UI_MUTED);
-    }
-
-    BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
-    for (int k = 0; k < n; k++) {
-        Repo *r = &repos[order[k]];
-        Rectangle card = {la.x, la.y + k * rowH - scHome, la.width - 12, rowH - 10};
-        if (card.y > la.y + la.height || card.y + card.height < la.y) continue;
-        bool hot = Hover(la) && Hover(card);
-        if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
-        DrawRectangleRec(card, hot ? UI_HOVER : UI_PANEL);
-        DrawRectangleLinesEx(card, 1, UI_BORDER);
-
-        int tx = (int)card.x + 18;
-        if (homeView == 1) {                       /* show "owner / name" when browsing everyone */
-            const char *own = TextFormat("%s / ", UserName(r->owner));
-            DrawText(own, tx, (int)card.y + 14, FS, UI_LINK);
-            tx += MeasureText(own, FS);
-        }
-        DrawBold(r->name, tx, (int)card.y + 14, FS, UI_LINK);
-        tx += MeasureText(r->name, FS) + 16;
-        if (HasStarred(r, curUser)) DrawText("starred", tx, (int)card.y + 14, FS, UI_YELLOW);
-
-        DrawFit(r->desc[0] ? r->desc : "No description", (int)card.x + 18, (int)card.y + 42, FS, (int)card.width - 36, UI_MUTED);
-        DrawFit(TextFormat("%d commit%s   |   %d open issue%s   |   %d star%s   |   updated %s",
-                           r->commitCount, r->commitCount == 1 ? "" : "s",
-                           OpenIssues(r), OpenIssues(r) == 1 ? "" : "s",
-                           r->starCount, r->starCount == 1 ? "" : "s",
-                           TimeAgo(LastActivity(r))),
-                (int)card.x + 18, (int)card.y + 70, FS, (int)card.width - 36, UI_MUTED);
-        if (Hover(la) && Clicked(card)) OpenRepo(order[k]);
-    }
-    EndScissorMode();
-    DrawScrollbar(la, scHome, n * rowH - 10);
-
-    if (hoverDay) DrawDayTooltip(curUser, hoverDay);          /* last, so it sits on top of everything */
 }
 
 static void TryCreateRepo(void)
@@ -4276,7 +4231,8 @@ int main(void)
             if (anyFocus) Unfocus();
             else if (screen == SCR_FORGOT) GoLogin();
             else if (screen == SCR_RECOVERY) GoHome();
-            else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT || screen == SCR_PROFILE || screen == SCR_PEOPLE) GoHome();
+            else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT || screen == SCR_PEOPLE) GoHome();
+            else if (screen == SCR_PROFILE && viewUser != curUser) GoHome();
             else if (screen == SCR_DAY) { if (dayUser == curUser) GoHome(); else OpenProfile(dayUser); }
             else if (screen == SCR_COMMIT && fromDay) screen = SCR_DAY;
             else if (screen == SCR_COMMIT) { screen = SCR_REPO; tab = TAB_COMMITS; }
@@ -4296,7 +4252,6 @@ int main(void)
         case SCR_DAY:      ScreenDay();      break;
         case SCR_PROFILE:  ScreenProfile();  break;
         case SCR_PEOPLE:   ScreenPeople();   break;
-        case SCR_HOME:     ScreenHome();     break;
         case SCR_NEW:      ScreenNew();      break;
         case SCR_REPO: {
             Repo *r = &repos[curRepo];

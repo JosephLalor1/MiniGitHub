@@ -7,12 +7,12 @@ MINIGITHUB4
 32:3a700a47cf96e91f177f17b227c468f1
 64:42da4dfa8da3926ecc9663a5731746cd7bf8aa02e8e59abb253d6b5b824c990f
 1791288115
-0:
-5
+48:I am Joseph Lalor, a software developer at SETU!
+2
 7
 0:
-0:
-0:
+32:7a33c955541bd891bbe46331eb13f6f4
+64:1adcf808ebc7430d76491c17e426d89e6d47266b83e72b824de51275ee1a6818
 2
 6:ismael
 32:446f06e4a01a3d421e0f404981abb07d
@@ -182,18 +182,18 @@ hello!
 1791364957
 1
 1
-2
+3
 9:README.md
-38:# MyNewProject
-
-This is a new project
+15:# MyNewProject
 
 9:hello.txt
 30:hello!
 
 
 this is my new file!!
-2
+10:newFile.cs
+7://hello
+4
 38:# MyNewProject
 
 This is a new project
@@ -202,7 +202,10 @@ This is a new project
 
 
 this is my new file!!
-2
+7://hello
+15:# MyNewProject
+
+4
 7:b04224d
 14:Initial commit
 1791364957
@@ -219,6 +222,28 @@ this is my new file!!
 0
 9:hello.txt
 1
+7:cd2f05a
+14:added new file
+1791983700
+1
+3
+9:README.md
+0
+9:hello.txt
+1
+10:newFile.cs
+2
+7:716749f
+19:removed a fewlines 
+1791983764
+1
+3
+9:README.md
+3
+9:hello.txt
+1
+10:newFile.cs
+2
 1
 20:expand the text file
 0
