@@ -131,8 +131,21 @@ typedef struct {
     int       sFiles, sAdds, sDels;  /* not saved: files changed, lines added / removed     */
 } Commit;
 
-/* A working file is the version the owner is editing right now. */
-typedef struct { char name[NAME_LEN]; char *text; int len, cap; bool binary; } WorkFile;
+/* A file someone is editing. In a draft (below) it also remembers which
+   version it started from, so we can spot when someone else changed the
+   same file in the meantime. */
+typedef struct {
+    char name[NAME_LEN]; char *text; int len, cap; bool binary;
+    bool deleted;                    /* in a draft: "I've deleted this file"               */
+    int  base;                       /* in a draft: blob it started from (-1 = a new file) */
+} WorkFile;
+
+/* Each person who can edit a repository has their own draft: just the files
+   they've changed and not committed yet. Everything else they see is the
+   latest commit - so nobody sees anyone else's half-finished work, and a
+   commit only ever contains the changes of the person who made it. */
+#define MAX_DRAFT (MAX_FILES * 2)
+typedef struct { int user; int count; WorkFile *files; } Draft;
 
 typedef struct { char title[TEXT_LEN]; bool open; long long time; int author; } Issue;
 
@@ -142,7 +155,10 @@ typedef struct {
     char      desc[TEXT_LEN];
     long long created;
     int       starCount;   int      starredBy[MAX_USERS];
-    int       fileCount;   WorkFile files[MAX_FILES];
+    int       collabCount; int      collabs[MAX_USERS];       /* people invited who accepted   */
+    int       inviteCount; int      invites[MAX_USERS];       /* invited, not answered yet     */
+    long long inviteTime[MAX_USERS];
+    int       draftCount;  Draft    drafts[MAX_USERS];
     int       commitCount; Commit   commits[MAX_COMMITS];
     int       blobCount;   Blob     blobs[MAX_BLOBS];
     int       issueCount;  Issue    issues[MAX_ISSUES];
@@ -160,16 +176,17 @@ static int  repoCount = 0;
 /* App state                                                          */
 /* ------------------------------------------------------------------ */
 typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_FORGOT, SCR_RECOVERY, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY, SCR_PROFILE, SCR_PEOPLE, SCR_UPLOAD } Screen;
-typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES } Tab;
+typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES, TAB_PEOPLE } Tab;
 
 typedef struct { char buf[TEXT_LEN]; int len; bool active; bool secret; bool reveal; } TextField;
 typedef struct { int cursor; float scrollY, scrollX; bool focused; } EditorState;
 
 static Screen screen = SCR_LOGIN;
 static Tab    tab    = TAB_CODE;
-static int    curRepo = -1, curFile = -1, curCommit = -1, curChange = -1;
+static int    curRepo = -1, curCommit = -1, curChange = -1;
+static char   selName[NAME_LEN];      /* the file open in the Code tab ("" = pick the first) */
 
-static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode, tfUpPath, tfUpMsg;
+static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode, tfUpPath, tfUpMsg, tfInvite;
 static TextField tfPass    = {.secret = true}, tfPass2    = {.secret = true};
 static TextField tfOldPass = {.secret = true}, tfNewPass  = {.secret = true};
 static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
@@ -179,7 +196,7 @@ static int   homeView;                /* 0 = your repositories, 1 = everyone's *
 static float scFiles, scCommits, scIssues, scChanges, scDiff, scDay, scDayRepos;
 static char  shownCode[24];           /* recovery code on screen right now (never saved) */
 static bool  codeAfterReset;          /* the code screen was reached by resetting a password */
-static float scProfile, scPeople, scSettings;
+static float scProfile, scPeople, scSettings, scPeopleTab;
 static int   viewUser = -1;           /* whose profile page is open             */
 static int   dayUser  = -1;           /* whose contributions the day page shows */
 static int   settingsTab;             /* 0 = profile, 1 = password & account    */
@@ -348,34 +365,18 @@ static Repo *NewRepo(int owner, const char *name, const char *desc)
     return r;
 }
 
-static int FindFile(Repo *r, const char *name)
+static void FreeDraft(Draft *d)
 {
-    for (int i = 0; i < r->fileCount; i++) if (strcmp(r->files[i].name, name) == 0) return i;
-    return -1;
-}
-
-static int AddFileN(Repo *r, const char *name, const char *data, int len)
-{
-    if (r->fileCount >= MAX_FILES || FindFile(r, name) >= 0) return -1;
-    WorkFile *f = &r->files[r->fileCount];
-    memset(f, 0, sizeof *f);
-    snprintf(f->name, NAME_LEN, "%s", name);
-    WF_SetN(f, data, len);
-    return r->fileCount++;
-}
-static int AddFile(Repo *r, const char *name, const char *text) { return AddFileN(r, name, text, (int)strlen(text)); }
-
-static void RemoveFile(Repo *r, int i)
-{
-    WF_Free(&r->files[i]);
-    memmove(&r->files[i], &r->files[i + 1], (size_t)(r->fileCount - i - 1) * sizeof(WorkFile));
-    r->fileCount--;
-    memset(&r->files[r->fileCount], 0, sizeof(WorkFile));
+    for (int i = 0; i < d->count; i++) WF_Free(&d->files[i]);
+    free(d->files);
+    d->files = NULL;
+    d->count = 0;
 }
 
 static void FreeRepo(Repo *r)
 {
-    for (int i = 0; i < r->fileCount; i++) WF_Free(&r->files[i]);
+    for (int i = 0; i < r->draftCount; i++) FreeDraft(&r->drafts[i]);
+    r->draftCount = 0;
     for (int i = 0; i < r->blobCount; i++) free(r->blobs[i].data);
     filesGen++;
 }
@@ -418,26 +419,186 @@ static int FindInCommit(Commit *c, const char *name)
     return -1;
 }
 
-/* 'A' = new since last commit, 'M' = modified, 0 = unchanged */
-static char FileStatus(Repo *r, int i)
+/* ---------- drafts ---------- */
+
+/* The blob a file has in the latest commit, or -1 if it isn't there. */
+static int HeadBlobOf(Repo *r, const char *name)
 {
     Commit *h = Head(r);
-    if (!h) return 'A';
-    int k = FindInCommit(h, r->files[i].name);
-    if (k < 0) return 'A';
-    Blob *b = &r->blobs[h->blobs[k]];
-    WorkFile *f = &r->files[i];
-    return (b->len != f->len || memcmp(b->data, f->text, (size_t)f->len) != 0) ? 'M' : 0;
+    int k = h ? FindInCommit(h, name) : -1;
+    return k >= 0 ? h->blobs[k] : -1;
 }
 
-static int ChangeCount(Repo *r)
+static bool SameAsBlob(Repo *r, WorkFile *f, int b)
 {
-    int n = 0;
-    for (int i = 0; i < r->fileCount; i++) if (FileStatus(r, i)) n++;
-    Commit *h = Head(r);
-    if (h) for (int k = 0; k < h->fileCount; k++) if (FindFile(r, h->names[k]) < 0) n++;
-    return n;
+    return b >= 0 && r->blobs[b].len == f->len && memcmp(r->blobs[b].data, f->text, (size_t)f->len) == 0;
 }
+
+static Draft *GetDraft(Repo *r, int uid, bool create)
+{
+    for (int i = 0; i < r->draftCount; i++) if (r->drafts[i].user == uid) return &r->drafts[i];
+    if (!create || r->draftCount >= MAX_USERS) return NULL;
+    WorkFile *f = calloc(MAX_DRAFT, sizeof(WorkFile));
+    if (!f) return NULL;
+    Draft *d = &r->drafts[r->draftCount++];
+    d->user = uid; d->count = 0; d->files = f;
+    return d;
+}
+
+static int DraftIndex(Draft *d, const char *name)
+{
+    for (int i = 0; d && i < d->count; i++) if (strcmp(d->files[i].name, name) == 0) return i;
+    return -1;
+}
+static WorkFile *DraftFind(Repo *r, int uid, const char *name)
+{
+    Draft *d = GetDraft(r, uid, false);
+    int i = DraftIndex(d, name);
+    return i >= 0 ? &d->files[i] : NULL;
+}
+
+static void DraftDrop(Draft *d, int i)
+{
+    WF_Free(&d->files[i]);
+    memmove(&d->files[i], &d->files[i + 1], (size_t)(d->count - i - 1) * sizeof(WorkFile));
+    d->count--;
+    memset(&d->files[d->count], 0, sizeof(WorkFile));
+}
+static void DraftDropName(Repo *r, int uid, const char *name)
+{
+    Draft *d = GetDraft(r, uid, false);
+    int i = DraftIndex(d, name);
+    if (i >= 0) DraftDrop(d, i);
+}
+static void DraftClear(Repo *r, int uid)
+{
+    Draft *d = GetDraft(r, uid, false);
+    while (d && d->count) DraftDrop(d, d->count - 1);
+}
+static void RemoveDraft(Repo *r, int uid)
+{
+    for (int i = 0; i < r->draftCount; i++)
+        if (r->drafts[i].user == uid) {
+            FreeDraft(&r->drafts[i]);
+            memmove(&r->drafts[i], &r->drafts[i + 1], (size_t)(r->draftCount - i - 1) * sizeof(Draft));
+            r->draftCount--;
+            memset(&r->drafts[r->draftCount], 0, sizeof(Draft));
+            return;
+        }
+}
+
+/* Your own editable copy of a file: made from the latest commit the first
+   time you change it (or empty, for a new file). NULL if your draft is full. */
+static WorkFile *DraftEdit(Repo *r, int uid, const char *name)
+{
+    Draft *d = GetDraft(r, uid, true);
+    if (!d) return NULL;
+    int i = DraftIndex(d, name);
+    if (i >= 0) return &d->files[i];
+    if (d->count >= MAX_DRAFT) return NULL;
+    WorkFile *f = &d->files[d->count++];
+    memset(f, 0, sizeof *f);
+    snprintf(f->name, NAME_LEN, "%s", name);
+    f->base = HeadBlobOf(r, name);
+    if (f->base >= 0) WF_SetN(f, r->blobs[f->base].data, r->blobs[f->base].len);
+    else              WF_SetN(f, "", 0);
+    return f;
+}
+static void DraftSetText(Repo *r, int uid, const char *name, const char *text)
+{
+    WorkFile *f = DraftEdit(r, uid, name);
+    if (f) { f->deleted = false; WF_Set(f, text); }
+}
+
+/* What a file in your draft means:
+   'A' a new file, 'M' modified, 'D' deleted, 0 no real change,
+   'C' a conflict - someone committed a different version of this file
+       after you started changing it, so committing yours would wipe theirs. */
+static char DraftStatus(Repo *r, WorkFile *e)
+{
+    int cur = HeadBlobOf(r, e->name);
+    if (e->deleted) {
+        if (cur < 0) return 0;                            /* it's gone anyway */
+        return e->base == cur ? 'D' : 'C';                /* changed by someone after you deleted it */
+    }
+    if (SameAsBlob(r, e, cur)) return 0;                  /* yours matches the latest version */
+    if (e->base >= 0 && SameAsBlob(r, e, e->base)) return 0;   /* you haven't actually changed it */
+    if (e->base != cur) return 'C';
+    return cur < 0 ? 'A' : 'M';
+}
+
+/* Throws away draft files that aren't real changes, so they quietly follow
+   the latest commit again. */
+static void DraftTidy(Repo *r, int uid)
+{
+    Draft *d = GetDraft(r, uid, false);
+    if (!d) return;
+    for (int i = d->count - 1; i >= 0; i--) if (!DraftStatus(r, &d->files[i])) DraftDrop(d, i);
+}
+
+static void DraftCounts(Repo *r, int uid, int *changes, int *conflicts)
+{
+    *changes = *conflicts = 0;
+    Draft *d = GetDraft(r, uid, false);
+    for (int i = 0; d && i < d->count; i++) {
+        char st = DraftStatus(r, &d->files[i]);
+        if (st == 'C') (*conflicts)++;
+        else if (st)   (*changes)++;
+    }
+}
+
+/* Who most recently committed a change to this file (or -1). */
+static int LastChangedBy(Repo *r, const char *name)
+{
+    for (int k = r->commitCount - 1; k >= 0; k--) {
+        int now = FindInCommit(&r->commits[k], name);
+        int nb = now >= 0 ? r->commits[k].blobs[now] : -1;
+        int before = -1;
+        if (k > 0) { int p = FindInCommit(&r->commits[k - 1], name); before = p >= 0 ? r->commits[k - 1].blobs[p] : -1; }
+        if (nb != before) return r->commits[k].author;
+    }
+    return -1;
+}
+
+/* What you see in a repository: the latest commit with your own draft laid
+   on top. With uid = -1 it's just the latest commit (for read-only visitors). */
+typedef struct { char name[NAME_LEN]; const char *data; int len; bool binary; char status; WorkFile *mine; int blob; } ViewFile;
+static ViewFile view[MAX_FILES + MAX_DRAFT];
+static int      viewCount;
+
+static void BuildView(Repo *r, int uid)
+{
+    viewCount = 0;
+    Commit *h = Head(r);
+    Draft *d = uid >= 0 ? GetDraft(r, uid, false) : NULL;
+    for (int k = 0; h && k < h->fileCount; k++) {
+        ViewFile *v = &view[viewCount++];
+        memset(v, 0, sizeof *v);
+        snprintf(v->name, NAME_LEN, "%s", h->names[k]);
+        v->blob = h->blobs[k];
+        int i = DraftIndex(d, v->name);
+        WorkFile *e = i >= 0 ? &d->files[i] : NULL;
+        char st = e ? DraftStatus(r, e) : 0;
+        if (e && st) { v->mine = e; v->status = st; v->data = e->text; v->len = e->len; v->binary = e->binary; }
+        else { v->data = r->blobs[v->blob].data; v->len = r->blobs[v->blob].len; v->binary = r->blobs[v->blob].binary; }
+    }
+    for (int i = 0; d && i < d->count; i++) {                 /* your new files */
+        WorkFile *e = &d->files[i];
+        if (HeadBlobOf(r, e->name) >= 0) continue;
+        char st = DraftStatus(r, e);
+        if (!st) continue;
+        ViewFile *v = &view[viewCount++];
+        memset(v, 0, sizeof *v);
+        snprintf(v->name, NAME_LEN, "%s", e->name);
+        v->blob = -1; v->mine = e; v->status = st; v->data = e->text; v->len = e->len; v->binary = e->binary;
+    }
+}
+static int ViewIndex(const char *name)
+{
+    for (int i = 0; i < viewCount; i++) if (strcmp(view[i].name, name) == 0) return i;
+    return -1;
+}
+static bool ViewDeleted(ViewFile *v) { return v->mine && v->mine->deleted; }
 
 static int OpenIssues(Repo *r)
 {
@@ -470,31 +631,62 @@ static void FinishCommit(Repo *r, Commit *c, const char *msg)
 /* Returns NULL on success, or a message explaining what went wrong. */
 static const char *DoCommit(Repo *r, const char *msg)
 {
-    if (!msg[0])                       return "Write a commit message first";
-    if (ChangeCount(r) == 0)           return "Nothing to commit - no changes since the last commit";
+    if (!msg[0]) return "Write a commit message first";
+    DraftTidy(r, curUser);
+    int changes, conflicts;
+    DraftCounts(r, curUser, &changes, &conflicts);
+    if (conflicts)                     return "Sort out the conflicts first (files marked !)";
+    if (!changes)                      return "Nothing to commit - no changes since the last commit";
     if (r->commitCount >= MAX_COMMITS) return "This repository has reached its commit limit";
 
+    /* start from the latest commit, then apply your changes */
+    Draft *d = GetDraft(r, curUser, false);
     Commit c;
     memset(&c, 0, sizeof c);
-    for (int i = 0; i < r->fileCount; i++) {
-        int b = InternBlob(r, r->files[i].text, r->files[i].len);
-        if (b < 0) return "This repository is out of storage space";
-        snprintf(c.names[i], NAME_LEN, "%s", r->files[i].name);
-        c.blobs[i] = b;
+    Commit *h = Head(r);
+    if (h) {
+        c.fileCount = h->fileCount;
+        memcpy(c.names, h->names, sizeof c.names);
+        memcpy(c.blobs, h->blobs, sizeof c.blobs);
     }
-    c.fileCount = r->fileCount;
+    int adding = 0;
+    for (int i = 0; i < d->count; i++) if (DraftStatus(r, &d->files[i]) == 'A') adding++;
+    if (c.fileCount + adding > MAX_FILES) return TextFormat("A repository can hold up to %d files", MAX_FILES);
+    for (int i = 0; i < d->count; i++) {
+        WorkFile *e = &d->files[i];
+        char st = DraftStatus(r, e);
+        int k = FindInCommit(&c, e->name);
+        if (st == 'D') {
+            memmove(&c.names[k], &c.names[k + 1], (size_t)(c.fileCount - k - 1) * NAME_LEN);
+            memmove(&c.blobs[k], &c.blobs[k + 1], (size_t)(c.fileCount - k - 1) * sizeof(int));
+            c.fileCount--;
+            continue;
+        }
+        int b = InternBlob(r, e->text, e->len);
+        if (b < 0) return "This repository is out of storage space";
+        if (k < 0) { k = c.fileCount++; snprintf(c.names[k], NAME_LEN, "%.*s", NAME_LEN - 1, e->name); }
+        c.blobs[k] = b;
+    }
     FinishCommit(r, &c, msg);
+    DraftClear(r, curUser);                 /* everything is committed now */
     return NULL;
 }
 
 /* Replace the working files with the files from an old commit. */
 static void RestoreCommit(Repo *r, int ci)
 {
-    for (int i = 0; i < r->fileCount; i++) WF_Free(&r->files[i]);
-    memset(r->files, 0, sizeof r->files);
-    r->fileCount = 0;
-    Commit *c = &r->commits[ci];
-    for (int k = 0; k < c->fileCount; k++) AddFileN(r, c->names[k], r->blobs[c->blobs[k]].data, r->blobs[c->blobs[k]].len);
+    DraftClear(r, curUser);
+    Commit *c = &r->commits[ci], *h = Head(r);
+    for (int k = 0; k < c->fileCount; k++) {
+        if (HeadBlobOf(r, c->names[k]) == c->blobs[k]) continue;        /* already the same */
+        WorkFile *e = DraftEdit(r, curUser, c->names[k]);
+        if (e) WF_SetN(e, r->blobs[c->blobs[k]].data, r->blobs[c->blobs[k]].len);
+    }
+    for (int k = 0; h && k < h->fileCount; k++)                          /* files that didn't exist back then */
+        if (FindInCommit(c, h->names[k]) < 0) {
+            WorkFile *e = DraftEdit(r, curUser, h->names[k]);
+            if (e) e->deleted = true;
+        }
 }
 
 /* ------------------------------------------------------------------ */
@@ -524,6 +716,79 @@ static const char *UserName(int id) { User *u = FindUserById(id); return u ? u->
 
 static bool IsMine(Repo *r) { return curUser >= 0 && r->owner == curUser; }
 
+/* ---------- collaborators ---------- */
+static bool IsCollab(Repo *r, int uid)
+{
+    for (int i = 0; i < r->collabCount; i++) if (r->collabs[i] == uid) return true;
+    return false;
+}
+static bool IsInvited(Repo *r, int uid)
+{
+    for (int i = 0; i < r->inviteCount; i++) if (r->invites[i] == uid) return true;
+    return false;
+}
+/* Owners and collaborators can change a repository; everyone else can only look. */
+static bool CanEditBy(Repo *r, int uid) { return uid >= 0 && (r->owner == uid || IsCollab(r, uid)); }
+static bool CanEdit(Repo *r)            { return CanEditBy(r, curUser); }
+
+static void RemoveInvite(Repo *r, int uid)
+{
+    for (int i = 0; i < r->inviteCount; i++)
+        if (r->invites[i] == uid) {
+            memmove(&r->invites[i], &r->invites[i + 1], (size_t)(r->inviteCount - i - 1) * sizeof(int));
+            memmove(&r->inviteTime[i], &r->inviteTime[i + 1], (size_t)(r->inviteCount - i - 1) * sizeof(long long));
+            r->inviteCount--;
+            return;
+        }
+}
+/* Takes someone off a repository: their collaborator place, any invitation,
+   and their uncommitted draft. Their commits stay in the history. */
+static void RemoveMember(Repo *r, int uid)
+{
+    for (int i = 0; i < r->collabCount; i++)
+        if (r->collabs[i] == uid) {
+            memmove(&r->collabs[i], &r->collabs[i + 1], (size_t)(r->collabCount - i - 1) * sizeof(int));
+            r->collabCount--;
+            break;
+        }
+    RemoveInvite(r, uid);
+    RemoveDraft(r, uid);
+}
+
+/* Returns NULL if the invitation was sent, or a message saying why not. */
+static const char *InviteUser(Repo *r, const char *name)
+{
+    if (!IsMine(r)) return "Only the owner can invite people";
+    char nm[TEXT_LEN];                                    /* the name without spaces at either end */
+    int a = 0, n = (int)strlen(name);
+    while (a < n && name[a] == ' ') a++;
+    while (n > a && name[n - 1] == ' ') n--;
+    snprintf(nm, sizeof nm, "%.*s", n - a, name + a);
+    if (!nm[0]) return "Type the username of the person to invite";
+    User *u = FindUserByName(nm);
+    if (!u)                       return TextFormat("There's no user called \"%.40s\" on this computer", nm);
+    if (u->id == r->owner)        return "You already own this repository";
+    if (IsCollab(r, u->id))       return TextFormat("%s is already a collaborator", u->name);
+    if (IsInvited(r, u->id))      return TextFormat("%s has already been invited", u->name);
+    if (r->inviteCount + r->collabCount >= MAX_USERS - 1) return "This repository can't have any more collaborators";
+    r->invites[r->inviteCount] = u->id;
+    r->inviteTime[r->inviteCount] = (long long)time(NULL);
+    r->inviteCount++;
+    return NULL;
+}
+static void AcceptInvite(Repo *r, int uid)
+{
+    if (!IsInvited(r, uid)) return;
+    RemoveInvite(r, uid);
+    if (!IsCollab(r, uid) && r->collabCount < MAX_USERS) r->collabs[r->collabCount++] = uid;
+}
+static int InvitationCount(int uid)
+{
+    int n = 0;
+    for (int i = 0; i < repoCount; i++) if (IsInvited(&repos[i], uid)) n++;
+    return n;
+}
+
 static bool HasStarred(Repo *r, int uid)
 {
     for (int i = 0; i < r->starCount; i++) if (r->starredBy[i] == uid) return true;
@@ -540,12 +805,14 @@ static void ToggleStar(Repo *r, int uid)
     else if (r->starCount < MAX_USERS) r->starredBy[r->starCount++] = uid;
 }
 
-/* For someone else's repo you see their latest commit, not their unsaved edits. */
+/* How many files you see: the latest commit plus your own draft if you can
+   edit; just the latest commit if you're a visitor. */
 static int ShownCount(Repo *r)
 {
-    if (IsMine(r)) return r->fileCount;
-    Commit *h = Head(r);
-    return h ? h->fileCount : 0;
+    BuildView(r, CanEdit(r) ? curUser : -1);
+    int n = 0;
+    for (int i = 0; i < viewCount; i++) if (!ViewDeleted(&view[i])) n++;
+    return n;
 }
 
 /* Repos from an old (pre-accounts) save file go to the first account made. */
@@ -557,6 +824,8 @@ static int ClaimOrphans(int uid)
         if (r->owner >= 0) continue;
         r->owner = uid;
         n++;
+        Draft *d = GetDraft(r, -1, false);
+        if (d) d->user = uid;
         for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author < 0) r->commits[k].author = uid;
         for (int k = 0; k < r->issueCount;  k++) if (r->issues[k].author  < 0) r->issues[k].author  = uid;
     }
@@ -581,7 +850,10 @@ static int ReposOwnedBy(int uid)
 static void DeleteAccount(int uid)
 {
     for (int i = repoCount - 1; i >= 0; i--) if (repos[i].owner == uid) DeleteRepo(i);
-    for (int i = 0; i < repoCount; i++) RemoveStar(&repos[i], uid);
+    for (int i = 0; i < repoCount; i++) {
+        RemoveStar(&repos[i], uid);
+        RemoveMember(&repos[i], uid);                  /* collaborator places and invitations */
+    }
     for (int i = 0; i < userCount; i++)
         if (users[i].id == uid) {
             if (users[i].texState == 1) UnloadTexture(users[i].tex);
@@ -1276,7 +1548,7 @@ static void Save(void)
 {
     FILE *f = fopen(SAVE_FILE ".tmp", "wb");
     if (!f) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(f, "MINIGITHUB4\n");
+    fprintf(f, "MINIGITHUB5\n");
     WI(f, nextUserId);
     WS(f, lastUser);
     WI(f, userCount);
@@ -1292,8 +1564,10 @@ static void Save(void)
         WI(f, r->owner); WS(f, r->name); WS(f, r->desc); WI(f, r->created);
         WI(f, r->starCount);
         for (int k = 0; k < r->starCount; k++) WI(f, r->starredBy[k]);
-        WI(f, r->fileCount);
-        for (int k = 0; k < r->fileCount; k++) { WS(f, r->files[k].name); WSN(f, r->files[k].text, r->files[k].len); }
+        WI(f, r->collabCount);
+        for (int k = 0; k < r->collabCount; k++) WI(f, r->collabs[k]);
+        WI(f, r->inviteCount);
+        for (int k = 0; k < r->inviteCount; k++) { WI(f, r->invites[k]); WI(f, r->inviteTime[k]); }
         WI(f, r->blobCount);
         for (int k = 0; k < r->blobCount; k++) WSN(f, r->blobs[k].data, r->blobs[k].len);
         WI(f, r->commitCount);
@@ -1306,6 +1580,18 @@ static void Save(void)
         for (int k = 0; k < r->issueCount; k++) {
             Issue *is = &r->issues[k];
             WS(f, is->title); WI(f, is->open); WI(f, is->time); WI(f, is->author);
+        }
+        int drafts = 0;                                   /* skip empty drafts */
+        for (int k = 0; k < r->draftCount; k++) if (r->drafts[k].count) drafts++;
+        WI(f, drafts);
+        for (int k = 0; k < r->draftCount; k++) {
+            Draft *d = &r->drafts[k];
+            if (!d->count) continue;
+            WI(f, d->user); WI(f, d->count);
+            for (int j = 0; j < d->count; j++) {
+                WorkFile *e = &d->files[j];
+                WS(f, e->name); WSN(f, e->text, e->len); WI(f, e->deleted); WI(f, e->base);
+            }
         }
     }
     fclose(f);
@@ -1343,6 +1629,7 @@ static bool Load(void)
         if (strcmp(magic, "MINIGITHUB2") == 0) ver = 2;
         if (strcmp(magic, "MINIGITHUB3") == 0) ver = 3;
         if (strcmp(magic, "MINIGITHUB4") == 0) ver = 4;
+        if (strcmp(magic, "MINIGITHUB5") == 0) ver = 5;
     }
     if (!ver) loadErr = 1;
 
@@ -1398,14 +1685,28 @@ static bool Load(void)
             for (int k = 0; k < sc; k++) r->starredBy[r->starCount++] = (int)RI(f);
         }
 
-        int fc = (int)RI(f);
-        if (fc < 0 || fc > MAX_FILES) { loadErr = 1; break; }
-        for (int k = 0; k < fc && !loadErr; k++) {
-            char nm[NAME_LEN];
-            RSInto(f, nm, NAME_LEN);
-            int txLen = 0;
-            char *tx = RSN(f, &txLen);
-            if (tx) { AddFileN(r, nm, tx, txLen); free(tx); }
+        /* before version 5 there was one working copy per repository (the owner's);
+           it's read here and turned into the owner's draft once the commits are in */
+        static WorkFile legacy[MAX_FILES];
+        int legacyCount = 0;
+        if (ver >= 5) {
+            int cc2 = (int)RI(f);
+            if (cc2 < 0 || cc2 > MAX_USERS) { loadErr = 1; break; }
+            for (int k = 0; k < cc2; k++) r->collabs[r->collabCount++] = (int)RI(f);
+            int ic2 = (int)RI(f);
+            if (ic2 < 0 || ic2 > MAX_USERS) { loadErr = 1; break; }
+            for (int k = 0; k < ic2; k++) { r->invites[r->inviteCount] = (int)RI(f); r->inviteTime[r->inviteCount++] = RI(f); }
+        } else {
+            int fc = (int)RI(f);
+            if (fc < 0 || fc > MAX_FILES) { loadErr = 1; break; }
+            for (int k = 0; k < fc && !loadErr; k++) {
+                WorkFile *w = &legacy[legacyCount];
+                memset(w, 0, sizeof *w);
+                RSInto(f, w->name, NAME_LEN);
+                int txLen = 0;
+                char *tx = RSN(f, &txLen);
+                if (tx) { WF_SetN(w, tx, txLen); free(tx); legacyCount++; }
+            }
         }
 
         int bc = (int)RI(f);
@@ -1451,6 +1752,51 @@ static bool Load(void)
             is->time   = RI(f);
             is->author = ver >= 2 ? (int)RI(f) : -1;
         }
+
+        if (ver >= 5) {
+            int dc = (int)RI(f);
+            if (dc < 0 || dc > MAX_USERS) { loadErr = 1; break; }
+            for (int k = 0; k < dc && !loadErr; k++) {
+                int uid = (int)RI(f), n2 = (int)RI(f);
+                if (n2 < 0 || n2 > MAX_DRAFT) { loadErr = 1; break; }
+                Draft *d = GetDraft(r, uid, true);
+                for (int j = 0; j < n2 && !loadErr; j++) {
+                    char nm[NAME_LEN];
+                    RSInto(f, nm, NAME_LEN);
+                    int txLen = 0;
+                    char *tx = RSN(f, &txLen);
+                    bool del = RI(f) != 0;
+                    int base = (int)RI(f);
+                    if (!tx) break;
+                    if (base < -1 || base >= r->blobCount) loadErr = 1;
+                    if (d && !loadErr && d->count < MAX_DRAFT) {
+                        WorkFile *e = &d->files[d->count++];
+                        memset(e, 0, sizeof *e);
+                        snprintf(e->name, NAME_LEN, "%s", nm);
+                        WF_SetN(e, tx, txLen);
+                        e->deleted = del;
+                        e->base = base;
+                    }
+                    free(tx);
+                }
+            }
+        } else {
+            /* the old working copy becomes the owner's draft: only the real changes */
+            for (int k = 0; k < legacyCount; k++) {
+                WorkFile *w = &legacy[k];
+                if (!SameAsBlob(r, w, HeadBlobOf(r, w->name))) {
+                    WorkFile *e = DraftEdit(r, r->owner, w->name);
+                    if (e) WF_SetN(e, w->text, w->len);
+                }
+            }
+            Commit *h = Head(r);
+            for (int k = 0; h && k < h->fileCount; k++) {
+                bool kept = false;
+                for (int j = 0; j < legacyCount; j++) if (strcmp(legacy[j].name, h->names[k]) == 0) kept = true;
+                if (!kept) { WorkFile *e = DraftEdit(r, r->owner, h->names[k]); if (e) e->deleted = true; }
+            }
+            for (int k = 0; k < legacyCount; k++) WF_Free(&legacy[k]);
+        }
     }
     fclose(f);
 
@@ -1475,13 +1821,13 @@ static void SeedExample(int owner)
 {
     Repo *r = NewRepo(owner, "hello-world", "An example repository to try things out");
     if (!r) return;
-    AddFile(r, "README.md",
+    DraftSetText(r, owner, "README.md",
         "# hello-world\n"
         "\n"
         "Welcome to Mini GitHub!\n"
         "\n"
         "This is an example repository so you can see how things work.\n");
-    AddFile(r, "main.c",
+    DraftSetText(r, owner, "main.c",
         "#include <stdio.h>\n"
         "\n"
         "int main(void)\n"
@@ -1491,7 +1837,7 @@ static void SeedExample(int owner)
         "}\n");
     DoCommit(r, "Initial commit");
 
-    WF_Set(&r->files[0],
+    DraftSetText(r, owner, "README.md",
         "# hello-world\n"
         "\n"
         "Welcome to Mini GitHub!\n"
@@ -1669,7 +2015,14 @@ static int XToCol(const char *line, int lineLen, float x)
     return best;
 }
 
-static void SelectFile(int i) { curFile = i; ed.cursor = 0; ed.scrollX = ed.scrollY = 0; }
+/* The Code tab remembers the open file by name, so it stays open while files
+   are added, deleted or committed around it. "" means "open the first one". */
+static void SelectFileName(const char *name)
+{
+    snprintf(selName, NAME_LEN, "%.*s", NAME_LEN - 1, name ? name : "");
+    ed.cursor = 0; ed.scrollX = ed.scrollY = 0;
+    ed.focused = false;
+}
 
 /* Draws and runs the editor. Returns true if the text was changed.
    In read-only mode you can still click, scroll and move the cursor. */
@@ -2668,7 +3021,7 @@ static void Unfocus(void)
     tfSearch.active = tfName.active = tfDesc.active = false;
     tfNewFile.active = tfCommit.active = tfIssue.active = false;
     tfUser.active = tfPass.active = tfPass2.active = tfCode.active = false;
-    tfUpPath.active = tfUpMsg.active = false;
+    tfUpPath.active = tfUpMsg.active = tfInvite.active = false;
     tfOldPass.active = tfNewPass.active = tfNewPass2.active = tfDelPass.active = false;
     ed.focused = false;
     armedId = 0;
@@ -2799,6 +3152,8 @@ static void OpenDay(int uid, long long day)
     screen = SCR_DAY;
 }
 
+static void ForgetScratch(void);
+
 static void OpenRepo(int i)
 {
     Unfocus();
@@ -2806,8 +3161,10 @@ static void OpenRepo(int i)
     curRepo = i;
     screen  = SCR_REPO;
     tab     = TAB_CODE;
-    SelectFile(ShownCount(&repos[i]) ? 0 : -1);
-    scFiles = scCommits = scIssues = 0;
+    SelectFileName("");
+    scFiles = scCommits = scIssues = scPeopleTab = 0;
+    ForgetScratch();
+    TF_Clear(&tfInvite);
     TF_Clear(&tfCommit);
     TF_Clear(&tfNewFile);
     TF_Clear(&tfIssue);
@@ -2867,9 +3224,11 @@ static void DoLogin(void)
     char nm[NAME_LEN];
     snprintf(nm, NAME_LEN, "%s", u->name);
     bool noCode = !HasRecoveryCode(u);
+    int inv = InvitationCount(u->id);
     SignIn(u->id);
-    Toast(noCode ? "Tip: make a recovery code in Account settings in case you forget your password"
-                 : TextFormat("Welcome back, %s", nm));
+    if (inv)         Toast(TextFormat("You've been invited to %d repositor%s - see your profile", inv, inv == 1 ? "y" : "ies"));
+    else if (noCode) Toast("Tip: make a recovery code in Account settings in case you forget your password");
+    else             Toast(TextFormat("Welcome back, %s", nm));
 }
 
 static void DoRegister(void)
@@ -3547,14 +3906,47 @@ static void ScreenProfile(void)
     if (Clicked(pplHit)) { OpenPeople(); return; }
     if (y + 54 <= H) DrawText(TextFormat("Theme: %s", THEMES[theme].name), 20, y + 30, FS, acc);   /* only if there's room */
 
+    /* ---- right column: invitations waiting for you ---- */
+    float mx = 340, mw = (float)W - 360, oy = 0;
+    if (mine) {
+        int shownInv = 0, totalInv = InvitationCount(curUser);
+        for (int i = 0; i < repoCount && shownInv < 2; i++) {
+            Repo *ir = &repos[i];
+            if (!IsInvited(ir, curUser)) continue;
+            Rectangle b = {mx, 191 + oy, mw, 52};
+            DrawRectangleRec(b, (Color){20, 50, 90, 255});
+            DrawRectangleLinesEx(b, 1, UI_LINK);
+            DrawAvatar(ir->owner, (int)b.x + 28, (int)b.y + 26, 16);
+            const char *msg = TextFormat("%s invited you to collaborate on %s", UserName(ir->owner), ir->name);
+            DrawFit(msg, (int)b.x + 54, (int)b.y + 15, FS, (int)b.width - 54 - 370, UI_TEXT);
+            if (Button((Rectangle){b.x + b.width - 360, b.y + 9, 100, 34}, "View", UI_BTN)) { OpenRepo(i); tab = TAB_PEOPLE; return; }
+            if (Button((Rectangle){b.x + b.width - 252, b.y + 9, 120, 34}, "Accept", UI_GREEN)) {
+                AcceptInvite(ir, curUser); MarkDirty();
+                Toast(TextFormat("You can now edit %s - it's in your list below", ir->name));
+                return;
+            }
+            if (Button((Rectangle){b.x + b.width - 124, b.y + 9, 116, 34}, "Decline", UI_BTN)) {
+                RemoveInvite(ir, curUser); MarkDirty();
+                Toast("Invitation declined");
+                return;
+            }
+            oy += 60;
+            shownInv++;
+        }
+        if (totalInv > shownInv) {
+            DrawText(TextFormat("...and %d more invitation%s", totalInv - shownInv, totalInv - shownInv == 1 ? "" : "s"),
+                     (int)mx, (int)(191 + oy), FS, UI_MUTED);
+            oy += 30;
+        }
+    }
+
     /* ---- right column: contributions ---- */
-    float mx = 340, mw = (float)W - 360;
     long long hoverDay = 0;
-    DrawContributions((Rectangle){mx, 191, mw, 160}, u->id, &hoverDay);
+    DrawContributions((Rectangle){mx, 191 + oy, mw, 160}, u->id, &hoverDay);
     if (screen != SCR_PROFILE) return;                       /* a day was clicked */
 
     /* ---- right column: repositories ---- */
-    float ty = 367;
+    float ty = 367 + oy;
     if (mine) {
         if (ButtonEx((Rectangle){mx, ty, 100, 40}, "Yours", homeView == 0 ? UI_BLUE : UI_BTN, true))       { homeView = 0; scProfile = 0; }
         if (ButtonEx((Rectangle){mx + 106, ty, 120, 40}, "Everyone", homeView == 1 ? UI_BLUE : UI_BTN, true)) { homeView = 1; scProfile = 0; }
@@ -3580,7 +3972,7 @@ static void ScreenProfile(void)
     int order[MAX_REPOS], n = 0;
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
-        if (!everyone && r->owner != u->id) continue;
+        if (!everyone && r->owner != u->id && !(mine && IsCollab(r, u->id))) continue;   /* yours: owned + collaborating */
         if (!ContainsCI(r->name, tfSearch.buf) && !ContainsCI(UserName(r->owner), tfSearch.buf)) continue;
         order[n++] = i;
     }
@@ -3610,13 +4002,14 @@ static void ScreenProfile(void)
         DrawRectangleLinesEx(card, 1, UI_BORDER);
 
         int tx = (int)card.x + 18;
-        if (everyone) {                            /* show "owner / name" when browsing everyone */
+        if (everyone || r->owner != u->id) {       /* show "owner / name" when it isn't theirs */
             const char *own = TextFormat("%s / ", UserName(r->owner));
             DrawText(own, tx, (int)card.y + 12, FS, UI_LINK);
             tx += MeasureText(own, FS);
         }
         DrawBold(r->name, tx, (int)card.y + 12, FS, UI_LINK);
         tx += MeasureText(r->name, FS) + 16;
+        if (IsCollab(r, curUser)) { DrawText("collaborator", tx, (int)card.y + 12, FS, UI_MUTED); tx += MeasureText("collaborator", FS) + 16; }
         if (HasStarred(r, curUser)) DrawText("starred", tx, (int)card.y + 12, FS, UI_YELLOW);
 
         DrawFit(r->desc[0] ? r->desc : "No description", (int)card.x + 18, (int)card.y + 38, FS, (int)card.width - 36, UI_MUTED);
@@ -3689,7 +4082,7 @@ static void TryCreateRepo(void)
     Repo *r = NewRepo(curUser, nm, tfDesc.buf);
     if (!r) { Toast("This computer has reached the maximum number of repositories"); return; }
     if (optReadme) {
-        AddFile(r, "README.md", TextFormat("# %s\n\n%s\n", nm, tfDesc.buf[0] ? tfDesc.buf : "A new project."));
+        DraftSetText(r, curUser, "README.md", TextFormat("# %s\n\n%s\n", nm, tfDesc.buf[0] ? tfDesc.buf : "A new project."));
         DoCommit(r, "Initial commit");
     }
     MarkDirty();
@@ -3724,6 +4117,315 @@ static void ScreenNew(void)
 
 /* ---------------- repository pages ---------------- */
 
+/* ------------------------------------------------------------------ */
+/* Contributions per person (the pie chart) and the People tab         */
+/* ------------------------------------------------------------------ */
+
+/* Slice colours, in a fixed order. They were checked with a colour-blindness
+   simulator to stay tellable apart (including the last and first, which touch
+   where the circle closes) and to stand out against the dark background.
+   A person's colour follows their place in the list (owner first, then
+   collaborators in the order they joined), never how much they've done,
+   so colours don't jump around as commits come in. Past 6 people, the rest
+   share one grey "Others" slice. */
+static const Color PIE_COLORS[6] = {
+    {0x39, 0x87, 0xe5, 255}, {0xd9, 0x59, 0x26, 255}, {0x19, 0x9e, 0x70, 255},
+    {0xc9, 0x85, 0x00, 255}, {0xd5, 0x51, 0x81, 255}, {0x00, 0x83, 0x00, 255}
+};
+static const Color PIE_OTHER = {0x6e, 0x76, 0x81, 255};
+
+typedef struct { int user; int commits; int adds; Color color; int people; } Share;   /* user -1 = "Others" */
+static Share shares[6];
+static int   shareCount, shareTotal;
+
+/* Owner, collaborators, then anyone else who has committed (former
+   collaborators, or deleted accounts that show as "ghost"). */
+static void BuildShares(Repo *r)
+{
+    int ids[MAX_USERS * 2] = {0}, n = 0;
+    #define ADD_ID(u) do { bool seen_ = false; for (int q_ = 0; q_ < n; q_++) if (ids[q_] == (u)) seen_ = true; \
+                           if (!seen_ && n < MAX_USERS * 2) ids[n++] = (u); } while (0)
+    ADD_ID(r->owner);
+    for (int i = 0; i < r->collabCount; i++) ADD_ID(r->collabs[i]);
+    for (int k = 0; k < r->commitCount; k++) ADD_ID(r->commits[k].author);
+    #undef ADD_ID
+
+    shareCount = shareTotal = 0;
+    for (int i = 0; i < n; i++) {
+        int c = 0, a = 0;
+        for (int k = 0; k < r->commitCount; k++)
+            if (r->commits[k].author == ids[i]) { c++; CommitStats(r, k); a += r->commits[k].sAdds; }
+        shareTotal += c;
+        if (n <= 6 || i < 5) shares[shareCount++] = (Share){ids[i], c, a, PIE_COLORS[i], 1};
+        else {
+            if (shareCount == 5) shares[shareCount++] = (Share){-1, 0, 0, PIE_OTHER, 0};
+            shares[5].commits += c; shares[5].adds += a; shares[5].people++;
+        }
+    }
+}
+
+/* A repository counts as "multi-user" once it has a collaborator, or commits by more than one person. */
+static bool IsMultiUser(Repo *r)
+{
+    if (r->collabCount) return true;
+    for (int k = 1; k < r->commitCount; k++) if (r->commits[k].author != r->commits[0].author) return true;
+    return false;
+}
+
+static const char *ShareName(Share *s)
+{
+    return s->user >= 0 ? UserName(s->user) : TextFormat("Others (%d people)", s->people);
+}
+
+/* A tooltip that's drawn last, on top of everything else on screen. */
+static char tipText[3][TEXT_LEN];
+static int  tipLines;
+static void SetTip(const char *a, const char *b, const char *c)
+{
+    snprintf(tipText[0], TEXT_LEN, "%s", a ? a : "");
+    snprintf(tipText[1], TEXT_LEN, "%s", b ? b : "");
+    snprintf(tipText[2], TEXT_LEN, "%s", c ? c : "");
+    tipLines = c ? 3 : b ? 2 : 1;
+}
+static void DrawTip(void)
+{
+    if (!tipLines) return;
+    int w = 0;
+    for (int i = 0; i < tipLines; i++) { int lw = MeasureText(tipText[i], FS); if (lw > w) w = lw; }
+    int bw = w + 32, bh = tipLines * 26 + 18;
+    Vector2 m = GetMousePosition();
+    int x = (int)m.x + 18, y = (int)m.y + 20;
+    if (x + bw > W - 8) x = (int)m.x - 18 - bw;
+    if (y + bh > H - 8) y = (int)m.y - 12 - bh;
+    Rectangle box = {(float)x, (float)y, (float)bw, (float)bh};
+    DrawRectangleRounded((Rectangle){box.x + 3, box.y + 4, box.width, box.height}, 0.1f, 6, (Color){0, 0, 0, 120});
+    DrawRectangleRounded(box, 0.1f, 6, (Color){36, 41, 49, 255});
+    DrawRectangleRoundedLinesEx(box, 0.1f, 6, 1, UI_BORDER);
+    for (int i = 0; i < tipLines; i++)
+        if (i == 0) DrawBold(tipText[i], x + 16, y + 10, FS, UI_TEXT);
+        else        DrawText(tipText[i], x + 16, y + 10 + i * 26, FS, UI_MUTED);
+    tipLines = 0;
+}
+
+static int Percent(int part, int total) { return total ? (part * 100 + total / 2) / total : 0; }
+
+/* Draws the pie for the shares worked out by BuildShares. Slices start at
+   the top and go clockwise; a thin gap separates them. Returns the slice
+   under the mouse (it's drawn slightly bigger), or -1. */
+static int DrawPie(Vector2 c, float rad)
+{
+    if (shareTotal == 0) {                      /* nobody has committed yet: an empty ring */
+        DrawRing(c, rad - 3, rad, 0, 360, 48, UI_BORDER);
+        return -1;
+    }
+    Vector2 m = GetMousePosition();
+    float dx = m.x - c.x, dy = m.y - c.y;
+    bool inside = dx * dx + dy * dy <= (rad + 4) * (rad + 4);
+    float mang = atan2f(dy, dx) * RAD2DEG;       /* same direction as raylib: clockwise from the right */
+    if (mang < -90) mang += 360;                 /* so it runs -90 (top) ... 270 */
+
+    int hov = -1, slices = 0;
+    float a = -90;
+    for (int i = 0; i < shareCount; i++) {
+        if (!shares[i].commits) continue;
+        slices++;
+        float sweep = 360.0f * shares[i].commits / shareTotal;
+        if (inside && mang >= a && mang < a + sweep) hov = i;
+        a += sweep;
+    }
+    a = -90;
+    for (int i = 0; i < shareCount; i++) {
+        if (!shares[i].commits) continue;
+        float sweep = 360.0f * shares[i].commits / shareTotal;
+        float rr = i == hov ? rad + 4 : rad;
+        DrawCircleSector(c, rr, a, a + sweep, (int)(sweep / 3) + 4, shares[i].color);
+        a += sweep;
+    }
+    if (slices > 1) {                            /* the gaps between slices */
+        Color gap = {22, 27, 34, 255};
+        a = -90;
+        for (int i = 0; i < shareCount; i++) {
+            if (!shares[i].commits) continue;
+            Vector2 e = {c.x + cosf(a * DEG2RAD) * (rad + 6), c.y + sinf(a * DEG2RAD) * (rad + 6)};
+            DrawLineEx(c, e, 2, gap);
+            a += 360.0f * shares[i].commits / shareTotal;
+        }
+    }
+    return hov;
+}
+
+static void ShareTip(int i)
+{
+    Share *s = &shares[i];
+    SetTip(ShareName(s),
+           TextFormat("%d commit%s  (%d%%)", s->commits, s->commits == 1 ? "" : "s", Percent(s->commits, shareTotal)),
+           TextFormat("+%d lines added", s->adds));
+}
+
+/* The little pie in a repository's header. Returns true if it was clicked. */
+static bool HeaderPie(Repo *r, float rightX, float cy)
+{
+    if (!IsMultiUser(r)) return false;
+    BuildShares(r);
+    int members = 1 + r->collabCount;
+    const char *label = TextFormat("%d %s", members, members == 1 ? "person" : "people");
+    Vector2 c = {rightX - 18, cy};
+    int lw = MeasureText(label, FS);
+    Rectangle hit = {rightX - 36 - 12 - lw, cy - 20, (float)lw + 48, 40};
+    bool hot = Hover(hit);
+    DrawText(label, (int)(rightX - 36 - 12 - lw), (int)cy - 10, FS, hot ? UI_LINK : UI_MUTED);
+    int h = DrawPie(c, 16);
+    if (hot) {
+        wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        if (h >= 0) ShareTip(h);
+        else SetTip("Contributions", "Click to see who did what", NULL);
+    }
+    return Clicked(hit);
+}
+
+/* ---------------- the People tab ---------------- */
+
+static void TabPeople(Repo *r)
+{
+    bool owner = IsMine(r), invited = IsInvited(r, curUser);
+    float top = 186;
+    float lw = ((float)W - 60) * 0.55f;
+    float x = 20;
+
+    /* an invitation waiting for you */
+    if (invited) {
+        Rectangle b = {x, top, lw, 60};
+        DrawRectangleRec(b, (Color){20, 50, 90, 255});
+        DrawRectangleLinesEx(b, 1, UI_LINK);
+        DrawFit(TextFormat("%s invited you to collaborate on %s", UserName(r->owner), r->name),
+                (int)b.x + 16, (int)b.y + 19, FS, (int)b.width - 290, UI_TEXT);
+        if (Button((Rectangle){b.x + b.width - 260, b.y + 12, 120, 36}, "Accept", UI_GREEN)) {
+            AcceptInvite(r, curUser); MarkDirty();
+            Toast(TextFormat("You can now edit %s", r->name));
+            return;
+        }
+        if (Button((Rectangle){b.x + b.width - 132, b.y + 12, 120, 36}, "Decline", UI_BTN)) {
+            RemoveInvite(r, curUser); MarkDirty();
+            Toast("Invitation declined");
+            return;
+        }
+        top += 76;
+    }
+
+    /* ---- left: who has access ---- */
+    DrawBold("People with access", (int)x, (int)top + 4, FS, UI_TEXT);
+    float listTop = top + 38, listBottom = (float)H - 20 - (owner ? 150 : 0);
+    Rectangle la = {x, listTop, lw, listBottom - listTop};
+    int rows = 1 + r->collabCount + r->inviteCount;
+    float rowH = 62;
+    ScrollArea(la, &scPeopleTab, rows * rowH - 6);
+    int act = 0, actUser = -1;                    /* 1 remove, 2 cancel invite, 3 leave */
+    BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
+    for (int i = 0; i < rows; i++) {
+        int uid = i == 0 ? r->owner : i <= r->collabCount ? r->collabs[i - 1] : r->invites[i - 1 - r->collabCount];
+        bool pending = i > r->collabCount;
+        Rectangle row = {la.x, la.y + i * rowH - scPeopleTab, la.width - 12, rowH - 6};
+        if (row.y > la.y + la.height || row.y + row.height < la.y) continue;
+        DrawRectangleRec(row, UI_PANEL);
+        DrawRectangleLinesEx(row, 1, UI_BORDER);
+        DrawAvatar(uid, (int)row.x + 34, (int)(row.y + row.height / 2), 20);
+        const char *nm = UserName(uid);
+        Rectangle nameHit = {row.x + 66, row.y + 8, (float)MeasureText(nm, FS), 24};
+        bool nh = Hover(la) && Hover(nameHit);
+        DrawBold(nm, (int)row.x + 66, (int)row.y + 9, FS, UI_LINK);
+        if (nh) { wantCursor = MOUSE_CURSOR_POINTING_HAND; DrawLine((int)nameHit.x, (int)row.y + 31, (int)(nameHit.x + nameHit.width), (int)row.y + 31, UI_LINK); }
+        if (nh && Clicked(nameHit)) { EndScissorMode(); OpenProfile(uid); return; }
+        const char *role = i == 0 ? "Owner" : pending ? TextFormat("Invited %s - waiting for an answer", TimeAgo(r->inviteTime[i - 1 - r->collabCount]))
+                                                      : "Collaborator";
+        DrawFit(TextFormat("%s%s", role, uid == curUser ? "  (you)" : ""), (int)row.x + 66, (int)row.y + 32, FS, (int)row.width - 230, UI_MUTED);
+
+        Rectangle btn = {row.x + row.width - 170, row.y + 12, 158, 32};
+        if (owner && i > 0 && !pending && Hover(la) && ConfirmButton(btn, "Remove", "Sure?", 100 + i)) { act = 1; actUser = uid; }
+        if (owner && pending && Hover(la) && ConfirmButton(btn, "Cancel invite", "Sure?", 100 + i)) { act = 2; actUser = uid; }
+        if (!owner && !pending && i > 0 && uid == curUser && Hover(la) && ConfirmButton(btn, "Leave", "Really leave?", 100 + i)) { act = 3; actUser = uid; }
+    }
+    EndScissorMode();
+    DrawScrollbar(la, scPeopleTab, rows * rowH - 6);
+    if (act) {
+        const char *who = UserName(actUser);
+        char whoCopy[NAME_LEN];
+        snprintf(whoCopy, NAME_LEN, "%s", who);
+        RemoveMember(r, actUser);
+        MarkDirty();
+        if (act == 1) Toast(TextFormat("%s can no longer edit this repository", whoCopy));
+        if (act == 2) Toast(TextFormat("Invitation to %s cancelled", whoCopy));
+        if (act == 3) { Toast(TextFormat("You've left %s", r->name)); SelectFileName(""); }
+        return;
+    }
+
+    /* ---- owner: invite someone ---- */
+    if (owner) {
+        float iy = (float)H - 20 - 140;
+        DrawLine((int)x, (int)iy, (int)(x + lw), (int)iy, UI_BORDER);
+        DrawBold("Invite a collaborator", (int)x, (int)iy + 12, FS, UI_TEXT);
+        bool enter = TextFieldUI(&tfInvite, (Rectangle){x, iy + 42, lw - 130, 40}, "their username");
+        if (Button((Rectangle){x + lw - 120, iy + 42, 120, 40}, "Invite", UI_GREEN) || enter) {
+            const char *err = InviteUser(r, tfInvite.buf);
+            if (err) Toast(err);
+            else {
+                Toast(TextFormat("Invited %s - they'll see it on their profile", tfInvite.buf));
+                TF_Clear(&tfInvite);
+                MarkDirty();
+            }
+        }
+        /* everyone who could be invited, as quick picks */
+        float cx2 = x + MeasureText("People here:", FS) + 12;
+        DrawText("People here:", (int)x, (int)iy + 98, FS, UI_MUTED);
+        int shown = 0;
+        for (int i = 0; i < userCount; i++) {
+            User *u = &users[i];
+            if (u->id == r->owner || IsCollab(r, u->id) || IsInvited(r, u->id)) continue;
+            int w = MeasureText(u->name, FS) + 20;
+            if (cx2 + w > x + lw) break;
+            Rectangle chip = {cx2, iy + 94, (float)w, 28};
+            bool hot = Hover(chip);
+            DrawRectangleRounded(chip, 0.5f, 6, hot ? UI_HOVER : UI_BTN);
+            DrawText(u->name, (int)chip.x + 10, (int)chip.y + 4, FS, UI_LINK);
+            if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+            if (Clicked(chip)) { snprintf(tfInvite.buf, TEXT_LEN, "%s", u->name); tfInvite.len = (int)strlen(tfInvite.buf); }
+            cx2 += w + 8;
+            shown++;
+        }
+        if (!shown) DrawText("everyone is already here", (int)cx2, (int)iy + 98, FS, UI_MUTED);
+    }
+
+    /* ---- right: contributions ---- */
+    float rx = x + lw + 20, rw = (float)W - 20 - rx;
+    Rectangle card = {rx, 186, rw, (float)H - 206};
+    DrawRectangleRec(card, UI_PANEL);
+    DrawRectangleLinesEx(card, 1, UI_BORDER);
+    DrawBold("Contributions", (int)rx + 18, (int)card.y + 16, FS, UI_TEXT);
+    if (!IsMultiUser(r)) {
+        DrawFit(TextFormat("Only %s has worked on this repository so far.", UserName(r->owner)),
+                (int)rx + 18, (int)card.y + 52, FS, (int)rw - 36, UI_MUTED);
+        DrawFit(owner ? "Invite a collaborator to see who did what here." : "Once more people take part, a breakdown appears here.",
+                (int)rx + 18, (int)card.y + 78, FS, (int)rw - 36, UI_MUTED);
+        return;
+    }
+    BuildShares(r);
+    DrawText(TextFormat("by number of commits  |  %d in total", shareTotal), (int)rx + 18, (int)card.y + 42, FS, UI_MUTED);
+    float rad = fminf(rw * 0.3f, 100);
+    Vector2 c = {rx + rw / 2, card.y + 84 + rad};
+    int h = DrawPie(c, rad);
+    if (h >= 0) ShareTip(h);
+
+    /* the key: every person with their colour, commits, share and lines */
+    float ky = c.y + rad + 26;
+    for (int i = 0; i < shareCount && ky + 24 < card.y + card.height; i++) {
+        Share *s = &shares[i];
+        DrawRectangleRounded((Rectangle){rx + 18, ky + 3, 14, 14}, 0.3f, 4, s->color);
+        DrawFit(ShareName(s), (int)rx + 42, (int)ky, FS, (int)(rw * 0.42f), UI_TEXT);
+        const char *val = TextFormat("%d commit%s  %d%%", s->commits, s->commits == 1 ? "" : "s", Percent(s->commits, shareTotal));
+        DrawText(val, (int)(rx + rw - 18) - MeasureText(val, FS), (int)ky, FS, UI_MUTED);
+        ky += 30;
+    }
+}
+
 /* Returns true if the repository was deleted or we left it (so stop drawing it). */
 static bool DrawRepoHeader(Repo *r, int activeTab)
 {
@@ -3736,7 +4438,7 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
     DrawText(" / ", x + w1, y, 30, UI_MUTED);
     DrawBold(r->name, x + w1 + w2, y, 30, UI_TEXT);
     bool mine = IsMine(r);
-    const char *badge = mine ? "Yours" : "Read-only";
+    const char *badge = mine ? "Yours" : IsCollab(r, curUser) ? "Collaborator" : "Read-only";
     Rectangle pill = {(float)(x + w1 + w2 + w3 + 16), (float)y + 2, (float)MeasureText(badge, FS) + 20, 26};
     DrawRectangleRounded(pill, 0.5f, 6, UI_BTN);
     DrawText(badge, (int)pill.x + 10, (int)pill.y + 3, FS, UI_MUTED);
@@ -3759,11 +4461,14 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
         return true;
     }
 
+    if (HeaderPie(r, (float)W - 20, 150)) { Unfocus(); tab = TAB_PEOPLE; screen = SCR_REPO; }
+
     int tx = 20;
-    for (int t = 0; t < 3; t++) {
+    for (int t = 0; t < 4; t++) {
         const char *label = t == 0 ? TextFormat("Code  %d", ShownCount(r))
                           : t == 1 ? TextFormat("Commits  %d", r->commitCount)
-                                   : TextFormat("Issues  %d", OpenIssues(r));
+                          : t == 2 ? TextFormat("Issues  %d", OpenIssues(r))
+                                   : TextFormat("People  %d", 1 + r->collabCount);
         int w = MeasureText(label, FS) + 28;
         Rectangle tr = {(float)tx, 132, (float)w, 38};
         bool on = (t == activeTab);
@@ -3781,27 +4486,32 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
 }
 
 /* File list on the left. Names come from the working files (yours) or the latest commit (theirs). */
+/* File list on the left: the latest commit, plus your own changes if you can edit. */
 static void DrawFileList(Repo *r, Rectangle la)
 {
-    bool mine = IsMine(r);
-    int n = ShownCount(r);
+    bool edit = CanEdit(r);
+    BuildView(r, edit ? curUser : -1);
+    int n = viewCount;
     float rowH = 30;
     ScrollArea(la, &scFiles, n * rowH);
-    if (!n) DrawText(mine ? "No files yet" : "Nothing committed yet", (int)la.x + 14, (int)la.y + 6, FS, UI_MUTED);
+    if (!n) DrawText(edit ? "No files yet" : "Nothing committed yet", (int)la.x + 14, (int)la.y + 6, FS, UI_MUTED);
     BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
     for (int i = 0; i < n; i++) {
+        ViewFile *v = &view[i];
         Rectangle row = {la.x, la.y + i * rowH - scFiles, la.width, rowH};
         bool hot = Hover(la) && Hover(row);
-        if (i == curFile) DrawRectangleRec(row, (Color){56, 139, 253, 40});
-        else if (hot)     DrawRectangleRec(row, UI_HOVER);
+        if (strcmp(v->name, selName) == 0) DrawRectangleRec(row, (Color){56, 139, 253, 40});
+        else if (hot)                       DrawRectangleRec(row, UI_HOVER);
         if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
-        const char *name = mine ? r->files[i].name : Head(r)->names[i];
-        DrawFit(name, (int)row.x + 14, (int)row.y + 5, FS, (int)row.width - 54, UI_TEXT);
-        if (mine) {
-            char st = FileStatus(r, i);
-            if (st) DrawText(st == 'A' ? "A" : "M", (int)(row.x + row.width - 28), (int)row.y + 5, FS, st == 'A' ? UI_GREENT : UI_YELLOW);
+        bool gone = ViewDeleted(v);
+        DrawFit(v->name, (int)row.x + 14, (int)row.y + 5, FS, (int)row.width - 54, gone ? UI_MUTED : UI_TEXT);
+        if (gone) DrawLine((int)row.x + 14, (int)row.y + 15, (int)row.x + 14 + MeasureText(v->name, FS), (int)row.y + 15, UI_MUTED);
+        if (v->status) {
+            const char *t = v->status == 'C' ? "!" : TextFormat("%c", v->status);
+            Color c = v->status == 'A' ? UI_GREENT : v->status == 'M' ? UI_YELLOW : v->status == 'D' ? UI_REDT : UI_ORANGE;
+            DrawBold(t, (int)(row.x + row.width - 28), (int)row.y + 5, FS, c);
         }
-        if (Hover(la) && Clicked(row)) SelectFile(i);
+        if (Hover(la) && Clicked(row)) SelectFileName(v->name);
     }
     EndScissorMode();
     DrawScrollbar(la, scFiles, n * rowH);
@@ -3948,10 +4658,9 @@ static char StagedKind(Repo *r, Staged *s)
 /* True if you've edited this file since the last commit and the upload would replace those edits. */
 static bool StagedReplacesEdits(Repo *r, Staged *s)
 {
-    int i = FindFile(r, s->name);
-    if (i < 0 || !FileStatus(r, i)) return false;
-    WorkFile *f = &r->files[i];
-    return !(f->len == s->len && memcmp(f->text, s->data, (size_t)s->len) == 0);
+    WorkFile *f = DraftFind(r, curUser, s->name);
+    if (!f || !DraftStatus(r, f)) return false;
+    return f->deleted || !(f->len == s->len && memcmp(f->text, s->data, (size_t)s->len) == 0);
 }
 
 /* Saves the staged files as one commit. Returns NULL or a message. */
@@ -3959,16 +4668,15 @@ static const char *DoUploadCommit(Repo *r, const char *msg)
 {
     if (!stagedCount) return "Add some files first";
     Commit *h = Head(r);
-    int changed = 0, newInCommit = 0, newInWork = 0;
+    int changed = 0, newInCommit = 0;
     for (int i = 0; i < stagedCount; i++) {
         char kd = StagedKind(r, &staged[i]);
         if (kd != '=') changed++;
         if (kd == 'A') newInCommit++;
-        if (FindFile(r, staged[i].name) < 0) newInWork++;
     }
     if (!changed)                      return "Nothing to commit - these are the same as the latest versions";
     if (r->commitCount >= MAX_COMMITS) return "This repository has reached its commit limit";
-    if ((h ? h->fileCount : 0) + newInCommit > MAX_FILES || r->fileCount + newInWork > MAX_FILES)
+    if ((h ? h->fileCount : 0) + newInCommit > MAX_FILES)
         return TextFormat("A repository can hold up to %d files", MAX_FILES);
     if (r->blobCount + changed > MAX_BLOBS) return "This repository is out of storage space";
 
@@ -3992,13 +4700,8 @@ static const char *DoUploadCommit(Repo *r, const char *msg)
     FinishCommit(r, &c, msg[0] ? msg : "Add files via upload");
     MarkDirty();
 
-    /* the uploaded versions also become the versions you're working on */
-    for (int i = 0; i < stagedCount; i++) {
-        Staged *s = &staged[i];
-        int f = FindFile(r, s->name);
-        if (f < 0) AddFileN(r, s->name, s->data, s->len);
-        else       WF_SetN(&r->files[f], s->data, s->len);
-    }
+    /* the uploaded versions replace any uncommitted edits you had to those files */
+    for (int i = 0; i < stagedCount; i++) DraftDropName(r, curUser, staged[i].name);
     return NULL;
 }
 
@@ -4138,7 +4841,7 @@ static void BackToCode(void) { Unfocus(); screen = SCR_REPO; tab = TAB_CODE; }
 
 static void ScreenUpload(Repo *r)
 {
-    if (!IsMine(r)) { BackToCode(); return; }
+    if (!CanEdit(r)) { BackToCode(); return; }
     TextField *order[] = {&tfUpPath, &tfUpMsg};
     TabCycle(order, 2);
 
@@ -4230,7 +4933,7 @@ static void ScreenUpload(Repo *r)
         ClearStaged();
         MarkDirty();
         BackToCode();
-        SelectFile(FindFile(r, first));
+        SelectFileName(first);
     }
 }
 
@@ -4255,32 +4958,97 @@ static void DrawFileHeader(Rectangle fh, const char *name, const char *tag, Colo
     DrawText(info, (int)(fh.x + fh.width) - 14 - rightGap - MeasureText(info, FS), (int)fh.y + 11, FS, UI_MUTED);
 }
 
+/* A private copy of a committed file for the editor to work on. Nothing is
+   saved while you only look or move the cursor; the moment you actually
+   change something, the file is copied into your draft. */
+static WorkFile    scratch;
+static const Repo *scratchRepo;
+static int         scratchBlob = -2;
+static char        scratchName[NAME_LEN];
+static WorkFile *Scratch(Repo *r, ViewFile *v)
+{
+    if (scratchRepo != r || scratchBlob != v->blob || strcmp(scratchName, v->name) != 0) {
+        WF_SetN(&scratch, v->data, v->len);
+        scratchRepo = r;
+        scratchBlob = v->blob;
+        snprintf(scratchName, NAME_LEN, "%s", v->name);
+        snprintf(scratch.name, NAME_LEN, "%s", v->name);
+    }
+    return &scratch;
+}
+static void ForgetScratch(void) { scratchBlob = -2; }
+
+/* Explains a conflict and offers the two ways out. Returns true if one was chosen. */
+static bool ConflictBar(Repo *r, ViewFile *v, Rectangle bar)
+{
+    WorkFile *e = v->mine;
+    int cur = HeadBlobOf(r, v->name), who = LastChangedBy(r, v->name);
+    const char *by = who >= 0 ? (who == curUser ? "You" : UserName(who)) : "Someone";
+    const char *why = e->deleted          ? TextFormat("You deleted this file, but %s changed it after that.", who == curUser ? "you" : by)
+                    : cur < 0             ? TextFormat("%s deleted this file after you started editing it.", by)
+                    : e->base < 0         ? TextFormat("%s also added a file called %s.", by, v->name)
+                                          : TextFormat("%s committed a newer version after you started editing it.", by);
+    DrawRectangleRec(bar, (Color){74, 40, 18, 255});
+    DrawRectangleLinesEx(bar, 1, UI_ORANGE);
+    float tw = bar.width - 32 - 300;
+    DrawBold("Conflict - this file was changed by someone else too", (int)bar.x + 16, (int)bar.y + 10, FS, UI_ORANGE);
+    DrawFit(why, (int)bar.x + 16, (int)bar.y + 36, FS, (int)tw, UI_TEXT);
+    if (Button((Rectangle){bar.x + bar.width - 300, bar.y + 14, 140, 36}, "Keep mine", UI_BTN)) {
+        e->base = cur;                       /* yours now counts as a change to the latest version */
+        MarkDirty();
+        Toast("Keeping your version - it will replace theirs when you commit");
+        return true;
+    }
+    if (Button((Rectangle){bar.x + bar.width - 152, bar.y + 14, 140, 36}, "Use theirs", UI_BTN)) {
+        DraftDropName(r, curUser, v->name);  /* forget your change; you see the latest version */
+        MarkDirty();
+        Toast("Switched to the latest version - your change was dropped");
+        return true;
+    }
+    return false;
+}
+
 static void TabCode(Repo *r)
 {
-    bool mine = IsMine(r);
+    bool edit = CanEdit(r);
     float top = 186, bottom = (float)H - 20;
+    if (edit) DraftTidy(r, curUser);
+    BuildView(r, edit ? curUser : -1);
+
+    /* keep the open file, or open the first one */
+    if (viewCount == 0) selName[0] = 0;
+    else if (!selName[0] || ViewIndex(selName) < 0) {
+        int first = 0;
+        for (int i = 0; i < viewCount; i++) if (!ViewDeleted(&view[i])) { first = i; break; }
+        SelectFileName(view[first].name);
+    }
 
     /* ---- left: file list ---- */
     Rectangle lp = {20, top, 260, bottom - top};
     DrawRectangleRec(lp, UI_PANEL);
     DrawRectangleLinesEx(lp, 1, UI_BORDER);
     DrawBold("Files", (int)lp.x + 14, (int)top + 12, FS, UI_TEXT);
-    DrawFileList(r, (Rectangle){lp.x + 1, top + 44, lp.width - 2, lp.height - 44 - (mine ? 156 : 4)});
+    DrawFileList(r, (Rectangle){lp.x + 1, top + 44, lp.width - 2, lp.height - 44 - (edit ? 156 : 4)});
 
-    if (mine) {
+    if (edit) {
         float by = lp.y + lp.height - 148;
         DrawLine((int)lp.x, (int)by - 10, (int)(lp.x + lp.width), (int)by - 10, UI_BORDER);
         bool addEnter = TextFieldUI(&tfNewFile, (Rectangle){lp.x + 12, by, lp.width - 24, 38}, "new-file.txt");
         if (Button((Rectangle){lp.x + 12, by + 46, 114, 36}, "Add file", UI_GREEN) || addEnter) {
             char nm[NAME_LEN];
             SanitizeName(tfNewFile.buf, nm);
-            if (!nm[0])                    Toast("Type a file name first, e.g. notes.txt");
-            else if (FindFile(r, nm) >= 0) Toast("A file with that name already exists");
+            BuildView(r, curUser);
+            int vi = ViewIndex(nm);
+            if (!nm[0])                                    Toast("Type a file name first, e.g. notes.txt");
+            else if (vi >= 0 && !ViewDeleted(&view[vi]))   Toast("A file with that name already exists");
+            else if (vi < 0 && ShownCount(r) >= MAX_FILES) Toast(TextFormat("A repository can hold up to %d files", MAX_FILES));
             else {
-                int idx = AddFile(r, nm, "");
-                if (idx < 0) Toast("This repository can't hold any more files");
+                WorkFile *e = DraftEdit(r, curUser, nm);
+                if (!e) Toast("You're changing too many files at once - commit some first");
                 else {
-                    SelectFile(idx);
+                    e->deleted = false;
+                    WF_SetN(e, "", 0);
+                    SelectFileName(nm);
                     Unfocus();
                     ed.focused = true;
                     TF_Clear(&tfNewFile);
@@ -4289,59 +5057,99 @@ static void TabCode(Repo *r)
             }
         }
         if (Button((Rectangle){lp.x + lp.width - 126, by + 46, 114, 36}, "Upload", UI_BTN)) { OpenUpload(); return; }
-        int nch = ChangeCount(r);
-        DrawText(nch ? TextFormat("%d change%s to commit", nch, nch == 1 ? "" : "s") : "All changes committed",
-                 (int)lp.x + 14, (int)by + 100, FS, nch ? UI_YELLOW : UI_MUTED);
+        int nch, ncf;
+        DraftCounts(r, curUser, &nch, &ncf);
+        const char *st = ncf ? TextFormat("%d change%s, %d conflict%s", nch + ncf, nch + ncf == 1 ? "" : "s", ncf, ncf == 1 ? "" : "s")
+                       : nch ? TextFormat("%d change%s to commit", nch, nch == 1 ? "" : "s")
+                             : "All changes committed";
+        DrawFit(st, (int)lp.x + 14, (int)by + 100, FS, (int)lp.width - 28, ncf ? UI_ORANGE : nch ? UI_YELLOW : UI_MUTED);
     }
 
-    /* ---- right: editor (or read-only viewer) + bottom bar ---- */
+    /* ---- right: editor (or a viewer) + bottom bar ---- */
     Rectangle rp  = {300, top, (float)W - 320, bottom - top};
     Rectangle fh  = {rp.x, rp.y, rp.width, 42};
     Rectangle edr = {rp.x, rp.y + 42, rp.width, rp.height - 42 - 62};
     Rectangle cb  = {rp.x, rp.y + rp.height - 48, rp.width, 48};
 
-    if (curFile >= 0 && curFile < ShownCount(r)) {
-        if (mine) {
-            WorkFile *f = &r->files[curFile];
-            if (f->binary) DrawBinaryView(f->text, f->len, edr);
-            else if (EditorUI(f, edr, false)) MarkDirty();
-            DrawRectangleLinesEx(edr, 1, UI_BORDER);
-            char st = FileStatus(r, curFile);
-            DrawFileHeader(fh, f->name, st == 'A' ? "new file" : st == 'M' ? "modified" : NULL,
-                           st == 'A' ? UI_GREENT : UI_YELLOW, f, 104);
-            if (ConfirmButton((Rectangle){fh.x + fh.width - 106, fh.y + 6, 98, 30}, "Delete", "Sure?", 3)) {
-                int was = curFile;
-                RemoveFile(r, was);
-                SelectFile(r->fileCount == 0 ? -1 : (was < r->fileCount ? was : r->fileCount - 1));
+    BuildView(r, edit ? curUser : -1);
+    int sel = ViewIndex(selName);
+    if (sel >= 0) {
+        ViewFile *v = &view[sel];
+        Rectangle area = edr;
+        if (v->status == 'C') {
+            if (ConflictBar(r, v, (Rectangle){edr.x, edr.y, edr.width, 64})) return;
+            area.y += 64;
+            area.height -= 64;
+        }
+        WorkFile shown = {0};                      /* what the header describes */
+        snprintf(shown.name, NAME_LEN, "%s", v->name);
+        shown.text = (char *)v->data; shown.len = v->len; shown.binary = v->binary;
+
+        if (ViewDeleted(v)) {
+            DrawRectangleRec(area, UI_BASE);
+            float cx = area.x + area.width / 2, cy = area.y + area.height / 2;
+            const char *l1 = "You've deleted this file.";
+            const char *l2 = "It will be removed from the repository when you commit.";
+            DrawBold(l1, (int)cx - MeasureText(l1, FS) / 2, (int)cy - 50, FS, UI_TEXT);
+            DrawText(l2, (int)cx - MeasureText(l2, FS) / 2, (int)cy - 22, FS, UI_MUTED);
+            if (v->status != 'C' && Button((Rectangle){cx - 80, cy + 16, 160, 40}, "Undo delete", UI_BTN)) {
+                DraftDropName(r, curUser, v->name);
                 MarkDirty();
-                Toast("File deleted - commit to record it in the history");
+                return;
             }
+        } else if (v->binary) {
+            DrawBinaryView(v->data, v->len, area);
+        } else if (v->mine) {
+            if (EditorUI(v->mine, area, false)) MarkDirty();
+            shown = *v->mine;
         } else {
-            /* show the committed version through a temporary, never-modified WorkFile */
-            static WorkFile view;
-            Commit *h = Head(r);
-            snprintf(view.name, NAME_LEN, "%s", h->names[curFile]);
-            view.text   = (char *)BlobText(r, h->blobs[curFile]);
-            view.len    = BlobLen(r, h->blobs[curFile]);
-            view.binary = BlobBinary(r, h->blobs[curFile]);
-            view.cap    = 0;
-            if (view.binary) DrawBinaryView(view.text, view.len, edr);
-            else EditorUI(&view, edr, true);
-            DrawRectangleLinesEx(edr, 1, UI_BORDER);
-            DrawFileHeader(fh, view.name, TextFormat("as of commit %s", h->id), UI_MUTED, &view, 0);
+            WorkFile *sc = Scratch(r, v);
+            if (EditorUI(sc, area, !edit) && edit) {
+                WorkFile *e = DraftEdit(r, curUser, v->name);
+                if (e) { WF_SetN(e, sc->text, sc->len); MarkDirty(); }
+                else Toast("You're changing too many files at once - commit some first");
+                ForgetScratch();
+            }
+            shown.text = sc->text; shown.len = sc->len;
+        }
+        DrawRectangleLinesEx(area, 1, UI_BORDER);
+
+        const char *tag = NULL;
+        Color tc = UI_MUTED;
+        if (!edit)                  { Commit *h = Head(r); tag = h ? TextFormat("as of commit %s", h->id) : NULL; }
+        else if (v->status == 'A')  { tag = "new file"; tc = UI_GREENT; }
+        else if (v->status == 'M')  { tag = "modified"; tc = UI_YELLOW; }
+        else if (v->status == 'D')  { tag = "deleted";  tc = UI_REDT; }
+        else if (v->status == 'C')  { tag = "conflict"; tc = UI_ORANGE; }
+        bool canDelete = edit && !ViewDeleted(v);
+        DrawFileHeader(fh, v->name, tag, tc, &shown, canDelete ? 104 : 0);
+        if (canDelete && ConfirmButton((Rectangle){fh.x + fh.width - 106, fh.y + 6, 98, 30}, "Delete", "Sure?", 3)) {
+            WorkFile *e = DraftFind(r, curUser, v->name);
+            if (e && e->base < 0 && HeadBlobOf(r, v->name) < 0) {   /* never committed: just remove it */
+                DraftDropName(r, curUser, v->name);
+                SelectFileName("");
+            } else {
+                e = DraftEdit(r, curUser, v->name);
+                if (e) e->deleted = true;
+            }
+            MarkDirty();
+            Toast("File deleted - commit to record it in the history");
+            return;
         }
     } else {
         Rectangle e = {rp.x, rp.y, rp.width, rp.height - 62};
         DrawRectangleRec(e, UI_PANEL);
         DrawRectangleLinesEx(e, 1, UI_BORDER);
-        const char *m = mine ? "Pick a file on the left, add a new one, or upload some." : "This repository has no committed files yet.";
+        const char *m = edit ? "Pick a file on the left, add a new one, or upload some." : "This repository has no committed files yet.";
         DrawText(m, (int)(e.x + e.width / 2) - MeasureText(m, FS) / 2, (int)(e.y + e.height / 2) - 10, FS, UI_MUTED);
     }
 
-    if (!mine) {
+    if (!edit) {
         const char *o = UserName(r->owner);
-        DrawFit(TextFormat("You're viewing %s's latest commit. Only %s can change this repository.", o, o),
-                (int)cb.x, (int)cb.y + 14, FS, (int)cb.width, UI_MUTED);
+        const char *note = r->collabCount
+            ? TextFormat("You're viewing the latest commit. Only %s and their collaborators can change this repository.", o)
+            : TextFormat("You're viewing %s's latest commit. Only %s can change this repository.", o, o);
+        DrawFit(note, (int)cb.x, (int)cb.y + 14, FS, (int)cb.width, UI_MUTED);
         return;
     }
     bool enter = TextFieldUI(&tfCommit, (Rectangle){cb.x, cb.y + 4, cb.width - 156, 42}, "Describe your changes (the commit message)");
@@ -4352,6 +5160,7 @@ static void TabCode(Repo *r)
             Toast(TextFormat("Committed %s", Head(r)->id));
             TF_Clear(&tfCommit);
             tfCommit.active = false;
+            ForgetScratch();
             MarkDirty();
         }
     }
@@ -4365,7 +5174,7 @@ static void TabCommits(Repo *r)
     ScrollArea(la, &scCommits, n * rowH);
     if (!n) {
         DrawText("No commits yet.", 20, 196, FS, UI_TEXT);
-        if (IsMine(r)) DrawText("Edit some files in the Code tab, write a message, then press Commit.", 20, 226, FS, UI_MUTED);
+        if (CanEdit(r)) DrawText("Edit some files in the Code tab, write a message, then press Commit.", 20, 226, FS, UI_MUTED);
         return;
     }
     BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
@@ -4447,7 +5256,7 @@ static void TabIssues(Repo *r)
                  (int)row.x + 124, (int)row.y + 38, FS, UI_MUTED);
 
         /* only the repo owner or whoever opened the issue may close / reopen it */
-        bool canManage = IsMine(r) || is->author == curUser;
+        bool canManage = CanEdit(r) || is->author == curUser;
         if (canManage &&
             ButtonEx((Rectangle){row.x + row.width - 140, row.y + 16, 124, 36}, is->open ? "Close" : "Reopen", UI_BTN, Hover(la))) {
             is->open = !is->open;
@@ -4522,10 +5331,10 @@ static void ScreenCommit(Repo *r)
         else { screen = SCR_REPO; tab = TAB_COMMITS; }
         return;
     }
-    if (IsMine(r) &&
+    if (CanEdit(r) &&
         ConfirmButton((Rectangle){(float)W - 330, 186, 310, 38}, "Restore files from here", "Click again to confirm", 2)) {
         RestoreCommit(r, curCommit);
-        SelectFile(r->fileCount ? 0 : -1);
+        SelectFileName("");
         MarkDirty();
         Toast(TextFormat("Files restored to %s - commit them to keep this version", c->id));
         Unfocus();
@@ -4807,11 +5616,11 @@ int main(void)
             if (me && screen == SCR_ACCOUNT && dropped.count > 0) {
                 settingsTab = 0;
                 UseAvatarPath(me, dropped.paths[0]);
-            } else if (inRepo && IsMine(&repos[curRepo])) {
+            } else if (inRepo && CanEdit(&repos[curRepo])) {
                 if (screen != SCR_UPLOAD) OpenUpload();
                 StagePaths(dropped.paths, (int)dropped.count);
             } else if (inRepo) {
-                Toast("Only the owner of this repository can upload files to it");
+                Toast("Only the owner and collaborators can upload files to this repository");
             } else if (me) {
                 Toast("To upload files, open one of your repositories and drop them there");
             }
@@ -4830,7 +5639,7 @@ int main(void)
                             tfNewFile.active || tfCommit.active || tfIssue.active || tfUser.active ||
                             tfPass.active || tfPass2.active || tfOldPass.active || tfNewPass.active ||
                             tfNewPass2.active || tfDelPass.active || tfBio.active || tfAvatar.active || tfCode.active ||
-                            tfUpPath.active || tfUpMsg.active;
+                            tfUpPath.active || tfUpMsg.active || tfInvite.active;
             if (anyFocus) Unfocus();
             else if (screen == SCR_FORGOT) GoLogin();
             else if (screen == SCR_RECOVERY) GoHome();
@@ -4862,7 +5671,8 @@ int main(void)
             if (DrawRepoHeader(r, tab)) break;
             if      (tab == TAB_CODE)    TabCode(r);
             else if (tab == TAB_COMMITS) TabCommits(r);
-            else                         TabIssues(r);
+            else if (tab == TAB_ISSUES)  TabIssues(r);
+            else                         TabPeople(r);
         } break;
         case SCR_COMMIT: {
             Repo *r = &repos[curRepo];
@@ -4876,6 +5686,7 @@ int main(void)
         } break;
         }
 
+        DrawTip();
         DrawToast();
         EndDrawing();
 
