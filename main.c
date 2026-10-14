@@ -12,6 +12,9 @@
  *   - Repositories belong to a user: create, star and delete your own
  *   - Browse everyone's repositories (read-only unless they're yours)
  *   - A built-in text editor for the files in your repositories
+ *   - Uploads: drag files from your computer onto one of your repositories (or
+ *     paste their paths), check the list, and save them as one commit. Text files
+ *     can then be edited; pictures are previewed; any other file is stored as-is
  *   - Commits: a snapshot of every file, saved with a message and an author
  *   - Commit history and line-by-line diffs (what was added / removed)
  *   - Issues: anyone can open one; the repo owner or the issue's author can close it
@@ -56,7 +59,7 @@
 #define MAX_ISSUES   100
 #define NAME_LEN     64
 #define TEXT_LEN     160
-#define MAX_DIFF     1500
+#define MAX_UPLOAD   (10 * 1024 * 1024)   /* biggest file you can upload: 10 MB */
 #define SAVE_FILE    "minigithub.dat"
 
 #define BIO_LEN      150     /* longest bio allowed                           */
@@ -110,8 +113,10 @@ typedef struct {
 } User;
 
 /* A blob is one unique version of a file's contents. Identical
-   contents are stored only once, just like real git. */
-typedef struct { uint32_t hash; char *data; } Blob;
+   contents are stored only once, just like real git.
+   "Binary" files (pictures, zips, programs...) are stored byte for byte;
+   they just can't be shown as text or edited. */
+typedef struct { uint32_t hash; char *data; int len; bool binary; } Blob;
 
 /* A commit is a snapshot: a list of file names, each pointing at a blob. */
 typedef struct {
@@ -127,7 +132,7 @@ typedef struct {
 } Commit;
 
 /* A working file is the version the owner is editing right now. */
-typedef struct { char name[NAME_LEN]; char *text; int len, cap; } WorkFile;
+typedef struct { char name[NAME_LEN]; char *text; int len, cap; bool binary; } WorkFile;
 
 typedef struct { char title[TEXT_LEN]; bool open; long long time; int author; } Issue;
 
@@ -154,7 +159,7 @@ static int  repoCount = 0;
 /* ------------------------------------------------------------------ */
 /* App state                                                          */
 /* ------------------------------------------------------------------ */
-typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_FORGOT, SCR_RECOVERY, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY, SCR_PROFILE, SCR_PEOPLE } Screen;
+typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_FORGOT, SCR_RECOVERY, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY, SCR_PROFILE, SCR_PEOPLE, SCR_UPLOAD } Screen;
 typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES } Tab;
 
 typedef struct { char buf[TEXT_LEN]; int len; bool active; bool secret; bool reveal; } TextField;
@@ -164,7 +169,7 @@ static Screen screen = SCR_LOGIN;
 static Tab    tab    = TAB_CODE;
 static int    curRepo = -1, curFile = -1, curCommit = -1, curChange = -1;
 
-static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode;
+static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode, tfUpPath, tfUpMsg;
 static TextField tfPass    = {.secret = true}, tfPass2    = {.secret = true};
 static TextField tfOldPass = {.secret = true}, tfNewPass  = {.secret = true};
 static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
@@ -290,13 +295,30 @@ static const char *TimeAgo(long long t)
 /* ------------------------------------------------------------------ */
 /* Working files                                                      */
 /* ------------------------------------------------------------------ */
-static void WF_Set(WorkFile *f, const char *text)
+
+/* The same rule real git uses: a file is "binary" (not text) if there's a
+   zero byte anywhere in its first 8000 bytes. Text never contains one. */
+static bool LooksBinary(const char *d, int len)
 {
-    int n = (int)strlen(text);
-    if (f->cap < n + 1) { f->cap = n + 64; f->text = realloc(f->text, (size_t)f->cap); }
-    memcpy(f->text, text, (size_t)n + 1);
-    f->len = n;
+    int n = len < 8000 ? len : 8000;
+    return memchr(d, 0, (size_t)n) != NULL;
 }
+
+/* Goes up by one whenever file contents are replaced or freed, so a picture
+   preview made earlier is never mistaken for the new contents. */
+static int filesGen;
+
+/* Sets a working file to any bytes (text or binary). */
+static void WF_SetN(WorkFile *f, const char *data, int n)
+{
+    filesGen++;
+    if (f->cap < n + 1) { f->cap = n + 64; f->text = realloc(f->text, (size_t)f->cap); }
+    memcpy(f->text, data, (size_t)n);
+    f->text[n] = 0;                                  /* always ends in a zero, handy for text */
+    f->len = n;
+    f->binary = LooksBinary(data, n);
+}
+static void WF_Set(WorkFile *f, const char *text) { WF_SetN(f, text, (int)strlen(text)); }
 static void WF_Insert(WorkFile *f, int at, const char *s, int n)
 {
     if (f->len + n + 1 > f->cap) { f->cap = (f->len + n + 1) * 2; f->text = realloc(f->text, (size_t)f->cap); }
@@ -309,7 +331,7 @@ static void WF_Delete(WorkFile *f, int at, int n)
     memmove(f->text + at, f->text + at + n, (size_t)(f->len - at - n + 1));
     f->len -= n;
 }
-static void WF_Free(WorkFile *f) { free(f->text); f->text = NULL; f->len = f->cap = 0; }
+static void WF_Free(WorkFile *f) { free(f->text); f->text = NULL; f->len = f->cap = 0; filesGen++; }
 
 /* ------------------------------------------------------------------ */
 /* Repositories, blobs and commits                                    */
@@ -332,15 +354,16 @@ static int FindFile(Repo *r, const char *name)
     return -1;
 }
 
-static int AddFile(Repo *r, const char *name, const char *text)
+static int AddFileN(Repo *r, const char *name, const char *data, int len)
 {
     if (r->fileCount >= MAX_FILES || FindFile(r, name) >= 0) return -1;
     WorkFile *f = &r->files[r->fileCount];
     memset(f, 0, sizeof *f);
     snprintf(f->name, NAME_LEN, "%s", name);
-    WF_Set(f, text);
+    WF_SetN(f, data, len);
     return r->fileCount++;
 }
+static int AddFile(Repo *r, const char *name, const char *text) { return AddFileN(r, name, text, (int)strlen(text)); }
 
 static void RemoveFile(Repo *r, int i)
 {
@@ -354,6 +377,7 @@ static void FreeRepo(Repo *r)
 {
     for (int i = 0; i < r->fileCount; i++) WF_Free(&r->files[i]);
     for (int i = 0; i < r->blobCount; i++) free(r->blobs[i].data);
+    filesGen++;
 }
 
 static void DeleteRepo(int i)
@@ -369,7 +393,7 @@ static int InternBlob(Repo *r, const char *data, int len)
 {
     uint32_t h = Fnv(data, len, FNV_START);
     for (int i = 0; i < r->blobCount; i++)
-        if (r->blobs[i].hash == h && (int)strlen(r->blobs[i].data) == len &&
+        if (r->blobs[i].hash == h && r->blobs[i].len == len &&
             memcmp(r->blobs[i].data, data, (size_t)len) == 0) return i;
     if (r->blobCount >= MAX_BLOBS) return -1;
     Blob *b = &r->blobs[r->blobCount];
@@ -377,10 +401,14 @@ static int InternBlob(Repo *r, const char *data, int len)
     b->data = malloc((size_t)len + 1);
     memcpy(b->data, data, (size_t)len);
     b->data[len] = 0;
+    b->len = len;
+    b->binary = LooksBinary(data, len);
     return r->blobCount++;
 }
 
-static const char *BlobText(Repo *r, int b) { return b >= 0 ? r->blobs[b].data : ""; }
+static const char *BlobText(Repo *r, int b)   { return b >= 0 ? r->blobs[b].data : ""; }
+static int         BlobLen(Repo *r, int b)    { return b >= 0 ? r->blobs[b].len : 0; }
+static bool        BlobBinary(Repo *r, int b) { return b >= 0 && r->blobs[b].binary; }
 static Commit *Head(Repo *r) { return r->commitCount ? &r->commits[r->commitCount - 1] : NULL; }
 static long long LastActivity(Repo *r) { return r->commitCount ? Head(r)->time : r->created; }
 
@@ -397,7 +425,9 @@ static char FileStatus(Repo *r, int i)
     if (!h) return 'A';
     int k = FindInCommit(h, r->files[i].name);
     if (k < 0) return 'A';
-    return strcmp(r->blobs[h->blobs[k]].data, r->files[i].text) ? 'M' : 0;
+    Blob *b = &r->blobs[h->blobs[k]];
+    WorkFile *f = &r->files[i];
+    return (b->len != f->len || memcmp(b->data, f->text, (size_t)f->len) != 0) ? 'M' : 0;
 }
 
 static int ChangeCount(Repo *r)
@@ -416,6 +446,27 @@ static int OpenIssues(Repo *r)
     return n;
 }
 
+/* Gives a snapshot (file names + blobs already filled in) its author, time,
+   message and id, and adds it to the repository's history. */
+static void FinishCommit(Repo *r, Commit *c, const char *msg)
+{
+    uint32_t h = FNV_START;
+    for (int i = 0; i < c->fileCount; i++) {
+        h = Fnv(c->names[i], (int)strlen(c->names[i]), h);
+        h ^= r->blobs[c->blobs[i]].hash; h *= 16777619u;
+    }
+    c->author = curUser;
+    c->statsDone = false;
+    snprintf(c->message, TEXT_LEN, "%s", msg);
+    c->time = (long long)time(NULL);
+    h = Fnv(msg, (int)strlen(msg), h);
+    h = Fnv((const char *)&c->author, (int)sizeof c->author, h);
+    h = Fnv((const char *)&c->time, (int)sizeof c->time, h);
+    if (r->commitCount) h = Fnv(Head(r)->id, 7, h);
+    snprintf(c->id, sizeof c->id, "%07x", (unsigned)(h & 0xFFFFFFFu));
+    r->commits[r->commitCount++] = *c;
+}
+
 /* Returns NULL on success, or a message explaining what went wrong. */
 static const char *DoCommit(Repo *r, const char *msg)
 {
@@ -425,25 +476,14 @@ static const char *DoCommit(Repo *r, const char *msg)
 
     Commit c;
     memset(&c, 0, sizeof c);
-    uint32_t h = FNV_START;
     for (int i = 0; i < r->fileCount; i++) {
         int b = InternBlob(r, r->files[i].text, r->files[i].len);
         if (b < 0) return "This repository is out of storage space";
         snprintf(c.names[i], NAME_LEN, "%s", r->files[i].name);
         c.blobs[i] = b;
-        h = Fnv(c.names[i], (int)strlen(c.names[i]), h);
-        h ^= r->blobs[b].hash; h *= 16777619u;
     }
     c.fileCount = r->fileCount;
-    c.author = curUser;
-    snprintf(c.message, TEXT_LEN, "%s", msg);
-    c.time = (long long)time(NULL);
-    h = Fnv(msg, (int)strlen(msg), h);
-    h = Fnv((const char *)&c.author, (int)sizeof c.author, h);
-    h = Fnv((const char *)&c.time, (int)sizeof c.time, h);
-    if (r->commitCount) h = Fnv(Head(r)->id, 7, h);
-    snprintf(c.id, sizeof c.id, "%07x", (unsigned)(h & 0xFFFFFFFu));
-    r->commits[r->commitCount++] = c;
+    FinishCommit(r, &c, msg);
     return NULL;
 }
 
@@ -454,7 +494,7 @@ static void RestoreCommit(Repo *r, int ci)
     memset(r->files, 0, sizeof r->files);
     r->fileCount = 0;
     Commit *c = &r->commits[ci];
-    for (int k = 0; k < c->fileCount; k++) AddFile(r, c->names[k], r->blobs[c->blobs[k]].data);
+    for (int k = 0; k < c->fileCount; k++) AddFileN(r, c->names[k], r->blobs[c->blobs[k]].data, r->blobs[c->blobs[k]].len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -803,18 +843,33 @@ static bool CheckRecoveryCode(User *u, const char *typed)
 typedef struct { const char *s; int n; } LineRef;
 typedef struct { char kind; int a, b; } DiffOp;   /* kind: ' ', '+', '-' */
 
-static LineRef dA[MAX_DIFF], dB[MAX_DIFF];
-static DiffOp  dOps[MAX_DIFF * 2];
-static int     dOpCount;
+/* These grow as needed, so files of any length can be compared. */
+static LineRef *dA, *dB;
+static DiffOp  *dOps;
+static int      dACap, dBCap, dOpsCap, dOpCount;
 
-static int SplitLines(const char *t, LineRef *out, int max)
+static void *Grow(void *p, int *cap, int need, size_t item)
+{
+    if (need <= *cap) return p;
+    int c = *cap ? *cap : 256;
+    while (c < need) c *= 2;
+    void *q = realloc(p, (size_t)c * item);
+    if (!q) return p;                         /* out of memory: keep the old one */
+    *cap = c;
+    return q;
+}
+
+/* Cuts text into lines (without the newline characters). Returns how many. */
+static int SplitLines(const char *t, LineRef **out, int *cap)
 {
     int c = 0;
     const char *p = t;
-    while (*p && c < max) {
+    while (*p) {
+        *out = Grow(*out, cap, c + 1, sizeof(LineRef));
+        if (c >= *cap) break;
         const char *e = strchr(p, '\n');
-        out[c].s = p;
-        out[c].n = e ? (int)(e - p) : (int)strlen(p);
+        (*out)[c].s = p;
+        (*out)[c].n = e ? (int)(e - p) : (int)strlen(p);
         c++;
         if (!e) break;
         p = e + 1;
@@ -823,36 +878,58 @@ static int SplitLines(const char *t, LineRef *out, int max)
 }
 static bool SameLine(LineRef x, LineRef y) { return x.n == y.n && memcmp(x.s, y.s, (size_t)x.n) == 0; }
 
+/* Works out the smallest set of added (+) and removed (-) lines that turns
+   oldT into newT, using the "longest common subsequence" method: find the
+   longest list of lines both versions share in order; everything else was
+   added or removed.
+
+   Lines that are the same at the very start and very end are matched first,
+   so a small change in a big file is still quick. If the part in the middle
+   is still huge, it's simply shown as all removed then all added. */
 static void ComputeDiff(const char *oldT, const char *newT, int *adds, int *dels)
 {
-    int n = SplitLines(oldT, dA, MAX_DIFF), m = SplitLines(newT, dB, MAX_DIFF);
-    int w = m + 1, ad = 0, de = 0, i = 0, j = 0;
-    int *L = calloc((size_t)(n + 1) * (size_t)w, sizeof(int));
+    int n = SplitLines(oldT, &dA, &dACap), m = SplitLines(newT, &dB, &dBCap);
+    int ad = 0, de = 0;
+    dOps = Grow(dOps, &dOpsCap, n + m + 1, sizeof(DiffOp));
     dOpCount = 0;
+    if (dOpsCap < n + m + 1) { if (adds) *adds = 0; if (dels) *dels = 0; return; }
+
+    int pre = 0, suf = 0;
+    while (pre < n && pre < m && SameLine(dA[pre], dB[pre])) pre++;
+    while (suf < n - pre && suf < m - pre && SameLine(dA[n - 1 - suf], dB[m - 1 - suf])) suf++;
+    for (int k = 0; k < pre; k++) dOps[dOpCount++] = (DiffOp){' ', k, k};
+
+    /* the middle part: rows i = pre .. n-suf-1 of the old, j = pre .. m-suf-1 of the new */
+    int N = n - pre - suf, M = m - pre - suf, i = 0, j = 0;
+    int *L = NULL;
+    if (N > 0 && M > 0 && (long long)(N + 1) * (M + 1) <= 6000000LL)
+        L = calloc((size_t)(N + 1) * (size_t)(M + 1), sizeof(int));
     if (L) {
-        for (int x = n - 1; x >= 0; x--)
-            for (int y = m - 1; y >= 0; y--) {
-                if (SameLine(dA[x], dB[y])) L[x * w + y] = L[(x + 1) * w + y + 1] + 1;
+        int w = M + 1;
+        for (int x = N - 1; x >= 0; x--)
+            for (int y = M - 1; y >= 0; y--) {
+                if (SameLine(dA[pre + x], dB[pre + y])) L[x * w + y] = L[(x + 1) * w + y + 1] + 1;
                 else {
                     int down = L[(x + 1) * w + y], right = L[x * w + y + 1];
                     L[x * w + y] = down > right ? down : right;
                 }
             }
-        while (i < n && j < m) {
-            if (SameLine(dA[i], dB[j]))                      { dOps[dOpCount++] = (DiffOp){' ', i, j};  i++; j++; }
-            else if (L[(i + 1) * w + j] >= L[i * w + j + 1]) { dOps[dOpCount++] = (DiffOp){'-', i, -1}; i++; de++; }
-            else                                             { dOps[dOpCount++] = (DiffOp){'+', -1, j}; j++; ad++; }
+        while (i < N && j < M) {
+            if (SameLine(dA[pre + i], dB[pre + j]))          { dOps[dOpCount++] = (DiffOp){' ', pre + i, pre + j}; i++; j++; }
+            else if (L[(i + 1) * w + j] >= L[i * w + j + 1]) { dOps[dOpCount++] = (DiffOp){'-', pre + i, -1}; i++; de++; }
+            else                                             { dOps[dOpCount++] = (DiffOp){'+', -1, pre + j}; j++; ad++; }
         }
         free(L);
     }
-    while (i < n) { dOps[dOpCount++] = (DiffOp){'-', i, -1}; i++; de++; }
-    while (j < m) { dOps[dOpCount++] = (DiffOp){'+', -1, j}; j++; ad++; }
+    while (i < N) { dOps[dOpCount++] = (DiffOp){'-', pre + i, -1}; i++; de++; }
+    while (j < M) { dOps[dOpCount++] = (DiffOp){'+', -1, pre + j}; j++; ad++; }
+    for (int k = 0; k < suf; k++) dOps[dOpCount++] = (DiffOp){' ', n - suf + k, m - suf + k};
     if (adds) *adds = ad;
     if (dels) *dels = de;
 }
 
 /* The list of files a commit changed, compared with the commit before it. */
-typedef struct { char name[NAME_LEN]; int oldB, newB; char kind; int adds, dels; } Change;
+typedef struct { char name[NAME_LEN]; int oldB, newB; char kind; int adds, dels; bool binary; } Change;
 static Change changes[MAX_FILES * 2];
 static int    changeCount, totalAdds, totalDels;
 
@@ -877,7 +954,10 @@ static void BuildChanges(Repo *r, int ci)
         ch->oldB = p->blobs[k]; ch->newB = -1; ch->kind = 'D';
     }
     for (int k = 0; k < changeCount; k++) {
-        ComputeDiff(BlobText(r, changes[k].oldB), BlobText(r, changes[k].newB), &changes[k].adds, &changes[k].dels);
+        Change *ch = &changes[k];
+        ch->binary = BlobBinary(r, ch->oldB) || BlobBinary(r, ch->newB);
+        if (ch->binary) { ch->adds = ch->dels = 0; continue; }     /* no lines to compare */
+        ComputeDiff(BlobText(r, ch->oldB), BlobText(r, ch->newB), &ch->adds, &ch->dels);
         totalAdds += changes[k].adds;
         totalDels += changes[k].dels;
     }
@@ -1161,20 +1241,24 @@ static void DrawTheme(int theme, Rectangle r, float strength) { DrawThemeClip(th
 /* Saving and loading                                                 */
 /* Format: numbers on their own line; text as  <length>:<bytes>\n      */
 /* ------------------------------------------------------------------ */
-static void WS(FILE *f, const char *s) { int n = (int)strlen(s); fprintf(f, "%d:", n); fwrite(s, 1, (size_t)n, f); fputc('\n', f); }
+static void WSN(FILE *f, const char *s, int n) { fprintf(f, "%d:", n); fwrite(s, 1, (size_t)n, f); fputc('\n', f); }
+static void WS(FILE *f, const char *s) { WSN(f, s, (int)strlen(s)); }
 static void WI(FILE *f, long long v)   { fprintf(f, "%lld\n", v); }
 
 static int loadErr;
-static char *RS(FILE *f)
+/* Reads one piece of text (or binary data); *outLen gets its length. */
+static char *RSN(FILE *f, int *outLen)
 {
     int n;
     if (fscanf(f, " %d:", &n) != 1 || n < 0 || n > 50000000) { loadErr = 1; return NULL; }
     char *s = malloc((size_t)n + 1);
     if (!s || fread(s, 1, (size_t)n, f) != (size_t)n) { free(s); loadErr = 1; return NULL; }
     s[n] = 0;
+    if (outLen) *outLen = n;
     fgetc(f);
     return s;
 }
+static char *RS(FILE *f) { return RSN(f, NULL); }
 static void RSInto(FILE *f, char *dst, int cap)
 {
     char *s = RS(f);
@@ -1209,9 +1293,9 @@ static void Save(void)
         WI(f, r->starCount);
         for (int k = 0; k < r->starCount; k++) WI(f, r->starredBy[k]);
         WI(f, r->fileCount);
-        for (int k = 0; k < r->fileCount; k++) { WS(f, r->files[k].name); WS(f, r->files[k].text); }
+        for (int k = 0; k < r->fileCount; k++) { WS(f, r->files[k].name); WSN(f, r->files[k].text, r->files[k].len); }
         WI(f, r->blobCount);
-        for (int k = 0; k < r->blobCount; k++) WS(f, r->blobs[k].data);
+        for (int k = 0; k < r->blobCount; k++) WSN(f, r->blobs[k].data, r->blobs[k].len);
         WI(f, r->commitCount);
         for (int k = 0; k < r->commitCount; k++) {
             Commit *c = &r->commits[k];
@@ -1319,17 +1403,21 @@ static bool Load(void)
         for (int k = 0; k < fc && !loadErr; k++) {
             char nm[NAME_LEN];
             RSInto(f, nm, NAME_LEN);
-            char *tx = RS(f);
-            if (tx) { AddFile(r, nm, tx); free(tx); }
+            int txLen = 0;
+            char *tx = RSN(f, &txLen);
+            if (tx) { AddFileN(r, nm, tx, txLen); free(tx); }
         }
 
         int bc = (int)RI(f);
         if (bc < 0 || bc > MAX_BLOBS) { loadErr = 1; break; }
         for (int k = 0; k < bc && !loadErr; k++) {
-            char *d = RS(f);
+            int dLen = 0;
+            char *d = RSN(f, &dLen);
             if (!d) break;
-            r->blobs[r->blobCount].data = d;
-            r->blobs[r->blobCount].hash = Fnv(d, (int)strlen(d), FNV_START);
+            r->blobs[r->blobCount].data   = d;
+            r->blobs[r->blobCount].len    = dLen;
+            r->blobs[r->blobCount].binary = LooksBinary(d, dLen);
+            r->blobs[r->blobCount].hash   = Fnv(d, dLen, FNV_START);
             r->blobCount++;
         }
 
@@ -1585,6 +1673,14 @@ static void SelectFile(int i) { curFile = i; ed.cursor = 0; ed.scrollX = ed.scro
 
 /* Draws and runs the editor. Returns true if the text was changed.
    In read-only mode you can still click, scroll and move the cursor. */
+/* Letters like "e" with an accent take 2-4 bytes in UTF-8 text. The extra
+   bytes all look like 10xxxxxx, so the cursor skips over those to always
+   land at the start of a whole letter. */
+static bool IsCont(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
+static int  PrevChar(const char *t, int p)          { if (p > 0) p--; while (p > 0 && IsCont(t[p])) p--; return p; }
+static int  NextChar(const char *t, int len, int p) { if (p < len) p++; while (p < len && IsCont(t[p])) p++; return p; }
+static int  SnapChar(const char *t, int len, int p) { while (p > 0 && p < len && IsCont(t[p])) p--; return p; }
+
 static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
 {
     bool changed = false, moved = false;
@@ -1596,6 +1692,7 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
         ed.scrollY -= GetMouseWheelMove() * LH * 3;
     }
     if (ed.cursor > f->len) ed.cursor = f->len;
+    ed.cursor = SnapChar(f->text, f->len, ed.cursor);
 
     if (ed.focused) {
         int ch;
@@ -1613,17 +1710,22 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
             changed = true;
         }
         if (!readOnly && KeyRep(KEY_TAB))             { WF_Insert(f, ed.cursor, "    ", 4); ed.cursor += 4; changed = true; }
-        if (!readOnly && KeyRep(KEY_BACKSPACE) && ed.cursor > 0)   { WF_Delete(f, ed.cursor - 1, 1); ed.cursor--; changed = true; }
-        if (!readOnly && KeyRep(KEY_DELETE) && ed.cursor < f->len) { WF_Delete(f, ed.cursor, 1); changed = true; }
-        if (KeyRep(KEY_LEFT) && ed.cursor > 0)        { ed.cursor--; moved = true; }
-        if (KeyRep(KEY_RIGHT) && ed.cursor < f->len)  { ed.cursor++; moved = true; }
+        if (!readOnly && KeyRep(KEY_BACKSPACE) && ed.cursor > 0) {
+            int p = PrevChar(f->text, ed.cursor);
+            WF_Delete(f, p, ed.cursor - p); ed.cursor = p; changed = true;
+        }
+        if (!readOnly && KeyRep(KEY_DELETE) && ed.cursor < f->len) {
+            WF_Delete(f, ed.cursor, NextChar(f->text, f->len, ed.cursor) - ed.cursor); changed = true;
+        }
+        if (KeyRep(KEY_LEFT) && ed.cursor > 0)        { ed.cursor = PrevChar(f->text, ed.cursor); moved = true; }
+        if (KeyRep(KEY_RIGHT) && ed.cursor < f->len)  { ed.cursor = NextChar(f->text, f->len, ed.cursor); moved = true; }
         if (IsKeyPressed(KEY_HOME))                   { ed.cursor = LineStart(f->text, ed.cursor); moved = true; }
         if (IsKeyPressed(KEY_END))                    { ed.cursor = LineEnd(f->text, f->len, ed.cursor); moved = true; }
         if (KeyRep(KEY_UP)) {
             int ls = LineStart(f->text, ed.cursor), col = ed.cursor - ls;
             if (ls > 0) {
                 int pls = LineStart(f->text, ls - 1), plen = (ls - 1) - pls;
-                ed.cursor = pls + (col < plen ? col : plen);
+                ed.cursor = SnapChar(f->text, f->len, pls + (col < plen ? col : plen));
             }
             moved = true;
         }
@@ -1632,7 +1734,7 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
             int le = LineEnd(f->text, f->len, ed.cursor);
             if (le < f->len) {
                 int nls = le + 1, nlen = LineEnd(f->text, f->len, nls) - nls;
-                ed.cursor = nls + (col < nlen ? col : nlen);
+                ed.cursor = SnapChar(f->text, f->len, nls + (col < nlen ? col : nlen));
             }
             moved = true;
         }
@@ -1646,7 +1748,7 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
         int p = 0, l = 0;
         while (l < line && p < f->len) { if (f->text[p] == '\n') l++; p++; }
         int ls = LineStart(f->text, p), le = LineEnd(f->text, f->len, ls);
-        ed.cursor = ls + XToCol(f->text + ls, le - ls, m.x - textX + ed.scrollX);
+        ed.cursor = SnapChar(f->text, f->len, ls + XToCol(f->text + ls, le - ls, m.x - textX + ed.scrollX));
     }
 
     /* keep the cursor on screen */
@@ -1785,13 +1887,17 @@ static void CommitStats(Repo *r, int ci)
         int pk = p ? FindInCommit(p, c->names[k]) : -1;
         int ob = pk >= 0 ? p->blobs[pk] : -1;
         if (ob == c->blobs[k]) continue;
+        files++;
+        if (BlobBinary(r, ob) || BlobBinary(r, c->blobs[k])) continue;   /* binary: no lines to count */
         ComputeDiff(BlobText(r, ob), BlobText(r, c->blobs[k]), &a, &d);
-        files++; adds += a; dels += d;
+        adds += a; dels += d;
     }
     if (p) for (int k = 0; k < p->fileCount; k++) {
         if (FindInCommit(c, p->names[k]) >= 0) continue;          /* file was deleted */
+        files++;
+        if (BlobBinary(r, p->blobs[k])) continue;
         ComputeDiff(BlobText(r, p->blobs[k]), "", &a, &d);
-        files++; adds += a; dels += d;
+        adds += a; dels += d;
     }
     c->sFiles = files; c->sAdds = adds; c->sDels = dels;
     c->statsDone = true;
@@ -2404,6 +2510,30 @@ static bool AvatarTex(User *u)
 }
 
 /* Returns NULL on success, or a message saying what went wrong. */
+/* Opens a PNG, JPG, GIF or QOI picture held in memory. If it can't,
+   returns an empty Image and points *err at the reason. */
+static Image LoadAnyImage(const unsigned char *d, int size, const char **err)
+{
+    Image img = {0};
+    *err = NULL;
+    if (size > 8 && memcmp(d, "\x89PNG", 4) == 0)                    img = LoadImageFromMemory(".png", d, size);
+    else if (size > 3 && d[0] == 0xFF && d[1] == 0xD8)               img = DecodeJpg(d, size, err);
+    else if (size > 6 && memcmp(d, "GIF8", 4) == 0)                  img = LoadImageFromMemory(".gif", d, size);
+    else if (size > 4 && memcmp(d, "qoif", 4) == 0)                  img = LoadImageFromMemory(".qoi", d, size);
+    else if (size > 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "WEBP", 4) == 0)
+        *err = "WEBP pictures aren't supported - save it as PNG or JPG first";
+    else if (size > 12 && memcmp(d + 4, "ftyp", 4) == 0)
+        *err = "HEIC pictures (from iPhones) aren't supported - save it as PNG or JPG first";
+    else *err = "that isn't a picture this program can read - use PNG or JPG";
+    if (*err && img.data) { UnloadImage(img); img = (Image){0}; }
+    if (!*err && (!img.data || img.width <= 0 || img.height <= 0)) {
+        if (img.data) UnloadImage(img);
+        img = (Image){0};
+        *err = "the picture data is damaged";
+    }
+    return img;
+}
+
 static const char *ImportAvatar(User *u, const char *raw)
 {
     /* tidy the path: "Copy as path" on Windows adds quotes */
@@ -2420,20 +2550,10 @@ static const char *ImportAvatar(User *u, const char *raw)
     if (!d || size <= 0) return "Couldn't open that file";
     if (size > 40 * 1024 * 1024) { UnloadFileData(d); return "That picture is too big (over 40 MB)"; }
 
-    Image img = {0};
     const char *err = NULL;
-    if (size > 8 && memcmp(d, "\x89PNG", 4) == 0)                    img = LoadImageFromMemory(".png", d, size);
-    else if (size > 3 && d[0] == 0xFF && d[1] == 0xD8)               img = DecodeJpg(d, size, &err);
-    else if (size > 6 && memcmp(d, "GIF8", 4) == 0)                  img = LoadImageFromMemory(".gif", d, size);
-    else if (size > 4 && memcmp(d, "qoif", 4) == 0)                  img = LoadImageFromMemory(".qoi", d, size);
-    else if (size > 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "WEBP", 4) == 0)
-        err = "WEBP pictures aren't supported - save it as PNG or JPG first";
-    else if (size > 12 && memcmp(d + 4, "ftyp", 4) == 0)
-        err = "HEIC pictures (from iPhones) aren't supported - save it as PNG or JPG first";
-    else err = "that isn't a picture this program can read - use PNG or JPG";
+    Image img = LoadAnyImage(d, size, &err);
     UnloadFileData(d);
-    if (err) { if (img.data) UnloadImage(img); return TextFormat("Couldn't use it: %s", err); }
-    if (!img.data || img.width <= 0 || img.height <= 0) return "Couldn't read that picture - it may be damaged";
+    if (err) return TextFormat("Couldn't use it: %s", err);
 
     /* square crop from the middle, shrink, round edge */
     ImageFormat(&img, PIXELFORMAT_UNCOMPRESSED_R8G8B8A8);
@@ -2548,6 +2668,7 @@ static void Unfocus(void)
     tfSearch.active = tfName.active = tfDesc.active = false;
     tfNewFile.active = tfCommit.active = tfIssue.active = false;
     tfUser.active = tfPass.active = tfPass2.active = tfCode.active = false;
+    tfUpPath.active = tfUpMsg.active = false;
     tfOldPass.active = tfNewPass.active = tfNewPass2.active = tfDelPass.active = false;
     ed.focused = false;
     armedId = 0;
@@ -2698,7 +2819,8 @@ static void SelectChange(int i)
     scDiff = 0;
     if (i >= 0) {
         Repo *r = &repos[curRepo];
-        ComputeDiff(BlobText(r, changes[i].oldB), BlobText(r, changes[i].newB), NULL, NULL);
+        if (changes[i].binary) dOpCount = 0;
+        else ComputeDiff(BlobText(r, changes[i].oldB), BlobText(r, changes[i].newB), NULL, NULL);
     } else dOpCount = 0;
 }
 
@@ -3685,16 +3807,452 @@ static void DrawFileList(Repo *r, Rectangle la)
     DrawScrollbar(la, scFiles, n * rowH);
 }
 
-static void DrawFileHeader(Rectangle fh, const char *name, const char *tag, Color tagColor, WorkFile *f)
+/* ------------------------------------------------------------------ */
+/* Uploading files                                                    */
+/*                                                                    */
+/* Files dropped onto the window (or picked by typing their path) are */
+/* "staged": held in memory and listed so you can check them first.   */
+/* "Commit changes" then saves them all as one commit, built on top   */
+/* of the latest commit. Anything else you were in the middle of      */
+/* editing stays as it was, still waiting for its own commit.         */
+/* ------------------------------------------------------------------ */
+typedef struct { char name[NAME_LEN]; char *data; int len; bool binary; } Staged;
+static Staged staged[MAX_FILES];
+static int    stagedCount;
+static float  scUpload;
+
+static void ClearStaged(void)
+{
+    for (int i = 0; i < stagedCount; i++) free(staged[i].data);
+    memset(staged, 0, sizeof staged);
+    stagedCount = 0;
+}
+
+static int FindStaged(const char *name)
+{
+    for (int i = 0; i < stagedCount; i++) if (strcmp(staged[i].name, name) == 0) return i;
+    return -1;
+}
+
+/* "512 bytes", "12.3 KB", "4.5 MB" */
+static const char *FormatSize(int n)
+{
+    static char b[4][32];
+    static int w;
+    w = (w + 1) % 4;
+    if (n < 1024)             snprintf(b[w], 32, "%d byte%s", n, n == 1 ? "" : "s");
+    else if (n < 1024 * 1024) snprintf(b[w], 32, "%.1f KB", n / 1024.0);
+    else                      snprintf(b[w], 32, "%.1f MB", n / (1024.0 * 1024.0));
+    return b[w];
+}
+
+static int CountLines(const char *d, int len)
+{
+    if (len == 0) return 0;
+    int n = 0;
+    for (int i = 0; i < len; i++) if (d[i] == '\n') n++;
+    return d[len - 1] == '\n' ? n : n + 1;
+}
+
+/* Text files are tidied the way the editor needs them: Windows line endings
+   (\r\n) become plain \n, and tab characters become 4 spaces. */
+static char *TidyText(const char *d, int len, int *outLen)
+{
+    int tabs = 0;
+    for (int i = 0; i < len; i++) if (d[i] == '\t') tabs++;
+    char *o = malloc((size_t)len + (size_t)tabs * 3 + 1);
+    if (!o) return NULL;
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        char c = d[i];
+        if (c == '\r') { if (i + 1 < len && d[i + 1] == '\n') continue; c = '\n'; }
+        if (c == '\t') { memcpy(o + j, "    ", 4); j += 4; continue; }
+        o[j++] = c;
+    }
+    o[j] = 0;
+    *outLen = j;
+    return o;
+}
+
+/* Removes quotes and spaces around a typed or pasted path
+   ("Copy as path" on Windows adds quotes). */
+static void CleanPath(const char *raw, char *path, int cap)
+{
+    while (*raw == ' ' || *raw == '"' || *raw == '\'') raw++;
+    snprintf(path, (size_t)cap, "%s", raw);
+    int n = (int)strlen(path);
+    while (n > 0 && (path[n - 1] == ' ' || path[n - 1] == '"' || path[n - 1] == '\'')) path[--n] = 0;
+}
+
+/* Reads one file from your computer into the staging list.
+   Returns NULL if it worked, or a message saying why not. */
+static const char *StageFile(const char *raw)
+{
+    static char msg[TEXT_LEN];
+    char path[1024];
+    CleanPath(raw, path, sizeof path);
+    if (!path[0])           return "Type or paste a file's path first";
+    if (DirectoryExists(path)) return "Folders can't be uploaded - open the folder and drag the files inside";
+    if (!FileExists(path))  return "Couldn't find a file at that path";
+    const char *base = GetFileName(path);
+    int size = GetFileLength(path);
+    if (size < 0 || size > MAX_UPLOAD) {
+        snprintf(msg, sizeof msg, "%.60s is too big - files can be up to %s", base, FormatSize(MAX_UPLOAD));
+        return msg;
+    }
+
+    char nm[NAME_LEN];
+    SanitizeName(base, nm);
+    if (!nm[0]) snprintf(nm, NAME_LEN, "file");
+    int k = FindStaged(nm);
+    if (k < 0 && stagedCount >= MAX_FILES) return "That's as many files as one upload can hold";
+
+    char *data = NULL;
+    int len = 0;
+    if (size == 0) data = calloc(1, 1);                          /* an empty file */
+    else {
+        int got = 0;
+        unsigned char *d = LoadFileData(path, &got);
+        if (!d || got <= 0) { snprintf(msg, sizeof msg, "Couldn't open %.60s", base); return msg; }
+        data = malloc((size_t)got + 1);
+        if (data) { memcpy(data, d, (size_t)got); data[got] = 0; len = got; }
+        UnloadFileData(d);
+    }
+    if (!data) return "Out of memory";
+
+    bool bin = LooksBinary(data, len);
+    if (!bin) {
+        int tl = 0;
+        char *t = TidyText(data, len, &tl);
+        if (t) { free(data); data = t; len = tl; }
+    }
+    if (k < 0) k = stagedCount++;                                /* same name again: replace it */
+    else free(staged[k].data);
+    snprintf(staged[k].name, NAME_LEN, "%s", nm);
+    staged[k].data = data;
+    staged[k].len = len;
+    staged[k].binary = bin;
+    return NULL;
+}
+
+/* 'A' = a new file, 'M' = replaces a different version, '=' = same as the latest commit */
+static char StagedKind(Repo *r, Staged *s)
+{
+    Commit *h = Head(r);
+    int k = h ? FindInCommit(h, s->name) : -1;
+    if (k < 0) return 'A';
+    Blob *b = &r->blobs[h->blobs[k]];
+    return (b->len == s->len && memcmp(b->data, s->data, (size_t)s->len) == 0) ? '=' : 'M';
+}
+
+/* True if you've edited this file since the last commit and the upload would replace those edits. */
+static bool StagedReplacesEdits(Repo *r, Staged *s)
+{
+    int i = FindFile(r, s->name);
+    if (i < 0 || !FileStatus(r, i)) return false;
+    WorkFile *f = &r->files[i];
+    return !(f->len == s->len && memcmp(f->text, s->data, (size_t)s->len) == 0);
+}
+
+/* Saves the staged files as one commit. Returns NULL or a message. */
+static const char *DoUploadCommit(Repo *r, const char *msg)
+{
+    if (!stagedCount) return "Add some files first";
+    Commit *h = Head(r);
+    int changed = 0, newInCommit = 0, newInWork = 0;
+    for (int i = 0; i < stagedCount; i++) {
+        char kd = StagedKind(r, &staged[i]);
+        if (kd != '=') changed++;
+        if (kd == 'A') newInCommit++;
+        if (FindFile(r, staged[i].name) < 0) newInWork++;
+    }
+    if (!changed)                      return "Nothing to commit - these are the same as the latest versions";
+    if (r->commitCount >= MAX_COMMITS) return "This repository has reached its commit limit";
+    if ((h ? h->fileCount : 0) + newInCommit > MAX_FILES || r->fileCount + newInWork > MAX_FILES)
+        return TextFormat("A repository can hold up to %d files", MAX_FILES);
+    if (r->blobCount + changed > MAX_BLOBS) return "This repository is out of storage space";
+
+    /* start from the latest commit, then put the uploaded files in */
+    Commit c;
+    memset(&c, 0, sizeof c);
+    if (h) {
+        c.fileCount = h->fileCount;
+        memcpy(c.names, h->names, sizeof c.names);
+        memcpy(c.blobs, h->blobs, sizeof c.blobs);
+    }
+    for (int i = 0; i < stagedCount; i++) {
+        Staged *s = &staged[i];
+        if (StagedKind(r, s) == '=') continue;
+        int b = InternBlob(r, s->data, s->len);
+        if (b < 0) return "This repository is out of storage space";
+        int k = FindInCommit(&c, s->name);
+        if (k < 0) { k = c.fileCount++; snprintf(c.names[k], NAME_LEN, "%.*s", NAME_LEN - 1, s->name); }
+        c.blobs[k] = b;
+    }
+    FinishCommit(r, &c, msg[0] ? msg : "Add files via upload");
+    MarkDirty();
+
+    /* the uploaded versions also become the versions you're working on */
+    for (int i = 0; i < stagedCount; i++) {
+        Staged *s = &staged[i];
+        int f = FindFile(r, s->name);
+        if (f < 0) AddFileN(r, s->name, s->data, s->len);
+        else       WF_SetN(&r->files[f], s->data, s->len);
+    }
+    return NULL;
+}
+
+/* ---------------- previews of pictures and other non-text files ---------------- */
+
+/* Up to 4 pictures are kept ready to draw; the one used longest ago is replaced first. */
+#define PREVIEW_SLOTS 4
+static struct {
+    const char *data; int len, gen, state, w, h;     /* state: 1 = ready, -1 = couldn't be read */
+    Texture2D tex;
+    unsigned long long used;
+} prevs[PREVIEW_SLOTS];
+static unsigned long long prevClock;
+
+static bool IsPictureBytes(const char *d, int n)
+{
+    const unsigned char *u = (const unsigned char *)d;
+    return (n > 8 && memcmp(d, "\x89PNG", 4) == 0) || (n > 3 && u[0] == 0xFF && u[1] == 0xD8) ||
+           (n > 6 && memcmp(d, "GIF8", 4) == 0)    || (n > 4 && memcmp(d, "qoif", 4) == 0);
+}
+
+/* Returns which slot holds this picture, or -1 if it isn't a picture we can show. */
+static int Preview(const char *data, int len)
+{
+    if (!IsPictureBytes(data, len)) return -1;
+    prevClock++;
+    for (int i = 0; i < PREVIEW_SLOTS; i++)
+        if (prevs[i].state && prevs[i].data == data && prevs[i].len == len && prevs[i].gen == filesGen) {
+            prevs[i].used = prevClock;
+            return prevs[i].state == 1 ? i : -1;
+        }
+    int s = 0;
+    for (int i = 1; i < PREVIEW_SLOTS; i++) if (prevs[i].used < prevs[s].used) s = i;
+    if (prevs[s].state == 1) UnloadTexture(prevs[s].tex);
+    memset(&prevs[s], 0, sizeof prevs[s]);
+    prevs[s].data = data; prevs[s].len = len; prevs[s].gen = filesGen; prevs[s].used = prevClock;
+    prevs[s].state = -1;
+
+    const char *err = NULL;
+    Image img = LoadAnyImage((const unsigned char *)data, len, &err);
+    if (err) return -1;
+    prevs[s].w = img.width;
+    prevs[s].h = img.height;
+    int big = img.width > img.height ? img.width : img.height;
+    if (big > 2048) ImageResize(&img, img.width * 2048 / big, img.height * 2048 / big);   /* keeps graphics cards happy */
+    prevs[s].tex = LoadTextureFromImage(img);
+    UnloadImage(img);
+    SetTextureFilter(prevs[s].tex, TEXTURE_FILTER_BILINEAR);
+    prevs[s].state = 1;
+    return s;
+}
+
+/* Draws slot s's picture as big as fits in box (small pictures up to 3 times bigger),
+   on a chequered background so see-through parts are visible. */
+static void DrawPicture(int s, Rectangle box)
+{
+    Texture2D t = prevs[s].tex;
+    float sc = fminf(box.width / t.width, box.height / t.height);
+    float most = (t.width < 200 && t.height < 200) ? 3.0f : 1.0f;
+    if (sc > most) sc = most;
+    float w = t.width * sc, h = t.height * sc;
+    Rectangle dst = {box.x + (box.width - w) / 2, box.y + (box.height - h) / 2, w, h};
+    BeginScissorMode((int)dst.x, (int)dst.y, (int)dst.width + 1, (int)dst.height + 1);
+    for (int y = 0; y * 12 < dst.height; y++)
+        for (int x = 0; x * 12 < dst.width; x++)
+            DrawRectangle((int)dst.x + x * 12, (int)dst.y + y * 12, 12, 12,
+                          (x + y) % 2 ? (Color){60, 66, 74, 255} : (Color){44, 49, 56, 255});
+    EndScissorMode();
+    DrawTexturePro(t, (Rectangle){0, 0, (float)t.width, (float)t.height}, dst, (Vector2){0, 0}, 0, WHITE);
+}
+
+/* What the Code tab shows instead of the editor for a non-text file. */
+static void DrawBinaryView(const char *data, int len, Rectangle area)
+{
+    DrawRectangleRec(area, UI_BASE);
+    int s = Preview(data, len);
+    if (s >= 0) {
+        DrawPicture(s, (Rectangle){area.x + 20, area.y + 20, area.width - 40, area.height - 60});
+        const char *cap = TextFormat("%d x %d pixels   |   %s", prevs[s].w, prevs[s].h, FormatSize(len));
+        DrawText(cap, (int)(area.x + area.width / 2) - MeasureText(cap, FS) / 2, (int)(area.y + area.height) - 32, FS, UI_MUTED);
+        return;
+    }
+    /* a simple "document" shape with a folded corner */
+    float cx = area.x + area.width / 2, cy = area.y + area.height / 2 - 50;
+    Rectangle doc = {cx - 30, cy - 38, 60, 76};
+    DrawRectangleLinesEx(doc, 2, UI_MUTED);
+    DrawTriangle((Vector2){doc.x + 40, doc.y}, (Vector2){doc.x + 60, doc.y + 20}, (Vector2){doc.x + 60, doc.y}, UI_BASE);
+    DrawLineEx((Vector2){doc.x + 40, doc.y}, (Vector2){doc.x + 60, doc.y + 20}, 2, UI_MUTED);
+    DrawText("01", (int)cx - MeasureText("01", FS) / 2, (int)cy - 4, FS, UI_MUTED);
+    const char *l1 = IsPictureBytes(data, len) ? TextFormat("Picture   |   %s", FormatSize(len))
+                                               : TextFormat("Binary file   |   %s", FormatSize(len));
+    const char *l2 = IsPictureBytes(data, len) ? "This kind of picture can't be previewed, but it's stored safely."
+                                               : "This isn't a text file, so it can't be shown here - but it's stored safely.";
+    DrawText(l1, (int)cx - MeasureText(l1, FS) / 2, (int)cy + 56, FS, UI_TEXT);
+    DrawFit(l2, (int)fmaxf(area.x + 16, cx - MeasureText(l2, FS) / 2.0f), (int)cy + 86, FS, (int)area.width - 32, UI_MUTED);
+}
+
+/* ---------------- the upload page ---------------- */
+static void OpenUpload(void)
+{
+    Unfocus();
+    scUpload = 0;
+    TF_Clear(&tfUpPath);
+    TF_Clear(&tfUpMsg);
+    screen = SCR_UPLOAD;
+}
+
+/* Stages every path in a list (from a drop), and says how it went. */
+static void StagePaths(char **paths, int count)
+{
+    int ok = 0;
+    char err[TEXT_LEN] = "";
+    for (int i = 0; i < count; i++) {
+        const char *e = StageFile(paths[i]);
+        if (e) snprintf(err, sizeof err, "%s", e);
+        else ok++;
+    }
+    if (err[0] && ok) Toast(TextFormat("Added %d file%s, but: %.100s", ok, ok == 1 ? "" : "s", err));
+    else if (err[0])  Toast(err);
+}
+
+static void DashedRect(Rectangle r, Color c)
+{
+    for (float x = r.x; x < r.x + r.width; x += 16) {
+        float e = fminf(x + 8, r.x + r.width);
+        DrawLineEx((Vector2){x, r.y}, (Vector2){e, r.y}, 2, c);
+        DrawLineEx((Vector2){x, r.y + r.height}, (Vector2){e, r.y + r.height}, 2, c);
+    }
+    for (float y = r.y; y < r.y + r.height; y += 16) {
+        float e = fminf(y + 8, r.y + r.height);
+        DrawLineEx((Vector2){r.x, y}, (Vector2){r.x, e}, 2, c);
+        DrawLineEx((Vector2){r.x + r.width, y}, (Vector2){r.x + r.width, e}, 2, c);
+    }
+}
+
+static void BackToCode(void) { Unfocus(); screen = SCR_REPO; tab = TAB_CODE; }
+
+static void ScreenUpload(Repo *r)
+{
+    if (!IsMine(r)) { BackToCode(); return; }
+    TextField *order[] = {&tfUpPath, &tfUpMsg};
+    TabCycle(order, 2);
+
+    DrawBold(TextFormat("Upload files to %s", r->name), 20, 190, 30, UI_TEXT);
+    DrawText("Everything you upload here is saved together as one commit.", 20, 228, FS, UI_MUTED);
+
+    /* the drop zone, with a path box for people who'd rather type */
+    Rectangle zone = {20, 262, (float)W - 40, 116};
+    DrawRectangleRec(zone, UI_PANEL);
+    DashedRect(zone, uiAccent);
+    const char *big = "Drag files from your computer onto this window";
+    DrawBold(big, (int)(zone.x + zone.width / 2) - MeasureText(big, FS) / 2, (int)zone.y + 16, FS, UI_TEXT);
+    const char *orTxt = "or paste a path:";
+    int ow = MeasureText(orTxt, FS);
+    DrawText(orTxt, (int)zone.x + 24, (int)zone.y + 64, FS, UI_MUTED);
+    float px = zone.x + 24 + ow + 12, pw = zone.x + zone.width - 24 - 100 - px;
+    bool enter = TextFieldUI(&tfUpPath, (Rectangle){px, zone.y + 54, pw, 40}, "e.g. C:/Users/jo/Documents/notes.txt");
+    if (Button((Rectangle){zone.x + zone.width - 24 - 90, zone.y + 54, 90, 40}, "Add", UI_BTN) || enter) {
+        const char *e = StageFile(tfUpPath.buf);
+        if (e) Toast(e);
+        else TF_Clear(&tfUpPath);
+    }
+
+    /* the files waiting to be committed */
+    int changed = 0;
+    for (int i = 0; i < stagedCount; i++) if (StagedKind(r, &staged[i]) != '=') changed++;
+    DrawBold(stagedCount ? TextFormat("Files to upload (%d)", stagedCount) : "Files to upload", 20, 394, FS, UI_TEXT);
+
+    float bottom = (float)H - 112;
+    Rectangle la = {20, 424, (float)W - 40, bottom - 424 - 8};
+    float rowH = 50;
+    ScrollArea(la, &scUpload, stagedCount * rowH);
+    if (!stagedCount) DrawText("Nothing added yet.", 20, 430, FS, UI_MUTED);
+    int removeAt = -1;
+    BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
+    for (int i = 0; i < stagedCount; i++) {
+        Staged *s = &staged[i];
+        Rectangle row = {la.x, la.y + i * rowH - scUpload, la.width - 12, rowH - 6};
+        if (row.y > la.y + la.height || row.y + row.height < la.y) continue;
+        DrawRectangleRec(row, UI_PANEL);
+        DrawRectangleLinesEx(row, 1, UI_BORDER);
+
+        char kd = StagedKind(r, s);
+        const char *badge = kd == 'A' ? "New" : kd == 'M' ? "Replaces" : "Unchanged";
+        Color bc = kd == 'A' ? UI_GREEN : kd == 'M' ? (Color){150, 105, 20, 255} : UI_BTN;
+        Rectangle pill = {row.x + 10, row.y + 9, 112, 26};
+        DrawRectangleRounded(pill, 0.5f, 6, bc);
+        DrawText(badge, (int)(pill.x + pill.width / 2) - MeasureText(badge, FS) / 2, (int)pill.y + 3, FS, UI_TEXT);
+
+        int tx = (int)row.x + 136;
+        DrawBold(s->name, tx, (int)row.y + 12, FS, UI_TEXT);
+        tx += MeasureText(s->name, FS) + 18;
+        const char *kind = s->binary ? (IsPictureBytes(s->data, s->len) ? "picture" : "binary file")
+                                     : TextFormat("text, %d line%s", CountLines(s->data, s->len), CountLines(s->data, s->len) == 1 ? "" : "s");
+        const char *detail = TextFormat("%s, %s", kind, FormatSize(s->len));
+        int room = (int)(row.x + row.width) - 120 - tx;
+        DrawFit(detail, tx, (int)row.y + 12, FS, room, UI_MUTED);
+        if (StagedReplacesEdits(r, s)) {
+            const char *w = "   - replaces your uncommitted edits";
+            int dw = MeasureText(detail, FS);
+            if (dw + MeasureText(w, FS) < room) DrawText(w, tx + dw, (int)row.y + 12, FS, UI_YELLOW);
+        }
+        if (ButtonEx((Rectangle){row.x + row.width - 106, row.y + 7, 96, 30}, "Remove", UI_BTN, Hover(la))) removeAt = i;
+    }
+    EndScissorMode();
+    DrawScrollbar(la, scUpload, stagedCount * rowH);
+    if (removeAt >= 0) {
+        free(staged[removeAt].data);
+        memmove(&staged[removeAt], &staged[removeAt + 1], (size_t)(stagedCount - removeAt - 1) * sizeof(Staged));
+        stagedCount--;
+        memset(&staged[stagedCount], 0, sizeof(Staged));
+    }
+
+    /* commit message and buttons */
+    DrawLine(20, (int)bottom, W - 20, (int)bottom, UI_BORDER);
+    DrawText("Commit message", 20, (int)bottom + 14, FS, UI_TEXT);
+    if (stagedCount && !changed) DrawText("These are all the same as the latest versions - nothing to commit.",
+                                          20 + MeasureText("Commit message", FS) + 24, (int)bottom + 14, FS, UI_YELLOW);
+    bool msgEnter = TextFieldUI(&tfUpMsg, (Rectangle){20, bottom + 44, (float)W - 40 - 360, 44}, "Add files via upload");
+    bool cancel = Button((Rectangle){(float)W - 350, bottom + 44, 130, 44}, "Cancel", UI_BTN);
+    bool go = ButtonEx((Rectangle){(float)W - 210, bottom + 44, 190, 44}, "Commit changes", changed ? UI_GREEN : UI_BTN, changed > 0);
+    if (cancel) { BackToCode(); return; }
+    if (go || (msgEnter && changed)) {
+        char first[NAME_LEN];
+        snprintf(first, NAME_LEN, "%s", staged[0].name);
+        const char *err = DoUploadCommit(r, tfUpMsg.buf);
+        if (err) { Toast(err); return; }
+        Toast(TextFormat("Uploaded %d file%s in commit %s", changed, changed == 1 ? "" : "s", Head(r)->id));
+        ClearStaged();
+        MarkDirty();
+        BackToCode();
+        SelectFile(FindFile(r, first));
+    }
+}
+
+/* The bar above a file: its name, a tag like "modified", and where the cursor is
+   (or the size, for a non-text file). rightGap leaves room for a button. */
+static void DrawFileHeader(Rectangle fh, const char *name, const char *tag, Color tagColor, WorkFile *f, int rightGap)
 {
     DrawRectangleRec(fh, UI_PANEL);
     DrawRectangleLinesEx(fh, 1, UI_BORDER);
     DrawBold(name, (int)fh.x + 14, (int)fh.y + 11, FS, UI_TEXT);
     if (tag) DrawText(tag, (int)fh.x + 30 + MeasureText(name, FS), (int)fh.y + 11, FS, tagColor);
-    int ls = LineStart(f->text, ed.cursor);
-    const char *info = TextFormat("Ln %d, Col %d   |   %d lines",
-                                  LineOf(f->text, ed.cursor) + 1, ed.cursor - ls + 1, LineOf(f->text, f->len) + 1);
-    DrawText(info, (int)(fh.x + fh.width) - 14 - MeasureText(info, FS), (int)fh.y + 11, FS, UI_MUTED);
+    const char *info;
+    if (f->binary) {
+        int s = Preview(f->text, f->len);
+        info = s >= 0 ? TextFormat("%d x %d   |   %s", prevs[s].w, prevs[s].h, FormatSize(f->len))
+                      : TextFormat("binary file   |   %s", FormatSize(f->len));
+    } else {
+        int ls = LineStart(f->text, ed.cursor);
+        info = TextFormat("Ln %d, Col %d   |   %d lines",
+                          LineOf(f->text, ed.cursor) + 1, ed.cursor - ls + 1, LineOf(f->text, f->len) + 1);
+    }
+    DrawText(info, (int)(fh.x + fh.width) - 14 - rightGap - MeasureText(info, FS), (int)fh.y + 11, FS, UI_MUTED);
 }
 
 static void TabCode(Repo *r)
@@ -3730,13 +4288,7 @@ static void TabCode(Repo *r)
                 }
             }
         }
-        if (curFile >= 0 && ConfirmButton((Rectangle){lp.x + lp.width - 126, by + 46, 114, 36}, "Delete", "Sure?", 3)) {
-            int was = curFile;
-            RemoveFile(r, was);
-            SelectFile(r->fileCount == 0 ? -1 : (was < r->fileCount ? was : r->fileCount - 1));
-            MarkDirty();
-            Toast("File deleted - commit to record it in the history");
-        }
+        if (Button((Rectangle){lp.x + lp.width - 126, by + 46, 114, 36}, "Upload", UI_BTN)) { OpenUpload(); return; }
         int nch = ChangeCount(r);
         DrawText(nch ? TextFormat("%d change%s to commit", nch, nch == 1 ? "" : "s") : "All changes committed",
                  (int)lp.x + 14, (int)by + 100, FS, nch ? UI_YELLOW : UI_MUTED);
@@ -3751,28 +4303,38 @@ static void TabCode(Repo *r)
     if (curFile >= 0 && curFile < ShownCount(r)) {
         if (mine) {
             WorkFile *f = &r->files[curFile];
-            if (EditorUI(f, edr, false)) MarkDirty();
+            if (f->binary) DrawBinaryView(f->text, f->len, edr);
+            else if (EditorUI(f, edr, false)) MarkDirty();
             DrawRectangleLinesEx(edr, 1, UI_BORDER);
             char st = FileStatus(r, curFile);
             DrawFileHeader(fh, f->name, st == 'A' ? "new file" : st == 'M' ? "modified" : NULL,
-                           st == 'A' ? UI_GREENT : UI_YELLOW, f);
+                           st == 'A' ? UI_GREENT : UI_YELLOW, f, 104);
+            if (ConfirmButton((Rectangle){fh.x + fh.width - 106, fh.y + 6, 98, 30}, "Delete", "Sure?", 3)) {
+                int was = curFile;
+                RemoveFile(r, was);
+                SelectFile(r->fileCount == 0 ? -1 : (was < r->fileCount ? was : r->fileCount - 1));
+                MarkDirty();
+                Toast("File deleted - commit to record it in the history");
+            }
         } else {
             /* show the committed version through a temporary, never-modified WorkFile */
             static WorkFile view;
             Commit *h = Head(r);
             snprintf(view.name, NAME_LEN, "%s", h->names[curFile]);
-            view.text = (char *)BlobText(r, h->blobs[curFile]);
-            view.len  = (int)strlen(view.text);
-            view.cap  = 0;
-            EditorUI(&view, edr, true);
+            view.text   = (char *)BlobText(r, h->blobs[curFile]);
+            view.len    = BlobLen(r, h->blobs[curFile]);
+            view.binary = BlobBinary(r, h->blobs[curFile]);
+            view.cap    = 0;
+            if (view.binary) DrawBinaryView(view.text, view.len, edr);
+            else EditorUI(&view, edr, true);
             DrawRectangleLinesEx(edr, 1, UI_BORDER);
-            DrawFileHeader(fh, view.name, TextFormat("as of commit %s", h->id), UI_MUTED, &view);
+            DrawFileHeader(fh, view.name, TextFormat("as of commit %s", h->id), UI_MUTED, &view, 0);
         }
     } else {
         Rectangle e = {rp.x, rp.y, rp.width, rp.height - 62};
         DrawRectangleRec(e, UI_PANEL);
         DrawRectangleLinesEx(e, 1, UI_BORDER);
-        const char *m = mine ? "Pick a file on the left, or add a new one." : "This repository has no committed files yet.";
+        const char *m = mine ? "Pick a file on the left, add a new one, or upload some." : "This repository has no committed files yet.";
         DrawText(m, (int)(e.x + e.width / 2) - MeasureText(m, FS) / 2, (int)(e.y + e.height / 2) - 10, FS, UI_MUTED);
     }
 
@@ -3923,6 +4485,33 @@ static void DrawDiff(Rectangle area)
     DrawScrollbar(area, scDiff, dOpCount * LH + 16);
 }
 
+/* A non-text file in a commit: no lines to compare, so show the sizes,
+   and for pictures the old and new versions side by side. */
+static void DrawBinaryChange(Repo *r, Change *ch, Rectangle area)
+{
+    DrawRectangleRec(area, UI_BASE);
+    DrawRectangleLinesEx(area, 1, UI_BORDER);
+    int ol = BlobLen(r, ch->oldB), nl = BlobLen(r, ch->newB);
+    const char *what = ch->kind == 'A' ? TextFormat("Added   |   %s", FormatSize(nl))
+                     : ch->kind == 'D' ? TextFormat("Deleted   |   was %s", FormatSize(ol))
+                                       : TextFormat("Changed   |   %s  ->  %s", FormatSize(ol), FormatSize(nl));
+    DrawText(what, (int)area.x + 16, (int)area.y + 14, FS, UI_TEXT);
+    Rectangle box = {area.x + 16, area.y + 54, area.width - 32, area.height - 70};
+    int so = ch->oldB >= 0 ? Preview(BlobText(r, ch->oldB), ol) : -1;
+    int sn = ch->newB >= 0 ? Preview(BlobText(r, ch->newB), nl) : -1;
+    if (ch->kind == 'M' && so >= 0 && sn >= 0) {
+        float half = (box.width - 20) / 2;
+        DrawText("Before", (int)box.x, (int)box.y, FS, UI_REDT);
+        DrawText("After", (int)(box.x + half + 20), (int)box.y, FS, UI_GREENT);
+        DrawPicture(so, (Rectangle){box.x, box.y + 30, half, box.height - 30});
+        DrawPicture(sn, (Rectangle){box.x + half + 20, box.y + 30, half, box.height - 30});
+    } else if (sn >= 0 || so >= 0) {
+        DrawPicture(sn >= 0 ? sn : so, box);
+    } else {
+        DrawText("This isn't a text file, so there are no lines to compare.", (int)box.x, (int)box.y, FS, UI_MUTED);
+    }
+}
+
 static void ScreenCommit(Repo *r)
 {
     Commit *c = &r->commits[curCommit];
@@ -3994,9 +4583,11 @@ static void ScreenCommit(Repo *r)
     DrawBold(ch->name, (int)fh.x + 14, (int)fh.y + 11, FS, UI_TEXT);
     const char *kind = ch->kind == 'A' ? "added" : ch->kind == 'D' ? "deleted" : "modified";
     DrawText(kind, (int)fh.x + 30 + MeasureText(ch->name, FS), (int)fh.y + 11, FS, UI_MUTED);
-    const char *ad = TextFormat("+%d  -%d", ch->adds, ch->dels);
+    const char *ad = ch->binary ? "binary" : TextFormat("+%d  -%d", ch->adds, ch->dels);
     DrawText(ad, (int)(fh.x + fh.width) - 14 - MeasureText(ad, FS), (int)fh.y + 11, FS, UI_MUTED);
-    DrawDiff((Rectangle){rp.x, rp.y + 42, rp.width, rp.height - 42});
+    Rectangle area = {rp.x, rp.y + 42, rp.width, rp.height - 42};
+    if (ch->binary) DrawBinaryChange(r, ch, area);
+    else            DrawDiff(area);
 }
 
 /* ---------------- one day of contributions ---------------- */
@@ -4211,15 +4802,26 @@ int main(void)
         if (IsFileDropped()) {
             FilePathList dropped = LoadDroppedFiles();
             User *me = FindUserById(curUser);
+            bool inRepo = me && curRepo >= 0 && curRepo < repoCount &&
+                          (screen == SCR_REPO || screen == SCR_COMMIT || screen == SCR_UPLOAD);
             if (me && screen == SCR_ACCOUNT && dropped.count > 0) {
                 settingsTab = 0;
                 UseAvatarPath(me, dropped.paths[0]);
-            } else if (me) Toast("To change your profile picture, open Edit profile and drop it there");
+            } else if (inRepo && IsMine(&repos[curRepo])) {
+                if (screen != SCR_UPLOAD) OpenUpload();
+                StagePaths(dropped.paths, (int)dropped.count);
+            } else if (inRepo) {
+                Toast("Only the owner of this repository can upload files to it");
+            } else if (me) {
+                Toast("To upload files, open one of your repositories and drop them there");
+            }
             UnloadDroppedFiles(dropped);
         }
 
         /* every screen except sign-in / sign-up needs someone signed in */
         if (curUser < 0 && screen != SCR_LOGIN && screen != SCR_REGISTER && screen != SCR_FORGOT) GoLogin();
+        /* files waiting to be uploaded are let go once you leave the upload page */
+        if (screen != SCR_UPLOAD && stagedCount) ClearStaged();
         /* the recovery code only stays in memory while its screen is open */
         if (screen != SCR_RECOVERY && shownCode[0]) memset(shownCode, 0, sizeof shownCode);
 
@@ -4227,13 +4829,15 @@ int main(void)
             bool anyFocus = ed.focused || tfSearch.active || tfName.active || tfDesc.active ||
                             tfNewFile.active || tfCommit.active || tfIssue.active || tfUser.active ||
                             tfPass.active || tfPass2.active || tfOldPass.active || tfNewPass.active ||
-                            tfNewPass2.active || tfDelPass.active || tfBio.active || tfAvatar.active || tfCode.active;
+                            tfNewPass2.active || tfDelPass.active || tfBio.active || tfAvatar.active || tfCode.active ||
+                            tfUpPath.active || tfUpMsg.active;
             if (anyFocus) Unfocus();
             else if (screen == SCR_FORGOT) GoLogin();
             else if (screen == SCR_RECOVERY) GoHome();
             else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT || screen == SCR_PEOPLE) GoHome();
             else if (screen == SCR_PROFILE && viewUser != curUser) GoHome();
             else if (screen == SCR_DAY) { if (dayUser == curUser) GoHome(); else OpenProfile(dayUser); }
+            else if (screen == SCR_UPLOAD) BackToCode();
             else if (screen == SCR_COMMIT && fromDay) screen = SCR_DAY;
             else if (screen == SCR_COMMIT) { screen = SCR_REPO; tab = TAB_COMMITS; }
         }
@@ -4265,6 +4869,11 @@ int main(void)
             if (DrawRepoHeader(r, TAB_COMMITS)) break;
             if (screen == SCR_COMMIT) ScreenCommit(r);
         } break;
+        case SCR_UPLOAD: {
+            Repo *r = &repos[curRepo];
+            if (DrawRepoHeader(r, TAB_CODE)) break;
+            if (screen == SCR_UPLOAD) ScreenUpload(r);
+        } break;
         }
 
         DrawToast();
@@ -4280,6 +4889,8 @@ int main(void)
     ClearSecrets();
     for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);
     for (int i = 0; i < userCount; i++) { FreeAvatarTex(&users[i]); free(users[i].avatar); }
+    ClearStaged();
+    for (int i = 0; i < PREVIEW_SLOTS; i++) if (prevs[i].state == 1) UnloadTexture(prevs[i].tex);
     CloseWindow();
     return 0;
 }
