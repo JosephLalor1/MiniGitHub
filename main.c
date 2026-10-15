@@ -15,6 +15,8 @@
  *   - Uploads: drag files from your computer onto one of your repositories (or
  *     paste their paths), check the list, and save them as one commit. Text files
  *     can then be edited; pictures are previewed; any other file is stored as-is
+ *   - Downloads: any file, a whole repository (as a .zip), or the files as they
+ *     were in any commit - saved to your Downloads folder
  *   - Commits: a snapshot of every file, saved with a message and an author
  *   - Commit history and line-by-line diffs (what was added / removed)
  *   - Issues: anyone can open one; the repo owner or the issue's author can close it
@@ -4118,6 +4120,225 @@ static void ScreenNew(void)
 /* ---------------- repository pages ---------------- */
 
 /* ------------------------------------------------------------------ */
+/* Downloading                                                        */
+/*                                                                    */
+/* Files are saved into your normal Downloads folder (or, if there    */
+/* isn't one, a "downloads" folder next to the program). A whole      */
+/* repository is saved as one .zip file that any computer can open.   */
+/* ------------------------------------------------------------------ */
+#ifdef _WIN32
+#define PATH_SEP '\\'
+#else
+#define PATH_SEP '/'
+#endif
+
+/* One file to download: its name and its bytes. */
+typedef struct { const char *name; const char *data; int len; } OutFile;
+
+static bool usingFallbackFolder;          /* true when there was no Downloads folder */
+
+static const char *DownloadFolder(void)
+{
+    static char dir[1024];
+    const char *home = getenv("USERPROFILE");          /* Windows */
+    if (!home || !*home) home = getenv("HOME");        /* Linux and macOS */
+    if (home && *home) {
+        snprintf(dir, sizeof dir, "%s%cDownloads", home, PATH_SEP);
+        if (DirectoryExists(dir)) { usingFallbackFolder = false; return dir; }
+    }
+    snprintf(dir, sizeof dir, "downloads");
+    if (!DirectoryExists(dir)) MakeDirectory(dir);
+    usingFallbackFolder = true;
+    return dir;
+}
+
+/* "notes.txt", or "notes (1).txt", "notes (2).txt"... if that's taken - like a web browser. */
+static const char *FreePath(const char *dir, const char *fileName)
+{
+    static char path[1200];
+    char stem[NAME_LEN * 2], ext[NAME_LEN];
+    snprintf(stem, sizeof stem, "%s", fileName);
+    ext[0] = 0;
+    char *dot = strrchr(stem, '.');
+    if (dot && dot != stem) { snprintf(ext, sizeof ext, "%s", dot); *dot = 0; }
+    snprintf(path, sizeof path, "%s%c%s%s", dir, PATH_SEP, stem, ext);
+    for (int i = 1; FileExists(path) && i < 1000; i++)
+        snprintf(path, sizeof path, "%s%c%s (%d)%s", dir, PATH_SEP, stem, i, ext);
+    return path;
+}
+
+/* Tells you where a download went. */
+static void SavedToast(const char *path)
+{
+    const char *name = GetFileName(path);
+    if (usingFallbackFolder) Toast(TextFormat("Saved %.60s in the \"downloads\" folder next to Mini GitHub", name));
+    else                     Toast(TextFormat("Saved %.60s to your Downloads folder", name));
+}
+
+/* Saves one file's bytes, exactly as they are. */
+static void DownloadFile(const char *name, const char *data, int len)
+{
+    const char *path = FreePath(DownloadFolder(), name);
+    FILE *f = fopen(path, "wb");
+    if (!f) { Toast("Couldn't save the file - is the Downloads folder read-only?"); return; }
+    bool ok = fwrite(data, 1, (size_t)len, f) == (size_t)len;
+    ok = fclose(f) == 0 && ok;
+    if (!ok) { remove(path); Toast("Couldn't save the file - is the disk full?"); return; }
+    SavedToast(path);
+}
+
+/* ---------- .zip files ----------
+   A zip is a list of files, each with a small header saying its name, size
+   and a checksum (CRC-32) so damage can be spotted, followed by a table of
+   contents at the end. Each file is squeezed with DEFLATE (the standard zip
+   compression, which raylib can do); if that doesn't make it smaller, it's
+   stored as it is. */
+static uint32_t Crc32(const unsigned char *d, int n)
+{
+    static uint32_t table[256];
+    static bool ready;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+            table[i] = c;
+        }
+        ready = true;
+    }
+    uint32_t c = 0xFFFFFFFFu;
+    for (int i = 0; i < n; i++) c = table[(c ^ d[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+
+static void Put16(FILE *f, unsigned v) { fputc((int)(v & 0xFF), f); fputc((int)((v >> 8) & 0xFF), f); }
+static void Put32(FILE *f, uint32_t v) { Put16(f, v & 0xFFFF); Put16(f, v >> 16); }
+
+/* Writes files into a .zip, all inside one folder called folder/.
+   Returns NULL if it worked, or a message saying why not. */
+static const char *WriteZip(const char *path, const char *folder, OutFile *files, int n)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return "Couldn't save the zip - is the Downloads folder read-only?";
+
+    /* zip files store dates the old MS-DOS way: packed into two 16-bit numbers */
+    time_t now = time(NULL);
+    struct tm *lt = localtime(&now);
+    unsigned dosTime = (unsigned)(lt->tm_hour << 11 | lt->tm_min << 5 | lt->tm_sec / 2);
+    unsigned dosDate = (unsigned)((lt->tm_year - 80) << 9 | (lt->tm_mon + 1) << 5 | lt->tm_mday);
+
+    struct { uint32_t crc, csize, offset; int method; char name[NAME_LEN * 3]; int len; } ent[MAX_FILES + MAX_DRAFT + 1];
+    int count = 0;
+    bool ok = true;
+
+    /* the folder itself comes first, so it opens as a neat folder */
+    snprintf(ent[count].name, sizeof ent[count].name, "%s/", folder);
+    ent[count].crc = 0; ent[count].csize = 0; ent[count].len = 0; ent[count].method = 0;
+    ent[count].offset = (uint32_t)ftell(f);
+    count++;
+
+    for (int i = 0; i <= n && ok; i++) {
+        bool isFolder = i == 0;
+        const unsigned char *data = isFolder ? NULL : (const unsigned char *)files[i - 1].data;
+        int len = isFolder ? 0 : files[i - 1].len;
+        int e = isFolder ? 0 : count;
+        if (!isFolder) {
+            snprintf(ent[e].name, sizeof ent[e].name, "%s/%s", folder, files[i - 1].name);
+            ent[e].offset = (uint32_t)ftell(f);
+            ent[e].len = len;
+            ent[e].crc = Crc32(data, len);
+        }
+        /* try to squeeze it */
+        unsigned char *packed = NULL;
+        int packedLen = 0;
+        if (len > 0) packed = CompressData(data, len, &packedLen);
+        bool usePacked = packed && packedLen > 0 && packedLen < len;
+        ent[e].method = usePacked ? 8 : 0;
+        ent[e].csize = (uint32_t)(usePacked ? packedLen : len);
+
+        int nameLen = (int)strlen(ent[e].name);
+        Put32(f, 0x04034b50);                 /* "local file header" marker */
+        Put16(f, 20); Put16(f, 0);            /* zip version needed, flags  */
+        Put16(f, (unsigned)ent[e].method);
+        Put16(f, dosTime); Put16(f, dosDate);
+        Put32(f, ent[e].crc); Put32(f, ent[e].csize); Put32(f, (uint32_t)ent[e].len);
+        Put16(f, (unsigned)nameLen); Put16(f, 0);
+        fwrite(ent[e].name, 1, (size_t)nameLen, f);
+        if (ent[e].csize) ok = fwrite(usePacked ? packed : data, 1, ent[e].csize, f) == ent[e].csize;
+        if (packed) MemFree(packed);
+        if (!isFolder) count++;
+    }
+
+    /* the table of contents */
+    uint32_t dirStart = (uint32_t)ftell(f);
+    for (int e = 0; e < count; e++) {
+        int nameLen = (int)strlen(ent[e].name);
+        bool isFolder = ent[e].name[nameLen - 1] == '/';
+        Put32(f, 0x02014b50);                 /* "central directory" marker */
+        Put16(f, 20); Put16(f, 20); Put16(f, 0);
+        Put16(f, (unsigned)ent[e].method);
+        Put16(f, dosTime); Put16(f, dosDate);
+        Put32(f, ent[e].crc); Put32(f, ent[e].csize); Put32(f, (uint32_t)ent[e].len);
+        Put16(f, (unsigned)nameLen); Put16(f, 0); Put16(f, 0);
+        Put16(f, 0); Put16(f, 0);
+        Put32(f, isFolder ? 0x10 : 0);        /* "this is a folder" flag */
+        Put32(f, ent[e].offset);
+        fwrite(ent[e].name, 1, (size_t)nameLen, f);
+    }
+    uint32_t dirSize = (uint32_t)ftell(f) - dirStart;
+    Put32(f, 0x06054b50);                     /* "end of central directory" marker */
+    Put16(f, 0); Put16(f, 0);
+    Put16(f, (unsigned)count); Put16(f, (unsigned)count);
+    Put32(f, dirSize); Put32(f, dirStart);
+    Put16(f, 0);
+    ok = !ferror(f) && ok;
+    ok = fclose(f) == 0 && ok;
+    if (!ok) { remove(path); return "Couldn't save the zip - is the disk full?"; }
+    return NULL;
+}
+
+static void DownloadZip(const char *zipName, const char *folder, OutFile *files, int n)
+{
+    const char *path = FreePath(DownloadFolder(), zipName);
+    char keep[1200];
+    snprintf(keep, sizeof keep, "%s", path);
+    const char *err = WriteZip(keep, folder, files, n);
+    if (err) Toast(err);
+    else SavedToast(keep);
+}
+
+/* The whole repository as you see it: the latest commit, plus your own
+   uncommitted changes if you can edit it. */
+static void DownloadRepo(Repo *r)
+{
+    static OutFile out[MAX_FILES + MAX_DRAFT];
+    BuildView(r, CanEdit(r) ? curUser : -1);
+    int n = 0;
+    bool drafts = false;
+    for (int i = 0; i < viewCount; i++) {
+        if (view[i].status) drafts = true;
+        if (ViewDeleted(&view[i])) continue;
+        out[n++] = (OutFile){view[i].name, view[i].data, view[i].len};
+    }
+    if (!n) { Toast("There are no files to download yet"); return; }
+    DownloadZip(TextFormat("%s.zip", r->name), r->name, out, n);
+    if (drafts && toastMsg[0] && strncmp(toastMsg, "Saved", 5) == 0)
+        Toast(TextFormat("%.90s (with your uncommitted changes)", toastMsg));
+}
+
+/* The files exactly as they were in one commit. */
+static void DownloadCommit(Repo *r, int ci)
+{
+    static OutFile out[MAX_FILES];
+    Commit *c = &r->commits[ci];
+    for (int k = 0; k < c->fileCount; k++)
+        out[k] = (OutFile){c->names[k], r->blobs[c->blobs[k]].data, r->blobs[c->blobs[k]].len};
+    if (!c->fileCount) { Toast("This commit has no files"); return; }
+    char folder[NAME_LEN + 16];
+    snprintf(folder, sizeof folder, "%s-%s", r->name, c->id);
+    DownloadZip(TextFormat("%s.zip", folder), folder, out, c->fileCount);
+}
+
+/* ------------------------------------------------------------------ */
 /* Contributions per person (the pie chart) and the People tab         */
 /* ------------------------------------------------------------------ */
 
@@ -4452,6 +4673,7 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
         ToggleStar(r, curUser);
         MarkDirty();
     }
+    if (Button((Rectangle){(float)W - (mine ? 550 : 360), (float)y, 180, 38}, "Download ZIP", UI_BTN)) DownloadRepo(r);
     if (mine && ConfirmButton((Rectangle){(float)W - 360, (float)y, 180, 38}, "Delete repo", "Really delete?", 1)) {
         int i = curRepo;
         GoHome();
@@ -4945,17 +5167,22 @@ static void DrawFileHeader(Rectangle fh, const char *name, const char *tag, Colo
     DrawRectangleLinesEx(fh, 1, UI_BORDER);
     DrawBold(name, (int)fh.x + 14, (int)fh.y + 11, FS, UI_TEXT);
     if (tag) DrawText(tag, (int)fh.x + 30 + MeasureText(name, FS), (int)fh.y + 11, FS, tagColor);
-    const char *info;
+    /* the details on the right: the long version, a short one if space is tight, or none */
+    char full[96], brief[48];
     if (f->binary) {
         int s = Preview(f->text, f->len);
-        info = s >= 0 ? TextFormat("%d x %d   |   %s", prevs[s].w, prevs[s].h, FormatSize(f->len))
-                      : TextFormat("binary file   |   %s", FormatSize(f->len));
+        if (s >= 0) snprintf(full, sizeof full, "%d x %d   |   %s", prevs[s].w, prevs[s].h, FormatSize(f->len));
+        else        snprintf(full, sizeof full, "binary file   |   %s", FormatSize(f->len));
+        snprintf(brief, sizeof brief, "%s", FormatSize(f->len));
     } else {
-        int ls = LineStart(f->text, ed.cursor);
-        info = TextFormat("Ln %d, Col %d   |   %d lines",
-                          LineOf(f->text, ed.cursor) + 1, ed.cursor - ls + 1, LineOf(f->text, f->len) + 1);
+        int ls = LineStart(f->text, ed.cursor), lines = LineOf(f->text, f->len) + 1;
+        snprintf(full, sizeof full, "Ln %d, Col %d   |   %d lines", LineOf(f->text, ed.cursor) + 1, ed.cursor - ls + 1, lines);
+        snprintf(brief, sizeof brief, "%d lines", lines);
     }
-    DrawText(info, (int)(fh.x + fh.width) - 14 - rightGap - MeasureText(info, FS), (int)fh.y + 11, FS, UI_MUTED);
+    int leftEnd = (int)fh.x + 14 + MeasureText(name, FS) + (tag ? 16 + MeasureText(tag, FS) : 0) + 20;
+    int right = (int)(fh.x + fh.width) - 14 - rightGap;
+    const char *info = right - MeasureText(full, FS) >= leftEnd ? full : right - MeasureText(brief, FS) >= leftEnd ? brief : NULL;
+    if (info) DrawText(info, right - MeasureText(info, FS), (int)fh.y + 11, FS, UI_MUTED);
 }
 
 /* A private copy of a committed file for the editor to work on. Nothing is
@@ -5121,8 +5348,10 @@ static void TabCode(Repo *r)
         else if (v->status == 'M')  { tag = "modified"; tc = UI_YELLOW; }
         else if (v->status == 'D')  { tag = "deleted";  tc = UI_REDT; }
         else if (v->status == 'C')  { tag = "conflict"; tc = UI_ORANGE; }
-        bool canDelete = edit && !ViewDeleted(v);
-        DrawFileHeader(fh, v->name, tag, tc, &shown, canDelete ? 104 : 0);
+        bool canDelete = edit && !ViewDeleted(v), canDownload = !ViewDeleted(v);
+        DrawFileHeader(fh, v->name, tag, tc, &shown, (canDelete ? 104 : 0) + (canDownload ? 136 : 0));
+        if (canDownload && Button((Rectangle){fh.x + fh.width - (canDelete ? 106 : 0) - 136, fh.y + 6, 128, 30}, "Download", UI_BTN))
+            DownloadFile(v->name, shown.text, shown.len);       /* exactly what's on screen */
         if (canDelete && ConfirmButton((Rectangle){fh.x + fh.width - 106, fh.y + 6, 98, 30}, "Delete", "Sure?", 3)) {
             WorkFile *e = DraftFind(r, curUser, v->name);
             if (e && e->base < 0 && HeadBlobOf(r, v->name) < 0) {   /* never committed: just remove it */
@@ -5331,6 +5560,7 @@ static void ScreenCommit(Repo *r)
         else { screen = SCR_REPO; tab = TAB_COMMITS; }
         return;
     }
+    if (Button((Rectangle){(float)W - (CanEdit(r) ? 590 : 270), 186, 250, 38}, "Download this version", UI_BTN)) DownloadCommit(r, curCommit);
     if (CanEdit(r) &&
         ConfirmButton((Rectangle){(float)W - 330, 186, 310, 38}, "Restore files from here", "Click again to confirm", 2)) {
         RestoreCommit(r, curCommit);
