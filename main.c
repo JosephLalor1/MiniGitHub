@@ -4355,9 +4355,11 @@ static const Color PIE_COLORS[6] = {
 };
 static const Color PIE_OTHER = {0x6e, 0x76, 0x81, 255};
 
-typedef struct { int user; int commits; int adds; Color color; int people; } Share;   /* user -1 = "Others" */
+/* lines = lines added + lines removed: every changed line counts as work, so removing
+   14 lines counts the same as adding 14. A slice's size comes from lines. */
+typedef struct { int user; int commits; int adds, dels, lines; Color color; int people; } Share;   /* user -1 = "Others" */
 static Share shares[6];
-static int   shareCount, shareTotal;
+static int   shareCount, shareTotal;    /* shareTotal = all lines changed, by everyone */
 
 /* Owner, collaborators, then anyone else who has committed (former
    collaborators, or deleted accounts that show as "ghost"). */
@@ -4373,14 +4375,14 @@ static void BuildShares(Repo *r)
 
     shareCount = shareTotal = 0;
     for (int i = 0; i < n; i++) {
-        int c = 0, a = 0;
+        int c = 0, a = 0, d = 0;
         for (int k = 0; k < r->commitCount; k++)
-            if (r->commits[k].author == ids[i]) { c++; CommitStats(r, k); a += r->commits[k].sAdds; }
-        shareTotal += c;
-        if (n <= 6 || i < 5) shares[shareCount++] = (Share){ids[i], c, a, PIE_COLORS[i], 1};
+            if (r->commits[k].author == ids[i]) { c++; CommitStats(r, k); a += r->commits[k].sAdds; d += r->commits[k].sDels; }
+        shareTotal += a + d;
+        if (n <= 6 || i < 5) shares[shareCount++] = (Share){ids[i], c, a, d, a + d, PIE_COLORS[i], 1};
         else {
-            if (shareCount == 5) shares[shareCount++] = (Share){-1, 0, 0, PIE_OTHER, 0};
-            shares[5].commits += c; shares[5].adds += a; shares[5].people++;
+            if (shareCount == 5) shares[shareCount++] = (Share){-1, 0, 0, 0, 0, PIE_OTHER, 0};
+            shares[5].commits += c; shares[5].adds += a; shares[5].dels += d; shares[5].lines += a + d; shares[5].people++;
         }
     }
 }
@@ -4435,7 +4437,7 @@ static int Percent(int part, int total) { return total ? (part * 100 + total / 2
    under the mouse (it's drawn slightly bigger), or -1. */
 static int DrawPie(Vector2 c, float rad)
 {
-    if (shareTotal == 0) {                      /* nobody has committed yet: an empty ring */
+    if (shareTotal == 0) {                      /* no lines changed yet: an empty ring */
         DrawRing(c, rad - 3, rad, 0, 360, 48, UI_BORDER);
         return -1;
     }
@@ -4448,16 +4450,16 @@ static int DrawPie(Vector2 c, float rad)
     int hov = -1, slices = 0;
     float a = -90;
     for (int i = 0; i < shareCount; i++) {
-        if (!shares[i].commits) continue;
+        if (!shares[i].lines) continue;
         slices++;
-        float sweep = 360.0f * shares[i].commits / shareTotal;
+        float sweep = 360.0f * shares[i].lines / shareTotal;
         if (inside && mang >= a && mang < a + sweep) hov = i;
         a += sweep;
     }
     a = -90;
     for (int i = 0; i < shareCount; i++) {
-        if (!shares[i].commits) continue;
-        float sweep = 360.0f * shares[i].commits / shareTotal;
+        if (!shares[i].lines) continue;
+        float sweep = 360.0f * shares[i].lines / shareTotal;
         float rr = i == hov ? rad + 4 : rad;
         DrawCircleSector(c, rr, a, a + sweep, (int)(sweep / 3) + 4, shares[i].color);
         a += sweep;
@@ -4466,10 +4468,10 @@ static int DrawPie(Vector2 c, float rad)
         Color gap = {22, 27, 34, 255};
         a = -90;
         for (int i = 0; i < shareCount; i++) {
-            if (!shares[i].commits) continue;
+            if (!shares[i].lines) continue;
             Vector2 e = {c.x + cosf(a * DEG2RAD) * (rad + 6), c.y + sinf(a * DEG2RAD) * (rad + 6)};
             DrawLineEx(c, e, 2, gap);
-            a += 360.0f * shares[i].commits / shareTotal;
+            a += 360.0f * shares[i].lines / shareTotal;
         }
     }
     return hov;
@@ -4479,8 +4481,8 @@ static void ShareTip(int i)
 {
     Share *s = &shares[i];
     SetTip(ShareName(s),
-           TextFormat("%d commit%s  (%d%%)", s->commits, s->commits == 1 ? "" : "s", Percent(s->commits, shareTotal)),
-           TextFormat("+%d lines added", s->adds));
+           TextFormat("%d line%s changed  (%d%%)", s->lines, s->lines == 1 ? "" : "s", Percent(s->lines, shareTotal)),
+           TextFormat("+%d added, -%d removed, in %d commit%s", s->adds, s->dels, s->commits, s->commits == 1 ? "" : "s"));
 }
 
 /* The little pie in a repository's header. Returns true if it was clicked. */
@@ -4629,7 +4631,7 @@ static void TabPeople(Repo *r)
         return;
     }
     BuildShares(r);
-    DrawText(TextFormat("by number of commits  |  %d in total", shareTotal), (int)rx + 18, (int)card.y + 42, FS, UI_MUTED);
+    DrawFit(TextFormat("by lines changed (added + removed)  |  %d in total", shareTotal), (int)rx + 18, (int)card.y + 42, FS, (int)rw - 36, UI_MUTED);
     float rad = fminf(rw * 0.3f, 100);
     Vector2 c = {rx + rw / 2, card.y + 84 + rad};
     int h = DrawPie(c, rad);
@@ -4641,7 +4643,7 @@ static void TabPeople(Repo *r)
         Share *s = &shares[i];
         DrawRectangleRounded((Rectangle){rx + 18, ky + 3, 14, 14}, 0.3f, 4, s->color);
         DrawFit(ShareName(s), (int)rx + 42, (int)ky, FS, (int)(rw * 0.42f), UI_TEXT);
-        const char *val = TextFormat("%d commit%s  %d%%", s->commits, s->commits == 1 ? "" : "s", Percent(s->commits, shareTotal));
+        const char *val = TextFormat("%d line%s  %d%%", s->lines, s->lines == 1 ? "" : "s", Percent(s->lines, shareTotal));
         DrawText(val, (int)(rx + rw - 18) - MeasureText(val, FS), (int)ky, FS, UI_MUTED);
         ky += 30;
     }
@@ -5830,7 +5832,9 @@ int main(void)
         if (armedId && (armedT -= dt) <= 0) armedId = 0;
 
         /* the signed-in user's theme: its colour, and see-through panels if it draws a background */
-        int bgTheme = curUser >= 0 ? UserTheme(curUser) : THEME_CLASSIC;
+        int bgTheme = curUser < 0 ? THEME_CLASSIC
+                    : screen == SCR_PROFILE && FindUserById(viewUser) ? UserTheme(viewUser)   /* their page, their theme */
+                    : UserTheme(curUser);
         uiAccent = THEMES[bgTheme].accent;
         unsigned char see = bgTheme == THEME_CLASSIC ? 255 : 215;
         UI_PANEL.a = see;
