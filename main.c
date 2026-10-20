@@ -20,6 +20,12 @@
  *   - Commits: a snapshot of every file, saved with a message and an author
  *   - Commit history and line-by-line diffs (what was added / removed)
  *   - Issues: anyone can open one; the repo owner or the issue's author can close it
+ *   - Forks: make your own copy of someone else's repository (with its whole
+ *     history) and change it freely. A fork shows how many commits it is ahead
+ *     of / behind the original, and "Sync fork" brings in the original's new
+ *     commits: copied straight across when you haven't committed anything
+ *     yourself (a fast-forward), or combined with your work in a merge commit
+ *     when you have - unless you both changed the same file.
  *   - Profiles: a picture (PNG or JPG, dragged onto the window or by file path), a short
  *     bio, a circle colour, and a choice of animated themes (Classic is the plain look)
  *   - A People page and a profile page for every user. Your own profile is your
@@ -129,6 +135,8 @@ typedef struct {
     int       fileCount;
     char      names[MAX_FILES][NAME_LEN];
     int       blobs[MAX_FILES];
+    bool      copied;                /* came from the original repository into a fork: */
+                                     /* it isn't counted again as someone's contribution */
     bool      statsDone;             /* the three below are worked out when first needed, */
     int       sFiles, sAdds, sDels;  /* not saved: files changed, lines added / removed     */
 } Commit;
@@ -164,6 +172,12 @@ typedef struct {
     int       commitCount; Commit   commits[MAX_COMMITS];
     int       blobCount;   Blob     blobs[MAX_BLOBS];
     int       issueCount;  Issue    issues[MAX_ISSUES];
+    /* forks: the original is found by its owner + name (names are unique per owner) */
+    bool      isFork;
+    int       forkOwner;             /* user id of the original's owner              */
+    char      forkName[NAME_LEN];    /* the original's name                           */
+    char      forkBase[8];           /* id of the newest commit of the original this  */
+                                     /* fork already has ("" = the original was empty) */
 } Repo;
 
 static User users[MAX_USERS];
@@ -1550,7 +1564,7 @@ static void Save(void)
 {
     FILE *f = fopen(SAVE_FILE ".tmp", "wb");
     if (!f) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(f, "MINIGITHUB5\n");
+    fprintf(f, "MINIGITHUB6\n");
     WI(f, nextUserId);
     WS(f, lastUser);
     WI(f, userCount);
@@ -1577,6 +1591,7 @@ static void Save(void)
             Commit *c = &r->commits[k];
             WS(f, c->id); WS(f, c->message); WI(f, c->time); WI(f, c->author); WI(f, c->fileCount);
             for (int j = 0; j < c->fileCount; j++) { WS(f, c->names[j]); WI(f, c->blobs[j]); }
+            WI(f, c->copied);
         }
         WI(f, r->issueCount);
         for (int k = 0; k < r->issueCount; k++) {
@@ -1595,6 +1610,7 @@ static void Save(void)
                 WS(f, e->name); WSN(f, e->text, e->len); WI(f, e->deleted); WI(f, e->base);
             }
         }
+        WI(f, r->isFork); WI(f, r->forkOwner); WS(f, r->forkName); WS(f, r->forkBase);
     }
     fclose(f);
     remove(SAVE_FILE);
@@ -1618,7 +1634,8 @@ static bool V3HasProfiles(FILE *f)
     return !isText;
 }
 
-/* Reads every version: 4 (profiles + recovery codes), 3 (either one), 2 (accounts), 1 (before accounts). */
+/* Reads every version: 6 (forks), 5 (collaborators + drafts), 4 (profiles + recovery codes),
+   3 (either one), 2 (accounts), 1 (before accounts). */
 static bool Load(void)
 {
     FILE *f = fopen(SAVE_FILE, "rb");
@@ -1632,6 +1649,7 @@ static bool Load(void)
         if (strcmp(magic, "MINIGITHUB3") == 0) ver = 3;
         if (strcmp(magic, "MINIGITHUB4") == 0) ver = 4;
         if (strcmp(magic, "MINIGITHUB5") == 0) ver = 5;
+        if (strcmp(magic, "MINIGITHUB6") == 0) ver = 6;
     }
     if (!ver) loadErr = 1;
 
@@ -1742,6 +1760,7 @@ static bool Load(void)
                 if (b < 0 || b >= r->blobCount) { loadErr = 1; break; }
                 c->blobs[j] = b;
             }
+            if (ver >= 6) c->copied = RI(f) != 0;
             r->commitCount++;
         }
 
@@ -1798,6 +1817,13 @@ static bool Load(void)
                 if (!kept) { WorkFile *e = DraftEdit(r, r->owner, h->names[k]); if (e) e->deleted = true; }
             }
             for (int k = 0; k < legacyCount; k++) WF_Free(&legacy[k]);
+        }
+
+        if (ver >= 6 && !loadErr) {
+            r->isFork    = RI(f) != 0;
+            r->forkOwner = (int)RI(f);
+            RSInto(f, r->forkName, NAME_LEN);
+            RSInto(f, r->forkBase, (int)sizeof r->forkBase);
         }
     }
     fclose(f);
@@ -2296,7 +2322,7 @@ static void GatherDay(int uid, long long start)
         RepoTally t = {i, 0, 0, 0, 0};
         for (int k = 0; k < r->commitCount; k++) {
             Commit *c = &r->commits[k];
-            if (c->author != uid || c->time < start || c->time >= end) continue;
+            if (c->author != uid || c->copied || c->time < start || c->time >= end) continue;
             CommitStats(r, k);
             t.commits++; t.adds += c->sAdds; t.dels += c->sDels;
             dayFiles += c->sFiles;
@@ -3082,6 +3108,7 @@ static void ShowRecoveryCode(User *u, bool afterReset)
 }
 
 static void OpenProfile(int id);
+static int  ForkCount(Repo *r);
 
 static void GoHome(void)
 {
@@ -3401,7 +3428,7 @@ static void DrawContributions(Rectangle area, int uid, long long *hoverDay)
             bool isCommit = k < r->commitCount;
             int author    = isCommit ? r->commits[k].author : r->issues[k - r->commitCount].author;
             long long t   = isCommit ? r->commits[k].time   : r->issues[k - r->commitCount].time;
-            if (author != uid) continue;
+            if (author != uid || (isCommit && r->commits[k].copied)) continue;
             int pos = todayPos - DaysBetween(DayStart(t), today);
             if (pos >= 0 && pos <= todayPos) { counts[pos]++; total++; }
         }
@@ -3885,7 +3912,7 @@ static void ScreenProfile(void)
         Repo *r = &repos[i];
         if (r->owner == u->id) { nRepos++; nStars += r->starCount; nOpen += OpenIssues(r); }
         if (HasStarred(r, u->id)) nStarred++;
-        for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author == u->id) nCommits++;
+        for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author == u->id && !r->commits[k].copied) nCommits++;
         for (int k = 0; k < r->issueCount;  k++) if (r->issues[k].author  == u->id) nIssues++;
     }
     DrawLine(20, y, 300, y, UI_BORDER);
@@ -4012,13 +4039,16 @@ static void ScreenProfile(void)
         DrawBold(r->name, tx, (int)card.y + 12, FS, UI_LINK);
         tx += MeasureText(r->name, FS) + 16;
         if (IsCollab(r, curUser)) { DrawText("collaborator", tx, (int)card.y + 12, FS, UI_MUTED); tx += MeasureText("collaborator", FS) + 16; }
+        if (r->isFork) { DrawText("fork", tx, (int)card.y + 12, FS, UI_MUTED); tx += MeasureText("fork", FS) + 16; }
         if (HasStarred(r, curUser)) DrawText("starred", tx, (int)card.y + 12, FS, UI_YELLOW);
 
         DrawFit(r->desc[0] ? r->desc : "No description", (int)card.x + 18, (int)card.y + 38, FS, (int)card.width - 36, UI_MUTED);
-        DrawFit(TextFormat("%d commit%s   |   %d open issue%s   |   %d star%s   |   updated %s",
+        int nf = ForkCount(r);
+        DrawFit(TextFormat("%d commit%s   |   %d open issue%s   |   %d star%s   |   %d fork%s   |   updated %s",
                            r->commitCount, r->commitCount == 1 ? "" : "s",
                            OpenIssues(r), OpenIssues(r) == 1 ? "" : "s",
                            r->starCount, r->starCount == 1 ? "" : "s",
+                           nf, nf == 1 ? "" : "s",
                            TimeAgo(LastActivity(r))),
                 (int)card.x + 18, (int)card.y + 62, FS, (int)card.width - 36, UI_MUTED);
         if (Hover(la) && Clicked(card)) { EndScissorMode(); OpenRepo(order[k]); return; }
@@ -4355,11 +4385,9 @@ static const Color PIE_COLORS[6] = {
 };
 static const Color PIE_OTHER = {0x6e, 0x76, 0x81, 255};
 
-/* lines = lines added + lines removed: every changed line counts as work, so removing
-   14 lines counts the same as adding 14. A slice's size comes from lines. */
-typedef struct { int user; int commits; int adds, dels, lines; Color color; int people; } Share;   /* user -1 = "Others" */
+typedef struct { int user; int commits; int adds; Color color; int people; } Share;   /* user -1 = "Others" */
 static Share shares[6];
-static int   shareCount, shareTotal;    /* shareTotal = all lines changed, by everyone */
+static int   shareCount, shareTotal;
 
 /* Owner, collaborators, then anyone else who has committed (former
    collaborators, or deleted accounts that show as "ghost"). */
@@ -4375,14 +4403,14 @@ static void BuildShares(Repo *r)
 
     shareCount = shareTotal = 0;
     for (int i = 0; i < n; i++) {
-        int c = 0, a = 0, d = 0;
+        int c = 0, a = 0;
         for (int k = 0; k < r->commitCount; k++)
-            if (r->commits[k].author == ids[i]) { c++; CommitStats(r, k); a += r->commits[k].sAdds; d += r->commits[k].sDels; }
-        shareTotal += a + d;
-        if (n <= 6 || i < 5) shares[shareCount++] = (Share){ids[i], c, a, d, a + d, PIE_COLORS[i], 1};
+            if (r->commits[k].author == ids[i]) { c++; CommitStats(r, k); a += r->commits[k].sAdds; }
+        shareTotal += c;
+        if (n <= 6 || i < 5) shares[shareCount++] = (Share){ids[i], c, a, PIE_COLORS[i], 1};
         else {
-            if (shareCount == 5) shares[shareCount++] = (Share){-1, 0, 0, 0, 0, PIE_OTHER, 0};
-            shares[5].commits += c; shares[5].adds += a; shares[5].dels += d; shares[5].lines += a + d; shares[5].people++;
+            if (shareCount == 5) shares[shareCount++] = (Share){-1, 0, 0, PIE_OTHER, 0};
+            shares[5].commits += c; shares[5].adds += a; shares[5].people++;
         }
     }
 }
@@ -4437,7 +4465,7 @@ static int Percent(int part, int total) { return total ? (part * 100 + total / 2
    under the mouse (it's drawn slightly bigger), or -1. */
 static int DrawPie(Vector2 c, float rad)
 {
-    if (shareTotal == 0) {                      /* no lines changed yet: an empty ring */
+    if (shareTotal == 0) {                      /* nobody has committed yet: an empty ring */
         DrawRing(c, rad - 3, rad, 0, 360, 48, UI_BORDER);
         return -1;
     }
@@ -4450,16 +4478,16 @@ static int DrawPie(Vector2 c, float rad)
     int hov = -1, slices = 0;
     float a = -90;
     for (int i = 0; i < shareCount; i++) {
-        if (!shares[i].lines) continue;
+        if (!shares[i].commits) continue;
         slices++;
-        float sweep = 360.0f * shares[i].lines / shareTotal;
+        float sweep = 360.0f * shares[i].commits / shareTotal;
         if (inside && mang >= a && mang < a + sweep) hov = i;
         a += sweep;
     }
     a = -90;
     for (int i = 0; i < shareCount; i++) {
-        if (!shares[i].lines) continue;
-        float sweep = 360.0f * shares[i].lines / shareTotal;
+        if (!shares[i].commits) continue;
+        float sweep = 360.0f * shares[i].commits / shareTotal;
         float rr = i == hov ? rad + 4 : rad;
         DrawCircleSector(c, rr, a, a + sweep, (int)(sweep / 3) + 4, shares[i].color);
         a += sweep;
@@ -4468,10 +4496,10 @@ static int DrawPie(Vector2 c, float rad)
         Color gap = {22, 27, 34, 255};
         a = -90;
         for (int i = 0; i < shareCount; i++) {
-            if (!shares[i].lines) continue;
+            if (!shares[i].commits) continue;
             Vector2 e = {c.x + cosf(a * DEG2RAD) * (rad + 6), c.y + sinf(a * DEG2RAD) * (rad + 6)};
             DrawLineEx(c, e, 2, gap);
-            a += 360.0f * shares[i].lines / shareTotal;
+            a += 360.0f * shares[i].commits / shareTotal;
         }
     }
     return hov;
@@ -4481,8 +4509,8 @@ static void ShareTip(int i)
 {
     Share *s = &shares[i];
     SetTip(ShareName(s),
-           TextFormat("%d line%s changed  (%d%%)", s->lines, s->lines == 1 ? "" : "s", Percent(s->lines, shareTotal)),
-           TextFormat("+%d added, -%d removed, in %d commit%s", s->adds, s->dels, s->commits, s->commits == 1 ? "" : "s"));
+           TextFormat("%d commit%s  (%d%%)", s->commits, s->commits == 1 ? "" : "s", Percent(s->commits, shareTotal)),
+           TextFormat("+%d lines added", s->adds));
 }
 
 /* The little pie in a repository's header. Returns true if it was clicked. */
@@ -4631,7 +4659,7 @@ static void TabPeople(Repo *r)
         return;
     }
     BuildShares(r);
-    DrawFit(TextFormat("by lines changed (added + removed)  |  %d in total", shareTotal), (int)rx + 18, (int)card.y + 42, FS, (int)rw - 36, UI_MUTED);
+    DrawText(TextFormat("by number of commits  |  %d in total", shareTotal), (int)rx + 18, (int)card.y + 42, FS, UI_MUTED);
     float rad = fminf(rw * 0.3f, 100);
     Vector2 c = {rx + rw / 2, card.y + 84 + rad};
     int h = DrawPie(c, rad);
@@ -4643,13 +4671,266 @@ static void TabPeople(Repo *r)
         Share *s = &shares[i];
         DrawRectangleRounded((Rectangle){rx + 18, ky + 3, 14, 14}, 0.3f, 4, s->color);
         DrawFit(ShareName(s), (int)rx + 42, (int)ky, FS, (int)(rw * 0.42f), UI_TEXT);
-        const char *val = TextFormat("%d line%s  %d%%", s->lines, s->lines == 1 ? "" : "s", Percent(s->lines, shareTotal));
+        const char *val = TextFormat("%d commit%s  %d%%", s->commits, s->commits == 1 ? "" : "s", Percent(s->commits, shareTotal));
         DrawText(val, (int)(rx + rw - 18) - MeasureText(val, FS), (int)ky, FS, UI_MUTED);
         ky += 30;
     }
 }
 
 /* Returns true if the repository was deleted or we left it (so stop drawing it). */
+/* ------------------------------------------------------------------ */
+/* Forks                                                              */
+/*                                                                    */
+/* A fork is a full copy of someone else's repository - every commit  */
+/* and every blob - that now belongs to you. The commits keep their   */
+/* ids, so later we can tell which commits both repositories share:  */
+/*                                                                    */
+/*   original:  A - B - C - D - E          forkBase = C (copied up to) */
+/*   fork:      A - B - C - X               X = your own commit       */
+/*                                                                    */
+/*   behind = commits of the original after forkBase (D, E)  = 2      */
+/*   ahead  = commits of the fork the original doesn't have (X) = 1   */
+/*                                                                    */
+/* Sync fork: if you're not ahead, D and E are simply copied across   */
+/* ("fast-forward"). If you are, the two sides are combined file by   */
+/* file into one new "merge" commit (a three-way merge, using C as    */
+/* the common starting point).                                        */
+/* ------------------------------------------------------------------ */
+static int FindRepoOf(int owner, const char *name)
+{
+    for (int i = 0; i < repoCount; i++)
+        if (repos[i].owner == owner && EqualsCI(repos[i].name, name)) return i;
+    return -1;
+}
+
+static int CommitIndexById(Repo *r, const char *id)
+{
+    for (int k = 0; k < r->commitCount; k++) if (strcmp(r->commits[k].id, id) == 0) return k;
+    return -1;
+}
+
+static bool IsForkOf(Repo *fork, Repo *orig)
+{
+    return fork->isFork && fork->forkOwner == orig->owner && EqualsCI(fork->forkName, orig->name);
+}
+
+/* The original a fork came from (its index), or -1 if it isn't a fork or the original is gone. */
+static int Upstream(Repo *r) { return r->isFork ? FindRepoOf(r->forkOwner, r->forkName) : -1; }
+
+static int ForkCount(Repo *r)
+{
+    int n = 0;
+    for (int i = 0; i < repoCount; i++) if (IsForkOf(&repos[i], r)) n++;
+    return n;
+}
+
+/* uid's fork of repos[orig], or -1 */
+static int FindForkOf(int uid, int orig)
+{
+    for (int i = 0; i < repoCount; i++)
+        if (repos[i].owner == uid && IsForkOf(&repos[i], &repos[orig])) return i;
+    return -1;
+}
+
+typedef struct {
+    int  up;        /* index of the original, -1 = gone                        */
+    bool related;   /* the original still has the commit this fork started from */
+    int  base;      /* index of that commit in the original (-1 = none)         */
+    int  behind;    /* the original's commits this fork doesn't have yet        */
+    int  ahead;     /* this fork's commits the original doesn't have            */
+} ForkState;
+
+static ForkState GetForkState(Repo *r)
+{
+    ForkState s = {-1, false, -1, 0, 0};
+    s.up = Upstream(r);
+    if (s.up < 0) return s;
+    Repo *p = &repos[s.up];
+    s.base    = r->forkBase[0] ? CommitIndexById(p, r->forkBase) : -1;
+    s.related = !r->forkBase[0] || s.base >= 0;
+    if (!s.related) return s;
+    s.behind = p->commitCount - (s.base + 1);
+    for (int k = 0; k < r->commitCount; k++)
+        if (CommitIndexById(p, r->commits[k].id) < 0) s.ahead++;
+    return s;
+}
+
+/* Copies commit ci of src onto the end of dst. Blob numbers differ between
+   repositories, so each file's contents are stored again in dst (InternBlob
+   reuses a blob when dst already has the same contents). */
+static bool CopyCommit(Repo *dst, Repo *src, int ci)
+{
+    if (dst->commitCount >= MAX_COMMITS) return false;
+    Commit c = src->commits[ci];
+    for (int j = 0; j < c.fileCount; j++) {
+        int b = InternBlob(dst, src->blobs[c.blobs[j]].data, src->blobs[c.blobs[j]].len);
+        if (b < 0) return false;
+        c.blobs[j] = b;
+    }
+    c.copied    = true;
+    c.statsDone = false;
+    dst->commits[dst->commitCount++] = c;
+    return true;
+}
+
+static void TryForkRepo(int orig)
+{
+    Repo *p = &repos[orig];
+    int mineAlready = FindForkOf(curUser, orig);
+    if (mineAlready >= 0) { OpenRepo(mineAlready); Toast("You already have a fork of this repository - here it is"); return; }
+    if (repoCount >= MAX_REPOS) { Toast("This computer has reached the maximum number of repositories"); return; }
+
+    /* same name if it's free, otherwise name-fork, name-fork-2, ... */
+    char nm[NAME_LEN];
+    snprintf(nm, NAME_LEN, "%s", p->name);
+    for (int n = 1; FindRepoOf(curUser, nm) >= 0; n++)
+        snprintf(nm, NAME_LEN, n == 1 ? "%.50s-fork" : "%.50s-fork-%d", p->name, n);
+
+    Repo *r = NewRepo(curUser, nm, p->desc);       /* p is still valid: repos[] never moves */
+    r->isFork    = true;
+    r->forkOwner = p->owner;
+    snprintf(r->forkName, NAME_LEN, "%s", p->name);
+    snprintf(r->forkBase, sizeof r->forkBase, "%s", p->commitCount ? Head(p)->id : "");
+    for (int k = 0; k < p->commitCount; k++)
+        if (!CopyCommit(r, p, k)) {
+            DeleteRepo(repoCount - 1);
+            Toast("Couldn't copy that repository - it's too big");
+            return;
+        }
+    MarkDirty();
+    OpenRepo(repoCount - 1);
+    Toast(TextFormat("Forked %s / %s - this copy is yours to change", UserName(p->owner), p->name));
+}
+
+/* A file's contents in a commit ("has" = false: the file isn't there). */
+typedef struct { bool has; const char *data; int len; } Version;
+static Version VersionIn(Repo *r, Commit *c, const char *name)
+{
+    Version v = {false, NULL, 0};
+    int k = c ? FindInCommit(c, name) : -1;
+    if (k >= 0) { v.has = true; v.data = r->blobs[c->blobs[k]].data; v.len = r->blobs[c->blobs[k]].len; }
+    return v;
+}
+static bool SameVersion(Version a, Version b)
+{
+    if (a.has != b.has) return false;
+    return !a.has || (a.len == b.len && memcmp(a.data, b.data, (size_t)a.len) == 0);
+}
+
+/* Brings the original's new commits into fork r.
+   Returns NULL on success (and a message for the user in *done), or an error. */
+static const char *SyncFork(Repo *r, char *done, int doneCap)
+{
+    ForkState s = GetForkState(r);
+    if (s.up < 0)     return "The original repository has been deleted";
+    if (!s.related)   return "The original repository's history no longer matches this fork";
+    if (!s.behind)    return "Already up to date";
+    Repo *p = &repos[s.up];
+    const char *who = TextFormat("%s / %s", UserName(p->owner), p->name);
+
+    /* 1) fast-forward: you haven't committed anything of your own, so just copy their new commits */
+    if (s.ahead == 0) {
+        if (r->commitCount + s.behind > MAX_COMMITS) return "This fork has reached its commit limit";
+        for (int k = s.base + 1; k < p->commitCount; k++) {
+            if (!CopyCommit(r, p, k)) return "This fork is out of storage space";
+            snprintf(r->forkBase, sizeof r->forkBase, "%s", p->commits[k].id);
+        }
+        snprintf(done, (size_t)doneCap, "Synced: copied %d commit%s from %s", s.behind, s.behind == 1 ? "" : "s", who);
+        return NULL;
+    }
+
+    /* 2) three-way merge. For every file, compare
+            base   = the original at forkBase (where the two histories split)
+            theirs = the original now
+            ours   = this fork now
+          If only one side changed the file, take that side. If both made the
+          same change, fine. If both changed it differently, that's a conflict. */
+    Commit *cb = s.base >= 0 ? &p->commits[s.base] : NULL, *ct = Head(p), *co = Head(r);
+    const char *names[MAX_FILES * 3];
+    int nn = 0;
+    Commit *sides[3] = {co, ct, cb};
+    for (int sd = 0; sd < 3; sd++)
+        for (int j = 0; sides[sd] && j < sides[sd]->fileCount; j++) {
+            bool seen = false;
+            for (int q = 0; q < nn; q++) if (strcmp(names[q], sides[sd]->names[j]) == 0) seen = true;
+            if (!seen) names[nn++] = sides[sd]->names[j];
+        }
+
+    /* first pass: decide every file, and stop before changing anything if there's a conflict */
+    char pick[MAX_FILES * 3];      /* 'o' ours, 't' theirs */
+    int  conflicts = 0, keep = 0;
+    const char *firstConflict = NULL;
+    bool changesOurs = false;
+    for (int q = 0; q < nn; q++) {
+        Version b = VersionIn(p, cb, names[q]), t = VersionIn(p, ct, names[q]), o = VersionIn(r, co, names[q]);
+        if      (SameVersion(o, t) || SameVersion(b, t)) pick[q] = 'o';   /* nothing new from them   */
+        else if (SameVersion(b, o))                      pick[q] = 't';   /* only they changed it    */
+        else { pick[q] = '!'; if (!conflicts++) firstConflict = names[q]; continue; }
+        if (pick[q] == 't') changesOurs = true;
+        if ((pick[q] == 'o' ? o : t).has) keep++;
+    }
+    if (conflicts)
+        return TextFormat("Can't merge: you and %s both changed %s%s", UserName(p->owner), firstConflict,
+                          conflicts > 1 ? TextFormat(" (and %d more file%s)", conflicts - 1, conflicts == 2 ? "" : "s") : "");
+    if (keep > MAX_FILES) return TextFormat("The merged repository would have more than %d files", MAX_FILES);
+
+    /* nothing of theirs to bring in (e.g. you'd already made the same changes): just remember we're level */
+    if (!changesOurs) {
+        snprintf(r->forkBase, sizeof r->forkBase, "%s", ct->id);
+        snprintf(done, (size_t)doneCap, "Up to date: you already have everything from %s", who);
+        return NULL;
+    }
+    if (r->commitCount >= MAX_COMMITS) return "This fork has reached its commit limit";
+
+    /* second pass: build the merge commit */
+    Commit m;
+    memset(&m, 0, sizeof m);
+    for (int q = 0; q < nn; q++) {
+        Version v = pick[q] == 'o' ? VersionIn(r, co, names[q]) : VersionIn(p, ct, names[q]);
+        if (!v.has) continue;                                           /* deleted on the winning side */
+        int bl = InternBlob(r, v.data, v.len);
+        if (bl < 0) return "This fork is out of storage space";
+        snprintf(m.names[m.fileCount], NAME_LEN, "%s", names[q]);
+        m.blobs[m.fileCount++] = bl;
+    }
+    FinishCommit(r, &m, TextFormat("Merge %d commit%s from %s", s.behind, s.behind == 1 ? "" : "s", who));
+    snprintf(r->forkBase, sizeof r->forkBase, "%s", ct->id);
+    snprintf(done, (size_t)doneCap, "Merged %d commit%s from %s into a new commit", s.behind, s.behind == 1 ? "" : "s", who);
+    return NULL;
+}
+
+/* The strip at the top of a fork's Code tab: where it came from, ahead / behind, and Sync. */
+static float DrawForkBar(Repo *r, float top)
+{
+    if (!r->isFork) return top;
+    Rectangle bar = {20, top, (float)W - 40, 46};
+    ForkState s = GetForkState(r);
+    bool canSync = CanEdit(r) && s.up >= 0 && s.related && s.behind > 0;
+    Color edge = canSync ? UI_YELLOW : UI_BORDER;
+    DrawRectangleRec(bar, UI_PANEL);
+    DrawRectangleLinesEx(bar, 1, edge);
+
+    const char *from = TextFormat("%s / %s", UserName(r->forkOwner), r->forkName);
+    const char *msg;
+    if (s.up < 0)                 msg = TextFormat("Forked from %s, which has since been deleted.", from);
+    else if (!s.related)          msg = TextFormat("Forked from %s, but its history no longer matches this fork.", from);
+    else if (!s.ahead && !s.behind) msg = TextFormat("This fork is up to date with %s.", from);
+    else if (!s.behind)           msg = TextFormat("This fork is %d commit%s ahead of %s.", s.ahead, s.ahead == 1 ? "" : "s", from);
+    else if (!s.ahead)            msg = TextFormat("This fork is %d commit%s behind %s.", s.behind, s.behind == 1 ? "" : "s", from);
+    else                          msg = TextFormat("This fork is %d commit%s ahead of and %d behind %s.",
+                                                   s.ahead, s.ahead == 1 ? "" : "s", s.behind, from);
+    float bw = canSync ? 150 : 0;
+    DrawFit(msg, (int)bar.x + 16, (int)bar.y + 13, FS, (int)(bar.width - 32 - bw - 12), canSync ? UI_TEXT : UI_MUTED);
+
+    if (canSync && Button((Rectangle){bar.x + bar.width - 8 - bw, bar.y + 5, bw, 36}, "Sync fork", UI_GREEN)) {
+        char done[TEXT_LEN] = "";
+        const char *err = SyncFork(r, done, sizeof done);
+        if (err) Toast(err);
+        else { Toast(done); ForgetScratch(); MarkDirty(); }
+    }
+    return top + 46 + 12;
+}
+
 static bool DrawRepoHeader(Repo *r, int activeTab)
 {
     int x = 20, y = 72;
@@ -4665,8 +4946,30 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
     Rectangle pill = {(float)(x + w1 + w2 + w3 + 16), (float)y + 2, (float)MeasureText(badge, FS) + 20, 26};
     DrawRectangleRounded(pill, 0.5f, 6, UI_BTN);
     DrawText(badge, (int)pill.x + 10, (int)pill.y + 3, FS, UI_MUTED);
-    DrawFit(r->desc[0] ? r->desc : "No description", x, y + 40, FS, W - 400, UI_MUTED);
     if (Clicked(ownerHit)) { OpenProfile(r->owner); return true; }
+
+    /* next to the badge: how many people have forked this */
+    int forks = ForkCount(r), ix = (int)(pill.x + pill.width + 16);
+    if (forks && W - 570 - ix > 80) DrawText(TextFormat("%d fork%s", forks, forks == 1 ? "" : "s"), ix, y + 5, FS, UI_MUTED);
+
+    /* under the name: "forked from owner / name" (click to open the original), then the description */
+    int dx = x, dmax = W - 400;
+    if (r->isFork) {
+        int up = Upstream(r);
+        const char *pre = "forked from ";
+        const char *src = TextFormat("%s / %s", UserName(r->forkOwner), r->forkName);
+        int pw = MeasureText(pre, FS), sw = MeasureText(src, FS);
+        DrawText(pre, dx, y + 40, FS, UI_MUTED);
+        DrawText(src, dx + pw, y + 40, FS, up >= 0 ? UI_LINK : UI_MUTED);
+        Rectangle hit = {(float)(dx + pw), (float)y + 36, (float)sw, FS + 8};
+        if (up >= 0 && Hover(hit)) { wantCursor = MOUSE_CURSOR_POINTING_HAND; DrawLine((int)hit.x, y + 41 + FS, (int)(hit.x + hit.width), y + 41 + FS, UI_LINK); }
+        if (up >= 0 && Clicked(hit)) { OpenRepo(up); return true; }
+        const char *gap = "   |   ";
+        DrawText(gap, dx + pw + sw, y + 40, FS, UI_MUTED);
+        dx += pw + sw + MeasureText(gap, FS);
+        dmax -= dx - x;
+    }
+    if (dmax > 40) DrawFit(r->desc[0] ? r->desc : "No description", dx, y + 40, FS, dmax, UI_MUTED);
 
     bool starred = HasStarred(r, curUser);
     if (Button((Rectangle){(float)W - 170, (float)y, 150, 38},
@@ -4676,6 +4979,14 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
         MarkDirty();
     }
     if (Button((Rectangle){(float)W - (mine ? 550 : 360), (float)y, 180, 38}, "Download ZIP", UI_BTN)) DownloadRepo(r);
+    if (!mine) {                       /* you can't fork your own repository - you already own it */
+        int myFork = FindForkOf(curUser, curRepo);
+        if (Button((Rectangle){(float)W - 550, (float)y, 180, 38},
+                   myFork >= 0 ? "Your fork" : TextFormat("Fork  %d", ForkCount(r)), UI_BTN)) {
+            TryForkRepo(curRepo);
+            return true;
+        }
+    }
     if (mine && ConfirmButton((Rectangle){(float)W - 360, (float)y, 180, 38}, "Delete repo", "Really delete?", 1)) {
         int i = curRepo;
         GoHome();
@@ -5241,6 +5552,7 @@ static void TabCode(Repo *r)
 {
     bool edit = CanEdit(r);
     float top = 186, bottom = (float)H - 20;
+    top = DrawForkBar(r, top);
     if (edit) DraftTidy(r, curUser);
     BuildView(r, edit ? curUser : -1);
 
@@ -5378,8 +5690,8 @@ static void TabCode(Repo *r)
     if (!edit) {
         const char *o = UserName(r->owner);
         const char *note = r->collabCount
-            ? TextFormat("You're viewing the latest commit. Only %s and their collaborators can change this repository.", o)
-            : TextFormat("You're viewing %s's latest commit. Only %s can change this repository.", o, o);
+            ? TextFormat("Only %s and their collaborators can change this. Press Fork to get your own copy.", o)
+            : TextFormat("Only %s can change this. Press Fork to get your own copy.", o);
         DrawFit(note, (int)cb.x, (int)cb.y + 14, FS, (int)cb.width, UI_MUTED);
         return;
     }
@@ -5832,9 +6144,7 @@ int main(void)
         if (armedId && (armedT -= dt) <= 0) armedId = 0;
 
         /* the signed-in user's theme: its colour, and see-through panels if it draws a background */
-        int bgTheme = curUser < 0 ? THEME_CLASSIC
-                    : screen == SCR_PROFILE && FindUserById(viewUser) ? UserTheme(viewUser)   /* their page, their theme */
-                    : UserTheme(curUser);
+        int bgTheme = curUser >= 0 ? UserTheme(curUser) : THEME_CLASSIC;
         uiAccent = THEMES[bgTheme].accent;
         unsigned char see = bgTheme == THEME_CLASSIC ? 255 : 215;
         UI_PANEL.a = see;
