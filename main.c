@@ -35,10 +35,19 @@
  *     repositories (or everyone's), with a search box and a New button
  *   - A contribution graph of the last six months: hover a day to see what you
  *     did, click it to open a page listing every commit and issue from that day
+ *   - Real git: every repository is a real git repository too. Mini GitHub runs
+ *     a small git server on this computer only (http://localhost:7979), so
+ *     git clone, git pull, git fetch and git push all work. Pushing needs your
+ *     Mini GitHub username and password, and only the owner and collaborators
+ *     may push. Press "Code" on a repository for its address; Settings > Git
+ *     explains the rest. Commits keep git's own fingerprints (SHA-1), files are
+ *     kept byte for byte, and folders show as a tree you can open and close.
  *
  * Everything is saved automatically to "minigithub.dat" in the folder the
- * program is run from. A save file from before accounts existed is upgraded
- * automatically: the first account created takes over its repositories.
+ * program is run from. Older save files are upgraded automatically (a copy of
+ * the old file is kept as minigithub.dat.v6-backup or similar). A save file
+ * from before accounts existed: the first account created takes over its
+ * repositories.
  *
  * Language: C99    Library: raylib 5.x    One file, nothing else needed.
  */
@@ -54,6 +63,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <ctype.h>
 #include <time.h>
 #include <math.h>
@@ -63,11 +73,13 @@
 /* ------------------------------------------------------------------ */
 #define MAX_USERS    32
 #define MAX_REPOS    48
-#define MAX_FILES    32
-#define MAX_COMMITS  200
-#define MAX_BLOBS    1024
+#define MAX_FILES    5000     /* files in one commit                           */
+#define MAX_COMMITS  100000   /* commits in one repository                     */
+#define MAX_BLOBS    2000000  /* different file versions in one repository     */
+#define MAX_DRAFT    500      /* files one person can change before committing */
 #define MAX_ISSUES   100
 #define NAME_LEN     64
+#define PATH_LEN     256      /* longest file path, e.g. "src/ui/button.c"     */
 #define TEXT_LEN     160
 #define MAX_UPLOAD   (10 * 1024 * 1024)   /* biggest file you can upload: 10 MB */
 #define SAVE_FILE    "minigithub.dat"
@@ -100,6 +112,462 @@ static const Color UI_YELLOW = {210, 153,  34, 255};
 static const Color UI_PURPLE = {137,  87, 229, 255};
 static const Color UI_ORANGE = {247, 129, 102, 255};
 
+#define FNV_START 2166136261u
+static uint32_t Fnv(const char *s, int n, uint32_t h)
+{
+    for (int i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+    return h;
+}
+
+/* ------------------------------------------------------------------ */
+/* Git's building blocks                                              */
+/*                                                                    */
+/* Real git names every piece of a repository by a SHA-1 fingerprint  */
+/* of its contents. There are three kinds of piece ("object"):        */
+/*   blob   - one version of one file's bytes                         */
+/*   tree   - one folder: a list of names, each pointing at a blob    */
+/*            (a file) or another tree (a folder inside it)           */
+/*   commit - a tree (the snapshot), the commit(s) before it, who     */
+/*            made it, when, and the message                          */
+/* Mini GitHub stores things the same way, with the same fingerprints, */
+/* so real git can push to it and clone from it.                      */
+/* ------------------------------------------------------------------ */
+
+/* An array that grows as needed (doubling). Returns the new pointer. */
+static void *GrowArr(void *p, int *cap, int need, size_t item)
+{
+    if (need <= *cap) return p;
+    int c = *cap ? *cap : 16;
+    while (c < need) c *= 2;
+    void *q = realloc(p, (size_t)c * item);
+    if (!q) return p;
+    memset((char *)q + (size_t)*cap * item, 0, (size_t)(c - *cap) * item);
+    *cap = c;
+    return q;
+}
+
+/* A growing buffer of bytes. */
+typedef struct { uint8_t *d; size_t n, cap; bool oom; } Buf;
+static void BufNeed(Buf *b, size_t more)
+{
+    if (b->oom) return;
+    if (b->n + more <= b->cap) return;
+    size_t c = b->cap ? b->cap : 256;
+    while (c < b->n + more) c *= 2;
+    uint8_t *q = realloc(b->d, c);
+    if (!q) { b->oom = true; return; }
+    b->d = q; b->cap = c;
+}
+static void BufAdd(Buf *b, const void *p, size_t n) { BufNeed(b, n); if (b->oom) return; memcpy(b->d + b->n, p, n); b->n += n; }
+static void BufStr(Buf *b, const char *s) { BufAdd(b, s, strlen(s)); }
+static void BufByte(Buf *b, uint8_t c) { BufAdd(b, &c, 1); }
+static void BufFree(Buf *b) { free(b->d); memset(b, 0, sizeof *b); }
+
+/* ---------- SHA-1 ---------- */
+typedef struct { uint32_t h[5]; uint8_t buf[64]; uint64_t len; int n; } Sha1;
+#define ROL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+static void Sha1Block(Sha1 *s, const uint8_t *p)
+{
+    uint32_t w[80];
+    for (int i = 0; i < 16; i++) w[i] = (uint32_t)p[i * 4] << 24 | (uint32_t)p[i * 4 + 1] << 16 | (uint32_t)p[i * 4 + 2] << 8 | p[i * 4 + 3];
+    for (int i = 16; i < 80; i++) w[i] = ROL(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    uint32_t a = s->h[0], b = s->h[1], c = s->h[2], d = s->h[3], e = s->h[4];
+    for (int i = 0; i < 80; i++) {
+        uint32_t f, k;
+        if (i < 20)      { f = (b & c) | (~b & d);           k = 0x5A827999; }
+        else if (i < 40) { f = b ^ c ^ d;                    k = 0x6ED9EBA1; }
+        else if (i < 60) { f = (b & c) | (b & d) | (c & d);  k = 0x8F1BBCDC; }
+        else             { f = b ^ c ^ d;                    k = 0xCA62C1D6; }
+        uint32_t t = ROL(a, 5) + f + e + k + w[i];
+        e = d; d = c; c = ROL(b, 30); b = a; a = t;
+    }
+    s->h[0] += a; s->h[1] += b; s->h[2] += c; s->h[3] += d; s->h[4] += e;
+}
+static void Sha1Init(Sha1 *s)
+{
+    s->h[0] = 0x67452301; s->h[1] = 0xEFCDAB89; s->h[2] = 0x98BADCFE; s->h[3] = 0x10325476; s->h[4] = 0xC3D2E1F0;
+    s->len = 0; s->n = 0;
+}
+static void Sha1Update(Sha1 *s, const void *data, size_t len)
+{
+    const uint8_t *p = data;
+    s->len += len;
+    if (s->n) {
+        while (len && s->n < 64) { s->buf[s->n++] = *p++; len--; }
+        if (s->n == 64) { Sha1Block(s, s->buf); s->n = 0; }
+    }
+    while (len >= 64) { Sha1Block(s, p); p += 64; len -= 64; }
+    while (len) { s->buf[s->n++] = *p++; len--; }
+}
+static void Sha1Final(Sha1 *s, uint8_t out[20])
+{
+    uint64_t bits = s->len * 8;
+    uint8_t pad = 0x80, zero = 0;
+    Sha1Update(s, &pad, 1);
+    while (s->n != 56) Sha1Update(s, &zero, 1);
+    uint8_t L[8];
+    for (int i = 0; i < 8; i++) L[i] = (uint8_t)(bits >> (56 - 8 * i));
+    Sha1Update(s, L, 8);
+    for (int i = 0; i < 5; i++) {
+        out[i * 4] = (uint8_t)(s->h[i] >> 24); out[i * 4 + 1] = (uint8_t)(s->h[i] >> 16);
+        out[i * 4 + 2] = (uint8_t)(s->h[i] >> 8); out[i * 4 + 3] = (uint8_t)s->h[i];
+    }
+}
+
+/* The fingerprint git gives an object: SHA-1 of "<kind> <size>\0" + the contents. */
+static void ObjectSha(const char *kind, const void *data, size_t len, uint8_t out[20])
+{
+    char head[48];
+    int hn = snprintf(head, sizeof head, "%s %zu", kind, len);
+    Sha1 s;
+    Sha1Init(&s);
+    Sha1Update(&s, head, (size_t)hn + 1);      /* + the zero byte after it */
+    Sha1Update(&s, data, len);
+    Sha1Final(&s, out);
+}
+
+static const uint8_t ZERO_SHA[20];
+static void ShaHex(const uint8_t sha[20], char out[41])
+{
+    static const char *hx = "0123456789abcdef";
+    for (int i = 0; i < 20; i++) { out[i * 2] = hx[sha[i] >> 4]; out[i * 2 + 1] = hx[sha[i] & 15]; }
+    out[40] = 0;
+}
+/* Reads 40 hex characters; false if they aren't. */
+static bool ParseHex40(const char *s, uint8_t out[20])
+{
+    for (int i = 0; i < 40; i++) if (!isxdigit((unsigned char)s[i])) return false;
+    for (int i = 0; i < 20; i++) {
+        int a = s[i * 2], b = s[i * 2 + 1];
+        a = a <= '9' ? a - '0' : (a | 32) - 'a' + 10;
+        b = b <= '9' ? b - '0' : (b | 32) - 'a' + 10;
+        out[i] = (uint8_t)(a << 4 | b);
+    }
+    return true;
+}
+
+/* ---------- looking things up by fingerprint ----------
+   A hash table from a SHA-1 to a number (which blob, which commit...). */
+typedef struct { uint8_t sha[20]; int idx; } ShaSlot;
+typedef struct { ShaSlot *s; int cap, used; } ShaMap;
+
+static uint32_t ShaKey(const uint8_t *s) { return (uint32_t)s[0] | (uint32_t)s[1] << 8 | (uint32_t)s[2] << 16 | (uint32_t)s[3] << 24; }
+static int MapGet(const ShaMap *m, const uint8_t *sha)
+{
+    if (!m->cap) return -1;
+    for (uint32_t i = ShaKey(sha) & (uint32_t)(m->cap - 1);; i = (i + 1) & (uint32_t)(m->cap - 1)) {
+        if (m->s[i].idx < 0) return -1;
+        if (memcmp(m->s[i].sha, sha, 20) == 0) return m->s[i].idx;
+    }
+}
+static void MapPut(ShaMap *m, const uint8_t *sha, int idx)
+{
+    if ((m->used + 1) * 2 > m->cap) {                      /* keep it at most half full */
+        ShaMap n = {0};
+        n.cap = m->cap ? m->cap * 2 : 64;
+        n.s = malloc((size_t)n.cap * sizeof(ShaSlot));
+        if (!n.s) return;
+        for (int i = 0; i < n.cap; i++) n.s[i].idx = -1;
+        for (int i = 0; i < m->cap; i++) if (m->s[i].idx >= 0) MapPut(&n, m->s[i].sha, m->s[i].idx);
+        free(m->s);
+        *m = n;
+    }
+    for (uint32_t i = ShaKey(sha) & (uint32_t)(m->cap - 1);; i = (i + 1) & (uint32_t)(m->cap - 1)) {
+        if (m->s[i].idx < 0) { memcpy(m->s[i].sha, sha, 20); m->s[i].idx = idx; m->used++; return; }
+        if (memcmp(m->s[i].sha, sha, 20) == 0) { m->s[i].idx = idx; return; }
+    }
+}
+static void MapFree(ShaMap *m) { free(m->s); memset(m, 0, sizeof *m); }
+
+/* ---------- file paths ----------
+   Every path ("src/main.c") is kept once and shared; commits just point at
+   it. That saves memory and lets paths be compared by pointer. */
+static char **ipool;
+static int    ipCount, ipCap, *ipTable, ipTableCap;
+static const char *Intern(const char *s)
+{
+    uint32_t h = Fnv(s, (int)strlen(s), FNV_START);
+    if ((ipCount + 1) * 2 > ipTableCap) {
+        int nc = ipTableCap ? ipTableCap * 2 : 1024;
+        int *t = malloc((size_t)nc * sizeof(int));
+        if (!t) return NULL;
+        for (int i = 0; i < nc; i++) t[i] = -1;
+        for (int k = 0; k < ipCount; k++) {
+            uint32_t j = Fnv(ipool[k], (int)strlen(ipool[k]), FNV_START) & (uint32_t)(nc - 1);
+            while (t[j] >= 0) j = (j + 1) & (uint32_t)(nc - 1);
+            t[j] = k;
+        }
+        free(ipTable);
+        ipTable = t; ipTableCap = nc;
+    }
+    uint32_t j = h & (uint32_t)(ipTableCap - 1);
+    for (; ipTable[j] >= 0; j = (j + 1) & (uint32_t)(ipTableCap - 1))
+        if (strcmp(ipool[ipTable[j]], s) == 0) return ipool[ipTable[j]];
+    ipool = GrowArr(ipool, &ipCap, ipCount + 1, sizeof(char *));
+    if (ipCount >= ipCap) return NULL;
+    size_t n = strlen(s);
+    char *c = malloc(n + 1);
+    if (!c) return NULL;
+    memcpy(c, s, n + 1);
+    ipool[ipCount] = c;
+    ipTable[j] = ipCount++;
+    return c;
+}
+
+/* Is this a sensible path for a file: "a/b.txt" yes; "", "/a", "a//b", "a/../b", "a/" no. */
+static bool ValidPath(const char *p)
+{
+    size_t n = strlen(p);
+    if (!n || n >= PATH_LEN || p[0] == '/' || p[n - 1] == '/') return false;
+    const char *s = p;
+    for (;;) {
+        const char *e = strchr(s, '/');
+        size_t len = e ? (size_t)(e - s) : strlen(s);
+        if (len == 0) return false;
+        if ((len == 1 && s[0] == '.') || (len == 2 && s[0] == '.' && s[1] == '.')) return false;
+        if (len == 4 && strncmp(s, ".git", 4) == 0) return false;
+        if (!e) break;
+        s = e + 1;
+    }
+    for (size_t i = 0; i < n; i++) if ((unsigned char)p[i] < 32 || p[i] == '\\') return false;
+    return true;
+}
+
+/* ---------- file modes ----------
+   Git remembers whether a file is a normal file, a program you can run,
+   or a "symbolic link" (a pointer to another path). */
+enum { MODE_FILE, MODE_EXEC, MODE_LINK };
+static const char *ModeText(int m) { return m == MODE_EXEC ? "100755" : m == MODE_LINK ? "120000" : "100644"; }
+
+/* ---------- unpacking (DEFLATE) ----------
+   Git squeezes every object with zlib (DEFLATE plus a small header and a
+   checksum). This undoes that, and also says how many bytes it used -
+   git's packs put objects back to back without saying where each ends. */
+typedef struct { uint16_t t[1 << 15]; } HTab;      /* lookup: 15 bits in -> symbol and code length */
+
+typedef struct {
+    const uint8_t *in; size_t inLen, pos;
+    uint64_t bb; int bc;                           /* bits waiting to be used */
+    Buf out; size_t maxOut;
+    bool err;
+} Inf;
+
+static void InfFill(Inf *s)
+{
+    while (s->bc <= 56) {
+        uint64_t byte = s->pos < s->inLen ? s->in[s->pos] : 0;   /* past the end: zeros (checked later) */
+        s->pos++;
+        s->bb |= byte << s->bc;
+        s->bc += 8;
+    }
+}
+static unsigned InfBits(Inf *s, int n)
+{
+    if (n == 0) return 0;
+    if (s->bc < n) InfFill(s);
+    unsigned v = (unsigned)(s->bb & ((1ull << n) - 1));
+    s->bb >>= n; s->bc -= n;
+    return v;
+}
+/* Builds the lookup table from each symbol's code length. False if the lengths make no sense. */
+static bool HBuild(HTab *h, const uint8_t *lens, int n)
+{
+    int count[16] = {0}, next[16];
+    for (int i = 0; i < n; i++) count[lens[i]]++;
+    count[0] = 0;
+    int left = 1;
+    for (int l = 1; l < 16; l++) { left <<= 1; left -= count[l]; if (left < 0) return false; }
+    int code = 0;
+    next[1] = 0;
+    for (int l = 1; l < 15; l++) { code = (code + count[l]) << 1; next[l + 1] = code; }
+    memset(h->t, 0, sizeof h->t);
+    for (int sym = 0; sym < n; sym++) {
+        int l = lens[sym];
+        if (!l) continue;
+        int c = next[l]++, rev = 0;
+        for (int k = 0; k < l; k++) rev |= ((c >> k) & 1) << (l - 1 - k);
+        for (int i = rev; i < (1 << 15); i += 1 << l) h->t[i] = (uint16_t)(sym | l << 9);
+    }
+    return true;
+}
+static int HDecode(Inf *s, const HTab *h)
+{
+    if (s->bc < 15) InfFill(s);
+    uint16_t e = h->t[s->bb & 0x7FFF];
+    int l = e >> 9;
+    if (!l) { s->err = true; return -1; }
+    s->bb >>= l; s->bc -= l;
+    return e & 0x1FF;
+}
+
+static const uint16_t LBASE[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+static const uint8_t  LEXT[29]  = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+static const uint16_t DBASE[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+static const uint8_t  DEXT[30]  = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+
+static HTab *fixedLit, *fixedDist;
+
+static bool InfCodes(Inf *s, const HTab *lit, const HTab *dist)
+{
+    for (;;) {
+        int sym = HDecode(s, lit);
+        if (s->err) return false;
+        if (sym < 256) { BufByte(&s->out, (uint8_t)sym); }
+        else if (sym == 256) return true;
+        else {
+            sym -= 257;
+            if (sym >= 29) return false;
+            size_t len = LBASE[sym] + InfBits(s, LEXT[sym]);
+            int ds = HDecode(s, dist);
+            if (s->err || ds < 0 || ds >= 30) return false;
+            size_t d = DBASE[ds] + InfBits(s, DEXT[ds]);
+            if (d > s->out.n) return false;
+            BufNeed(&s->out, len);
+            if (s->out.oom) return false;
+            uint8_t *o = s->out.d + s->out.n;
+            for (size_t i = 0; i < len; i++) o[i] = o[(ptrdiff_t)i - (ptrdiff_t)d];
+            s->out.n += len;
+        }
+        if (s->out.oom || s->out.n > s->maxOut) return false;
+        if (s->pos > s->inLen + 8) return false;      /* ran off the end of the input */
+    }
+}
+
+/* Raw DEFLATE. *used gets how many input bytes it took. NULL if the data is damaged. */
+static uint8_t *InflateRaw(const uint8_t *in, size_t inLen, size_t *used, size_t *outLen, size_t maxOut)
+{
+    static HTab lit, dist;
+    Inf s;
+    memset(&s, 0, sizeof s);
+    s.in = in; s.inLen = inLen; s.maxOut = maxOut;
+    if (!fixedLit) {
+        static HTab fl, fd;
+        uint8_t l[288];
+        for (int i = 0; i < 144; i++) l[i] = 8;
+        for (int i = 144; i < 256; i++) l[i] = 9;
+        for (int i = 256; i < 280; i++) l[i] = 7;
+        for (int i = 280; i < 288; i++) l[i] = 8;
+        HBuild(&fl, l, 288);
+        for (int i = 0; i < 30; i++) l[i] = 5;
+        HBuild(&fd, l, 30);
+        fixedLit = &fl; fixedDist = &fd;
+    }
+    bool last = false, ok = true;
+    while (!last && ok) {
+        last = InfBits(&s, 1);
+        int type = (int)InfBits(&s, 2);
+        if (type == 0) {                                   /* stored: no squeezing */
+            InfBits(&s, s.bc & 7);                         /* skip to a whole byte */
+            unsigned len = InfBits(&s, 16), nlen = InfBits(&s, 16);
+            if ((len ^ 0xFFFF) != nlen) { ok = false; break; }
+            for (unsigned i = 0; i < len && ok; i++) {
+                BufByte(&s.out, (uint8_t)InfBits(&s, 8));
+                if (s.pos > s.inLen + 8 || s.out.oom) ok = false;
+            }
+            if (s.out.n > s.maxOut) ok = false;
+        } else if (type == 1) {
+            ok = InfCodes(&s, fixedLit, fixedDist);
+        } else if (type == 2) {
+            int hlit = (int)InfBits(&s, 5) + 257, hdist = (int)InfBits(&s, 5) + 1, hclen = (int)InfBits(&s, 4) + 4;
+            static const uint8_t ord[19] = {16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15};
+            uint8_t cl[19] = {0}, lens[320] = {0};
+            for (int i = 0; i < hclen; i++) cl[ord[i]] = (uint8_t)InfBits(&s, 3);
+            HTab *ct = &lit;                              /* borrow the table for the code-length code */
+            if (!HBuild(ct, cl, 19)) { ok = false; break; }
+            int n = 0;
+            while (n < hlit + hdist && ok) {
+                int sym = HDecode(&s, ct);
+                if (s.err) { ok = false; break; }
+                if (sym < 16) lens[n++] = (uint8_t)sym;
+                else {
+                    int rep, val = 0;
+                    if (sym == 16) { if (!n) { ok = false; break; } val = lens[n - 1]; rep = 3 + (int)InfBits(&s, 2); }
+                    else if (sym == 17) rep = 3 + (int)InfBits(&s, 3);
+                    else rep = 11 + (int)InfBits(&s, 7);
+                    if (n + rep > hlit + hdist) { ok = false; break; }
+                    while (rep--) lens[n++] = (uint8_t)val;
+                }
+            }
+            if (!ok || !lens[256]) { ok = false; break; }
+            if (!HBuild(&lit, lens, hlit) || !HBuild(&dist, lens + hlit, hdist)) { ok = false; break; }
+            ok = InfCodes(&s, &lit, &dist);
+        } else ok = false;
+    }
+    size_t consumed = s.pos - (size_t)(s.bc >> 3);
+    if (!ok || s.out.oom || consumed > inLen) { BufFree(&s.out); return NULL; }
+    if (used) *used = consumed;
+    *outLen = s.out.n;
+    BufByte(&s.out, 0);                                    /* a zero after it, handy for text */
+    if (s.out.oom) { BufFree(&s.out); return NULL; }
+    return s.out.d;
+}
+
+static uint32_t Adler32(const uint8_t *d, size_t n)
+{
+    uint32_t a = 1, b = 0;
+    while (n) {
+        size_t k = n < 5000 ? n : 5000;
+        n -= k;
+        while (k--) { a += *d++; b += a; }
+        a %= 65521; b %= 65521;
+    }
+    return b << 16 | a;
+}
+
+/* zlib = 2-byte header + DEFLATE + Adler-32 checksum. */
+static uint8_t *InflateZlib(const uint8_t *in, size_t inLen, size_t *used, size_t *outLen, size_t maxOut)
+{
+    if (inLen < 6 || (in[0] & 0x0F) != 8 || ((in[0] << 8) | in[1]) % 31 != 0 || (in[1] & 0x20)) return NULL;
+    size_t u = 0;
+    uint8_t *o = InflateRaw(in + 2, inLen - 2, &u, outLen, maxOut);
+    if (!o) return NULL;
+    if (2 + u + 4 > inLen) { free(o); return NULL; }
+    const uint8_t *c = in + 2 + u;
+    uint32_t want = (uint32_t)c[0] << 24 | (uint32_t)c[1] << 16 | (uint32_t)c[2] << 8 | c[3];
+    if (want != Adler32(o, *outLen)) { free(o); return NULL; }
+    if (used) *used = 2 + u + 4;
+    return o;
+}
+
+/* gzip (used by git for big requests) = a header + DEFLATE + a CRC and the size. */
+static uint8_t *InflateGzip(const uint8_t *in, size_t inLen, size_t *outLen, size_t maxOut)
+{
+    if (inLen < 18 || in[0] != 0x1f || in[1] != 0x8b || in[2] != 8) return NULL;
+    int flg = in[3];
+    size_t p = 10;
+    if (flg & 4) { if (p + 2 > inLen) return NULL; p += 2 + (size_t)(in[p] | in[p + 1] << 8); }
+    if (flg & 8)  { while (p < inLen && in[p]) p++; p++; }
+    if (flg & 16) { while (p < inLen && in[p]) p++; p++; }
+    if (flg & 2)  p += 2;
+    if (p >= inLen) return NULL;
+    return InflateRaw(in + p, inLen - p, NULL, outLen, maxOut);
+}
+
+/* Squeezes data into zlib format. Uses raylib's DEFLATE when it helps,
+   otherwise just "stored" blocks (no squeezing, still valid). */
+static void ZlibCompress(Buf *out, const uint8_t *d, size_t n)
+{
+    BufByte(out, 0x78); BufByte(out, 0x01);
+    unsigned char *packed = NULL;
+    int pl = 0;
+    if (n >= 64 && n < 0x7FFFFFFF) packed = CompressData(d, (int)n, &pl);
+    if (packed && pl > 0 && (size_t)pl < n) BufAdd(out, packed, (size_t)pl);
+    else {
+        size_t at = 0;
+        do {
+            size_t k = n - at > 65535 ? 65535 : n - at;
+            BufByte(out, at + k >= n ? 1 : 0);
+            BufByte(out, (uint8_t)(k & 0xFF)); BufByte(out, (uint8_t)(k >> 8));
+            BufByte(out, (uint8_t)(~k & 0xFF)); BufByte(out, (uint8_t)((~k >> 8) & 0xFF));
+            BufAdd(out, d + at, k);
+            at += k;
+        } while (at < n);
+    }
+    if (packed) MemFree(packed);
+    uint32_t a = Adler32(d, n);
+    BufByte(out, (uint8_t)(a >> 24)); BufByte(out, (uint8_t)(a >> 16)); BufByte(out, (uint8_t)(a >> 8)); BufByte(out, (uint8_t)a);
+}
+
 /* ------------------------------------------------------------------ */
 /* Data                                                               */
 /* ------------------------------------------------------------------ */
@@ -115,6 +583,7 @@ typedef struct {
     char      rhash[65];             /* stored like the password ("" = none) */
     long long created;
     char      bio[TEXT_LEN];
+    char      email[TEXT_LEN];       /* put on commits made here, so git shows it ("" = none set) */
     int       theme;                 /* one of THEME_...                  */
     int       avatarColor;           /* 0 = automatic, 1..8 = chosen      */
     char     *avatar;                /* profile picture: PNG as base64 text, or NULL */
@@ -123,21 +592,30 @@ typedef struct {
 } User;
 
 /* A blob is one unique version of a file's contents. Identical
-   contents are stored only once, just like real git.
+   contents are stored only once, just like real git - and with the same
+   SHA-1 fingerprint git gives it.
    "Binary" files (pictures, zips, programs...) are stored byte for byte;
    they just can't be shown as text or edited. */
 typedef struct LangCache LangCache;   /* a file's language clues, worked out once (see "Language detection") */
-typedef struct { uint32_t hash; char *data; int len; bool binary; LangCache *lang; } Blob;
+typedef struct { uint8_t sha[20]; char *data; int len; bool binary; LangCache *lang; } Blob;
 
-/* A commit is a snapshot: a list of file names, each pointing at a blob. */
+/* A commit is a snapshot: a list of file paths (in order, e.g. "README.md",
+   "src/main.c"), each pointing at a blob. It is also a real git commit:
+   "raw" is exactly what git stores for it, and "sha" its fingerprint. */
 typedef struct {
-    char      id[8];                 /* short hash, e.g. "3fa9c1d" */
-    char      message[TEXT_LEN];
+    char      id[8];                 /* short id: the first 7 hex digits of sha, e.g. "3fa9c1d" */
+    uint8_t   sha[20];
+    char      message[TEXT_LEN];     /* the first line of the message */
     long long time;
     int       author;                /* user id */
+    int       parents[2];            /* the commit(s) it was built on (index in commits[]):   */
+    int       parentCount;           /* 0 = the first commit, 2 = a merge of two lines of work */
     int       fileCount;
-    char      names[MAX_FILES][NAME_LEN];
-    int       blobs[MAX_FILES];
+    const char **names;              /* sorted paths (shared strings, see Intern)            */
+    int       *blobs;
+    uint8_t   *modes;                /* MODE_FILE, MODE_EXEC or MODE_LINK                    */
+    char      *raw;                  /* the git commit object: tree, parents, author, message */
+    int       rawLen;
     bool      copied;                /* came from the original repository into a fork: */
                                      /* it isn't counted again as someone's contribution */
     bool      statsDone;             /* the three below are worked out when first needed, */
@@ -148,7 +626,7 @@ typedef struct {
    version it started from, so we can spot when someone else changed the
    same file in the meantime. */
 typedef struct {
-    char name[NAME_LEN]; char *text; int len, cap; bool binary;
+    char name[PATH_LEN]; char *text; int len, cap; bool binary;
     unsigned ver, langVer;           /* ver goes up with every change; langVer = the version lang was worked out for */
     LangCache *lang;
     bool deleted;                    /* in a draft: "I've deleted this file"               */
@@ -159,7 +637,6 @@ typedef struct {
    they've changed and not committed yet. Everything else they see is the
    latest commit - so nobody sees anyone else's half-finished work, and a
    commit only ever contains the changes of the person who made it. */
-#define MAX_DRAFT (MAX_FILES * 2)
 typedef struct { int user; int count; WorkFile *files; } Draft;
 
 typedef struct { char title[TEXT_LEN]; bool open; long long time; int author; } Issue;
@@ -168,21 +645,24 @@ typedef struct {
     int       owner;                 /* user id, or -1 = not claimed yet */
     char      name[NAME_LEN];
     char      desc[TEXT_LEN];
+    char      branch[NAME_LEN];      /* git's name for the line of commits, usually "main" */
     long long created;
     int       starCount;   int      starredBy[MAX_USERS];
     int       collabCount; int      collabs[MAX_USERS];       /* people invited who accepted   */
     int       inviteCount; int      invites[MAX_USERS];       /* invited, not answered yet     */
     long long inviteTime[MAX_USERS];
     int       draftCount;  Draft    drafts[MAX_USERS];
-    int       commitCount; Commit   commits[MAX_COMMITS];
-    int       blobCount;   Blob     blobs[MAX_BLOBS];
+    int       commitCount, commitCap; Commit *commits;        /* oldest first; the last is the latest */
+    int       blobCount,   blobCap;   Blob   *blobs;
+    ShaMap    commitMap, blobMap;    /* fingerprint -> index, for quick lookups */
+    unsigned  gen;                   /* goes up whenever the commits change */
     int       issueCount;  Issue    issues[MAX_ISSUES];
     /* forks: the original is found by its owner + name (names are unique per owner) */
     bool      isFork;
     int       forkOwner;             /* user id of the original's owner              */
     char      forkName[NAME_LEN];    /* the original's name                           */
-    char      forkBase[8];           /* id of the newest commit of the original this  */
-                                     /* fork already has ("" = the original was empty) */
+    char      forkBase[41];          /* fingerprint of the newest commit of the original */
+                                     /* this fork has taken in ("" = the original was empty) */
 } Repo;
 
 static User users[MAX_USERS];
@@ -205,9 +685,9 @@ typedef struct { int cursor; float scrollY, scrollX; bool focused; } EditorState
 static Screen screen = SCR_LOGIN;
 static Tab    tab    = TAB_CODE;
 static int    curRepo = -1, curCommit = -1, curChange = -1;
-static char   selName[NAME_LEN];      /* the file open in the Code tab ("" = pick the first) */
+static char   selName[PATH_LEN];      /* the file open in the Code tab ("" = pick the first) */
 
-static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode, tfUpPath, tfUpMsg, tfInvite;
+static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode, tfUpPath, tfUpMsg, tfInvite, tfEmail;
 static TextField tfPass    = {.secret = true}, tfPass2    = {.secret = true};
 static TextField tfOldPass = {.secret = true}, tfNewPass  = {.secret = true};
 static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
@@ -220,7 +700,7 @@ static bool  codeAfterReset;          /* the code screen was reached by resettin
 static float scProfile, scPeople, scSettings, scPeopleTab;
 static int   viewUser = -1;           /* whose profile page is open             */
 static int   dayUser  = -1;           /* whose contributions the day page shows */
-static int   settingsTab;             /* 0 = profile, 1 = password & account    */
+static int   settingsTab;             /* 0 = profile, 1 = password & account, 2 = git */
 static Color uiAccent = {247, 129, 102, 255};   /* the signed-in user's theme colour */
 static long long curDay;              /* midnight at the start of the day being viewed      */
 static bool  fromDay;                 /* commit page was opened from a day page: go back there */
@@ -230,6 +710,8 @@ static float lockT;                   /* sign-in paused after too many wrong pas
 static int   W, H;
 static bool  clickUsed;       /* stops one click triggering two things */
 static int   wantCursor;
+static int   gitPort;                 /* the git server's port (see "Talking to real git"), 0 = off */
+static char  gitProblem[TEXT_LEN];    /* why it isn't running                                       */
 static bool  dirty;           /* something changed and needs saving    */
 static char  toastMsg[TEXT_LEN];
 static float toastT;
@@ -239,12 +721,6 @@ static float armedT;
 /* ------------------------------------------------------------------ */
 /* Small helpers                                                      */
 /* ------------------------------------------------------------------ */
-#define FNV_START 2166136261u
-static uint32_t Fnv(const char *s, int n, uint32_t h)
-{
-    for (int i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
-    return h;
-}
 
 static void MarkDirty(void) { dirty = true; }
 static void Toast(const char *s) { snprintf(toastMsg, sizeof toastMsg, "%s", s); toastT = 3.0f; }
@@ -257,13 +733,20 @@ static bool Clicked(Rectangle r)
     return false;
 }
 
-static char sliceBuf[1024];
+/* The first n bytes of s as text to draw. Tab characters are shown as
+   spaces up to the next multiple of 4 columns (raylib can't draw a tab),
+   and the \r of Windows line endings is left out. */
+static char sliceBuf[2048];
 static const char *Slice(const char *s, int n)
 {
     if (n < 0) n = 0;
-    if (n > 1023) n = 1023;
-    memcpy(sliceBuf, s, (size_t)n);
-    sliceBuf[n] = 0;
+    int j = 0;
+    for (int i = 0; i < n && j < 2000; i++) {
+        if (s[i] == '\t') { do sliceBuf[j++] = ' '; while (j % 4 && j < 2000); }
+        else if (s[i] == '\r') continue;
+        else sliceBuf[j++] = s[i];
+    }
+    sliceBuf[j] = 0;
     return sliceBuf;
 }
 /* Width in pixels of the first n characters (where the cursor would sit). */
@@ -302,6 +785,21 @@ static bool ContainsCI(const char *hay, const char *needle)
         if (!needle[i]) return true;
     }
     return false;
+}
+
+/* A file path someone typed: like SanitizeName, but "/" makes folders
+   ("docs/notes.txt"). Doubled or stray slashes are dropped. */
+static void SanitizePath(const char *in, char *out)
+{
+    int j = 0;
+    for (int i = 0; in[i] && j < PATH_LEN - 1; i++) {
+        char c = in[i] == '\\' ? '/' : in[i];
+        if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.') out[j++] = c;
+        else if (c == ' ') out[j++] = '-';
+        else if (c == '/' && j > 0 && out[j - 1] != '/') out[j++] = '/';
+    }
+    while (j > 0 && out[j - 1] == '/') j--;
+    out[j] = 0;
 }
 
 /* Keep letters, digits, - _ . ; turn spaces into dashes. */
@@ -377,6 +875,9 @@ static void WF_Free(WorkFile *f) { free(f->text); f->text = NULL; f->len = f->ca
 /* ------------------------------------------------------------------ */
 /* Repositories, blobs and commits                                    */
 /* ------------------------------------------------------------------ */
+static const char *UserName(int id);
+static const char *UserEmail(int id);
+
 static Repo *NewRepo(int owner, const char *name, const char *desc)
 {
     if (repoCount >= MAX_REPOS) return NULL;
@@ -385,6 +886,7 @@ static Repo *NewRepo(int owner, const char *name, const char *desc)
     r->owner = owner;
     snprintf(r->name, NAME_LEN, "%s", name);
     snprintf(r->desc, TEXT_LEN, "%s", desc);
+    snprintf(r->branch, NAME_LEN, "main");
     r->created = (long long)time(NULL);
     return r;
 }
@@ -397,11 +899,22 @@ static void FreeDraft(Draft *d)
     d->count = 0;
 }
 
+static void FreeCommit(Commit *c)
+{
+    free(c->names); free(c->blobs); free(c->modes); free(c->raw);
+    c->names = NULL; c->blobs = NULL; c->modes = NULL; c->raw = NULL;
+}
+
 static void FreeRepo(Repo *r)
 {
     for (int i = 0; i < r->draftCount; i++) FreeDraft(&r->drafts[i]);
     r->draftCount = 0;
     for (int i = 0; i < r->blobCount; i++) { free(r->blobs[i].data); free(r->blobs[i].lang); }
+    for (int i = 0; i < r->commitCount; i++) FreeCommit(&r->commits[i]);
+    free(r->blobs); free(r->commits);
+    r->blobs = NULL; r->commits = NULL;
+    r->blobCount = r->blobCap = r->commitCount = r->commitCap = 0;
+    MapFree(&r->commitMap); MapFree(&r->blobMap);
     filesGen++;
 }
 
@@ -413,35 +926,344 @@ static void DeleteRepo(int i)
     memset(&repos[repoCount], 0, sizeof(Repo));
 }
 
-/* Store contents once; returns the blob's index (or -1 if full). */
-static int InternBlob(Repo *r, const char *data, int len)
+/* Store contents once; returns the blob's index (or -1 if out of room).
+   If sha is given it must be the contents' git fingerprint (saves working it out again). */
+static int InternBlobSha(Repo *r, const char *data, int len, const uint8_t *known)
 {
-    uint32_t h = Fnv(data, len, FNV_START);
-    for (int i = 0; i < r->blobCount; i++)
-        if (r->blobs[i].hash == h && r->blobs[i].len == len &&
-            memcmp(r->blobs[i].data, data, (size_t)len) == 0) return i;
+    uint8_t sha[20];
+    if (known) memcpy(sha, known, 20);
+    else ObjectSha("blob", data, (size_t)len, sha);
+    int have = MapGet(&r->blobMap, sha);
+    if (have >= 0) return have;
     if (r->blobCount >= MAX_BLOBS) return -1;
+    r->blobs = GrowArr(r->blobs, &r->blobCap, r->blobCount + 1, sizeof(Blob));
+    if (r->blobCount >= r->blobCap) return -1;
     Blob *b = &r->blobs[r->blobCount];
-    b->hash = h;
     b->data = malloc((size_t)len + 1);
+    if (!b->data) return -1;
     memcpy(b->data, data, (size_t)len);
     b->data[len] = 0;
     b->len = len;
     b->binary = LooksBinary(data, len);
     b->lang = NULL;
+    memcpy(b->sha, sha, 20);
+    MapPut(&r->blobMap, sha, r->blobCount);
     return r->blobCount++;
 }
+static int InternBlob(Repo *r, const char *data, int len) { return InternBlobSha(r, data, len, NULL); }
 
 static const char *BlobText(Repo *r, int b)   { return b >= 0 ? r->blobs[b].data : ""; }
 static int         BlobLen(Repo *r, int b)    { return b >= 0 ? r->blobs[b].len : 0; }
 static bool        BlobBinary(Repo *r, int b) { return b >= 0 && r->blobs[b].binary; }
 static Commit *Head(Repo *r) { return r->commitCount ? &r->commits[r->commitCount - 1] : NULL; }
 static long long LastActivity(Repo *r) { return r->commitCount ? Head(r)->time : r->created; }
+/* The commit this one was built on (the first one, for a merge), or NULL. */
+static Commit *ParentOf(Repo *r, int ci)
+{
+    Commit *c = &r->commits[ci];
+    return c->parentCount ? &r->commits[c->parents[0]] : NULL;
+}
+static int CommitBySha(Repo *r, const uint8_t *sha) { return MapGet(&r->commitMap, sha); }
 
+/* Commits keep their files sorted by path, so finding one is quick. */
 static int FindInCommit(Commit *c, const char *name)
 {
-    for (int i = 0; i < c->fileCount; i++) if (strcmp(c->names[i], name) == 0) return i;
+    int lo = 0, hi = c->fileCount - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2, d = strcmp(c->names[mid], name);
+        if (!d) return mid;
+        if (d < 0) lo = mid + 1; else hi = mid - 1;
+    }
     return -1;
+}
+
+/* ---------- snapshots being put together ----------
+   A list of files (kept sorted) that becomes a new commit. */
+typedef struct { int n, cap; const char **names; int *blobs; uint8_t *modes; } Snap;
+
+static void SnapFree(Snap *s) { free(s->names); free(s->blobs); free(s->modes); memset(s, 0, sizeof *s); }
+static bool SnapRoom(Snap *s, int need)
+{
+    if (need <= s->cap) return true;
+    int c = s->cap ? s->cap : 16;
+    while (c < need) c *= 2;
+    const char **n = realloc(s->names, (size_t)c * sizeof *n);
+    if (n) s->names = n;
+    int *b = realloc(s->blobs, (size_t)c * sizeof *b);
+    if (b) s->blobs = b;
+    uint8_t *m = realloc(s->modes, (size_t)c);
+    if (m) s->modes = m;
+    if (!n || !b || !m) return false;
+    s->cap = c;
+    return true;
+}
+/* Starts from a commit's files (or from nothing if c is NULL). */
+static bool SnapFrom(Snap *s, Commit *c)
+{
+    memset(s, 0, sizeof *s);
+    int n = c ? c->fileCount : 0;
+    if (!SnapRoom(s, n > 0 ? n : 1)) return false;
+    if (n) {
+        memcpy(s->names, c->names, (size_t)n * sizeof *s->names);
+        memcpy(s->blobs, c->blobs, (size_t)n * sizeof *s->blobs);
+        memcpy(s->modes, c->modes, (size_t)n);
+    }
+    s->n = n;
+    return true;
+}
+/* Where name is, or where it would go (as -1 - position). */
+static int SnapFind(Snap *s, const char *name)
+{
+    int lo = 0, hi = s->n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2, d = strcmp(s->names[mid], name);
+        if (!d) return mid;
+        if (d < 0) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1 - lo;
+}
+/* Puts a file in (or replaces it). mode -1 = keep its mode (a normal file if it's new). */
+static bool SnapSet(Snap *s, const char *name, int blob, int mode)
+{
+    int k = SnapFind(s, name);
+    if (k >= 0) { s->blobs[k] = blob; if (mode >= 0) s->modes[k] = (uint8_t)mode; return true; }
+    if (s->n >= MAX_FILES) return false;
+    const char *in = Intern(name);
+    if (!in || !SnapRoom(s, s->n + 1)) return false;
+    k = -1 - k;
+    memmove(&s->names[k + 1], &s->names[k], (size_t)(s->n - k) * sizeof *s->names);
+    memmove(&s->blobs[k + 1], &s->blobs[k], (size_t)(s->n - k) * sizeof *s->blobs);
+    memmove(&s->modes[k + 1], &s->modes[k], (size_t)(s->n - k));
+    s->names[k] = in; s->blobs[k] = blob; s->modes[k] = (uint8_t)(mode >= 0 ? mode : MODE_FILE);
+    s->n++;
+    return true;
+}
+static void SnapRemove(Snap *s, const char *name)
+{
+    int k = SnapFind(s, name);
+    if (k < 0) return;
+    memmove(&s->names[k], &s->names[k + 1], (size_t)(s->n - k - 1) * sizeof *s->names);
+    memmove(&s->blobs[k], &s->blobs[k + 1], (size_t)(s->n - k - 1) * sizeof *s->blobs);
+    memmove(&s->modes[k], &s->modes[k + 1], (size_t)(s->n - k - 1));
+    s->n--;
+}
+
+/* ---------- trees (folders) ----------
+   Git stores each folder as a "tree": for every entry, its mode, name and
+   fingerprint. Because the paths are sorted, each folder's files sit next
+   to each other in the list, in exactly the order git wants. */
+typedef void (*TreeEmit)(void *ctx, const uint8_t sha[20], const uint8_t *data, size_t len);
+
+/* Works out the fingerprint of the folder holding entries lo..hi-1 (paths all
+   starting with the same plen characters, e.g. "src/"). shas[i] is each
+   file's blob fingerprint. emit, if given, is handed every tree made. */
+static bool BuildTree(const char *const *names, const uint8_t (*shas)[20], const uint8_t *modes,
+                      int lo, int hi, int plen, uint8_t out[20], TreeEmit emit, void *ctx)
+{
+    Buf t = {0};
+    int i = lo;
+    while (i < hi) {
+        const char *rest = names[i] + plen;
+        const char *slash = strchr(rest, '/');
+        if (!slash) {
+            BufStr(&t, ModeText(modes[i])); BufByte(&t, ' ');
+            BufAdd(&t, rest, strlen(rest) + 1);
+            BufAdd(&t, shas[i], 20);
+            i++;
+            continue;
+        }
+        size_t nl = (size_t)(slash - rest);
+        int j = i + 1;
+        while (j < hi && strncmp(names[j] + plen, rest, nl + 1) == 0) j++;
+        uint8_t sub[20];
+        if (!BuildTree(names, shas, modes, i, j, plen + (int)nl + 1, sub, emit, ctx)) { BufFree(&t); return false; }
+        BufStr(&t, "40000 ");
+        BufAdd(&t, rest, nl); BufByte(&t, 0);
+        BufAdd(&t, sub, 20);
+        i = j;
+    }
+    if (t.oom) { BufFree(&t); return false; }
+    ObjectSha("tree", t.d ? t.d : (const uint8_t *)"", t.n, out);
+    if (emit) emit(ctx, out, t.d ? t.d : (const uint8_t *)"", t.n);
+    BufFree(&t);
+    return true;
+}
+static bool CommitTree(Repo *r, Commit *c, uint8_t out[20], TreeEmit emit, void *ctx)
+{
+    uint8_t (*shas)[20] = malloc((size_t)(c->fileCount ? c->fileCount : 1) * 20);
+    if (!shas) return false;
+    for (int i = 0; i < c->fileCount; i++) memcpy(shas[i], r->blobs[c->blobs[i]].sha, 20);
+    bool ok = BuildTree(c->names, (const uint8_t (*)[20])shas, c->modes, 0, c->fileCount, 0, out, emit, ctx);
+    free(shas);
+    return ok;
+}
+
+/* ---------- the git commit object ---------- */
+
+/* Minutes ahead of UTC for local time at moment t (e.g. +60 for Paris in winter). */
+static int TzOffset(long long t)
+{
+    time_t tt = (time_t)t;
+    struct tm lt = *localtime(&tt), gt = *gmtime(&tt);
+    int d = (lt.tm_hour - gt.tm_hour) * 60 + (lt.tm_min - gt.tm_min);
+    int day = lt.tm_year != gt.tm_year ? (lt.tm_year > gt.tm_year ? 1 : -1) : lt.tm_yday - gt.tm_yday;
+    return d + day * 1440;
+}
+
+/* What git calls the author: "name <email> time zone". */
+static void AuthorLine(Buf *b, const char *who, const char *email, long long t)
+{
+    int tz = TzOffset(t), a = tz < 0 ? -tz : tz;
+    BufStr(b, who); BufStr(b, " <"); BufStr(b, email); BufStr(b, "> ");
+    char when[48];
+    snprintf(when, sizeof when, "%lld %c%02d%02d", t, tz < 0 ? '-' : '+', a / 60, a % 60);
+    BufStr(b, when);
+}
+
+static char *MakeRawCommit(const uint8_t tree[20], const uint8_t *const *parents, int np,
+                           const char *who, const char *email, long long t, const char *msg, int *len)
+{
+    Buf b = {0};
+    char hx[41];
+    ShaHex(tree, hx);
+    BufStr(&b, "tree "); BufStr(&b, hx); BufByte(&b, '\n');
+    for (int i = 0; i < np; i++) { ShaHex(parents[i], hx); BufStr(&b, "parent "); BufStr(&b, hx); BufByte(&b, '\n'); }
+    BufStr(&b, "author ");    AuthorLine(&b, who, email, t); BufByte(&b, '\n');
+    BufStr(&b, "committer "); AuthorLine(&b, who, email, t); BufByte(&b, '\n');
+    BufByte(&b, '\n');
+    BufStr(&b, msg);
+    BufByte(&b, '\n');
+    if (b.oom) { BufFree(&b); return NULL; }
+    *len = (int)b.n;
+    BufByte(&b, 0);
+    return (char *)b.d;
+}
+
+/* The parts of a git commit object Mini GitHub uses. */
+#define MAX_PARENTS 16
+typedef struct {
+    uint8_t   tree[20];
+    int       np;
+    uint8_t   parents[MAX_PARENTS][20];
+    char      aname[NAME_LEN * 2], aemail[TEXT_LEN];
+    long long atime;
+    char      summary[TEXT_LEN];
+} CommitInfo;
+
+static bool ParseCommit(const char *raw, int len, CommitInfo *ci)
+{
+    memset(ci, 0, sizeof *ci);
+    int p = 0;
+    bool tree = false;
+    while (p < len) {
+        int e = p;
+        while (e < len && raw[e] != '\n') e++;
+        if (e == p) { p = e + 1; break; }                 /* blank line: the message follows */
+        const char *l = raw + p;
+        int n = e - p;
+        if (n == 45 && strncmp(l, "tree ", 5) == 0) tree = ParseHex40(l + 5, ci->tree);
+        else if (n == 47 && strncmp(l, "parent ", 7) == 0) {
+            if (ci->np >= MAX_PARENTS || !ParseHex40(l + 7, ci->parents[ci->np])) return false;
+            ci->np++;
+        } else if (n > 7 && strncmp(l, "author ", 7) == 0) {
+            const char *lt = memchr(l, '<', (size_t)n), *gt = lt ? memchr(lt, '>', (size_t)(n - (lt - l))) : NULL;
+            if (lt && gt) {
+                int nl = (int)(lt - (l + 7));
+                while (nl > 0 && l[7 + nl - 1] == ' ') nl--;
+                snprintf(ci->aname, sizeof ci->aname, "%.*s", nl, l + 7);
+                snprintf(ci->aemail, sizeof ci->aemail, "%.*s", (int)(gt - lt - 1), lt + 1);
+                ci->atime = strtoll(gt + 1, NULL, 10);
+            }
+        }
+        p = e + 1;
+    }
+    /* the summary: the message's first line that isn't blank */
+    while (p < len && (raw[p] == '\n' || raw[p] == ' ' || raw[p] == '\r')) p++;
+    int e = p;
+    while (e < len && raw[e] != '\n') e++;
+    while (e > p && (raw[e - 1] == '\r' || raw[e - 1] == ' ')) e--;
+    snprintf(ci->summary, sizeof ci->summary, "%.*s", e - p, raw + p);
+    if (!ci->summary[0]) snprintf(ci->summary, sizeof ci->summary, "(no message)");
+    return tree;
+}
+
+static bool SameTextCI(const char *a, const char *b, int n)
+{
+    for (int i = 0; i < n; i++) if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return true;
+}
+/* Who to show as a commit's author: the Mini GitHub user, plus the name
+   git has if that's different (e.g. "Jo Lalor (jo)" for a pushed commit). */
+static const char *CommitAuthorName(Commit *c)
+{
+    const char *u = UserName(c->author);
+    const char *p = c->raw ? strstr(c->raw, "\nauthor ") : NULL;
+    if (!p) return u;
+    p += 8;
+    const char *lt = strchr(p, '<'), *nl = strchr(p, '\n');
+    if (!lt || (nl && lt > nl)) return u;
+    int n = (int)(lt - p);
+    while (n > 0 && p[n - 1] == ' ') n--;
+    if (n <= 0 || n > 60 || ((int)strlen(u) == n && SameTextCI(p, u, n))) return u;
+    return TextFormat("%.*s (%s)", n, p, u);
+}
+
+/* Adds a finished commit to the end of the history (the repository owns its lists from now on). */
+static bool AppendCommit(Repo *r, Commit *c)
+{
+    if (r->commitCount >= MAX_COMMITS) return false;
+    r->commits = GrowArr(r->commits, &r->commitCap, r->commitCount + 1, sizeof(Commit));
+    if (r->commitCount >= r->commitCap) return false;
+    ObjectSha("commit", c->raw, (size_t)c->rawLen, c->sha);
+    char hx[41];
+    ShaHex(c->sha, hx);
+    snprintf(c->id, sizeof c->id, "%.7s", hx);
+    c->statsDone = false;
+    MapPut(&r->commitMap, c->sha, r->commitCount);
+    r->commits[r->commitCount++] = *c;
+    r->gen++;
+    return true;
+}
+
+/* A file can't have the same name as a folder ("docs" and "docs/guide.md"):
+   git couldn't store that. Returns the clashing name, or NULL. */
+static const char *PathClash(const char *const *names, int n)
+{
+    char pre[PATH_LEN + 2];
+    for (int i = 0; i < n; i++) {
+        snprintf(pre, sizeof pre, "%s/", names[i]);
+        size_t pl = strlen(pre);
+        int lo = i + 1, hi = n;                              /* the first name >= "name/" */
+        while (lo < hi) { int mid = (lo + hi) / 2; if (strcmp(names[mid], pre) < 0) lo = mid + 1; else hi = mid; }
+        if (lo < n && strncmp(names[lo], pre, pl) == 0) return names[i];
+    }
+    return NULL;
+}
+
+/* Turns a snapshot into a new commit by the signed-in user, on top of the
+   latest commit (and, for a merge, also on top of commit "also" - or -1).
+   The snapshot is used up either way. Returns false if there was no room. */
+static bool FinishCommit(Repo *r, Snap *s, const char *msg, int also)
+{
+    Commit c;
+    memset(&c, 0, sizeof c);
+    c.fileCount = s->n;
+    c.names = s->names; c.blobs = s->blobs; c.modes = s->modes;
+    memset(s, 0, sizeof *s);
+    if (!c.names) { c.names = malloc(sizeof *c.names); c.blobs = malloc(sizeof *c.blobs); c.modes = malloc(1); }
+    c.author = curUser;
+    c.time = (long long)time(NULL);
+    snprintf(c.message, TEXT_LEN, "%s", msg);
+    const uint8_t *par[2];
+    int np = 0;
+    if (r->commitCount) { c.parents[np] = r->commitCount - 1; par[np++] = Head(r)->sha; }
+    if (also >= 0)      { c.parents[np] = also;               par[np++] = r->commits[also].sha; }
+    c.parentCount = np;
+    uint8_t tree[20];
+    if (c.names && CommitTree(r, &c, tree, NULL, NULL))
+        c.raw = MakeRawCommit(tree, par, np, UserName(curUser), UserEmail(curUser), c.time, msg, &c.rawLen);
+    if (!c.raw || !AppendCommit(r, &c)) { FreeCommit(&c); return false; }
+    return true;
 }
 
 /* ---------- drafts ---------- */
@@ -520,10 +1342,10 @@ static WorkFile *DraftEdit(Repo *r, int uid, const char *name)
     if (!d) return NULL;
     int i = DraftIndex(d, name);
     if (i >= 0) return &d->files[i];
-    if (d->count >= MAX_DRAFT) return NULL;
+    if (d->count >= MAX_DRAFT || strlen(name) >= PATH_LEN) return NULL;
     WorkFile *f = &d->files[d->count++];
     memset(f, 0, sizeof *f);
-    snprintf(f->name, NAME_LEN, "%s", name);
+    snprintf(f->name, PATH_LEN, "%s", name);
     f->base = HeadBlobOf(r, name);
     if (f->base >= 0) WF_SetN(f, r->blobs[f->base].data, r->blobs[f->base].len);
     else              WF_SetN(f, "", 0);
@@ -572,34 +1394,42 @@ static void DraftCounts(Repo *r, int uid, int *changes, int *conflicts)
     }
 }
 
-/* Who most recently committed a change to this file (or -1). */
+/* Who most recently committed a change to this file (or -1): follows the
+   latest commit back through the commits it was built on. */
 static int LastChangedBy(Repo *r, const char *name)
 {
-    for (int k = r->commitCount - 1; k >= 0; k--) {
-        int now = FindInCommit(&r->commits[k], name);
-        int nb = now >= 0 ? r->commits[k].blobs[now] : -1;
-        int before = -1;
-        if (k > 0) { int p = FindInCommit(&r->commits[k - 1], name); before = p >= 0 ? r->commits[k - 1].blobs[p] : -1; }
-        if (nb != before) return r->commits[k].author;
+    int k = r->commitCount - 1;
+    while (k >= 0) {
+        Commit *c = &r->commits[k], *p = ParentOf(r, k);
+        int now = FindInCommit(c, name);
+        int nb = now >= 0 ? c->blobs[now] : -1, before = -1;
+        if (p) { int q = FindInCommit(p, name); before = q >= 0 ? p->blobs[q] : -1; }
+        if (nb != before) return c->author;
+        k = c->parentCount ? c->parents[0] : -1;
     }
     return -1;
 }
 
 /* What you see in a repository: the latest commit with your own draft laid
    on top. With uid = -1 it's just the latest commit (for read-only visitors). */
-typedef struct { char name[NAME_LEN]; const char *data; int len; bool binary; char status; WorkFile *mine; int blob; } ViewFile;
-static ViewFile view[MAX_FILES + MAX_DRAFT];
-static int      viewCount;
+typedef struct { const char *name; const char *data; int len; bool binary; char status; WorkFile *mine; int blob; } ViewFile;
+static ViewFile *view;
+static int       viewCount, viewCap;
+
+static int CmpView(const void *a, const void *b) { return strcmp(((const ViewFile *)a)->name, ((const ViewFile *)b)->name); }
 
 static void BuildView(Repo *r, int uid)
 {
     viewCount = 0;
     Commit *h = Head(r);
     Draft *d = uid >= 0 ? GetDraft(r, uid, false) : NULL;
+    int most = (h ? h->fileCount : 0) + (d ? d->count : 0);
+    view = GrowArr(view, &viewCap, most + 1, sizeof(ViewFile));
+    if (viewCap < most) return;
     for (int k = 0; h && k < h->fileCount; k++) {
         ViewFile *v = &view[viewCount++];
         memset(v, 0, sizeof *v);
-        snprintf(v->name, NAME_LEN, "%s", h->names[k]);
+        v->name = h->names[k];
         v->blob = h->blobs[k];
         int i = DraftIndex(d, v->name);
         WorkFile *e = i >= 0 ? &d->files[i] : NULL;
@@ -607,20 +1437,30 @@ static void BuildView(Repo *r, int uid)
         if (e && st) { v->mine = e; v->status = st; v->data = e->text; v->len = e->len; v->binary = e->binary; }
         else { v->data = r->blobs[v->blob].data; v->len = r->blobs[v->blob].len; v->binary = r->blobs[v->blob].binary; }
     }
+    bool added = false;
     for (int i = 0; d && i < d->count; i++) {                 /* your new files */
         WorkFile *e = &d->files[i];
         if (HeadBlobOf(r, e->name) >= 0) continue;
         char st = DraftStatus(r, e);
         if (!st) continue;
+        const char *nm = Intern(e->name);
+        if (!nm) continue;
         ViewFile *v = &view[viewCount++];
         memset(v, 0, sizeof *v);
-        snprintf(v->name, NAME_LEN, "%s", e->name);
+        v->name = nm;
         v->blob = -1; v->mine = e; v->status = st; v->data = e->text; v->len = e->len; v->binary = e->binary;
+        added = true;
     }
+    if (added) qsort(view, (size_t)viewCount, sizeof(ViewFile), CmpView);   /* keep folders together */
 }
 static int ViewIndex(const char *name)
 {
-    for (int i = 0; i < viewCount; i++) if (strcmp(view[i].name, name) == 0) return i;
+    int lo = 0, hi = viewCount - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2, d = strcmp(view[mid].name, name);
+        if (!d) return mid;
+        if (d < 0) lo = mid + 1; else hi = mid - 1;
+    }
     return -1;
 }
 static bool ViewDeleted(ViewFile *v) { return v->mine && v->mine->deleted; }
@@ -630,27 +1470,6 @@ static int OpenIssues(Repo *r)
     int n = 0;
     for (int i = 0; i < r->issueCount; i++) if (r->issues[i].open) n++;
     return n;
-}
-
-/* Gives a snapshot (file names + blobs already filled in) its author, time,
-   message and id, and adds it to the repository's history. */
-static void FinishCommit(Repo *r, Commit *c, const char *msg)
-{
-    uint32_t h = FNV_START;
-    for (int i = 0; i < c->fileCount; i++) {
-        h = Fnv(c->names[i], (int)strlen(c->names[i]), h);
-        h ^= r->blobs[c->blobs[i]].hash; h *= 16777619u;
-    }
-    c->author = curUser;
-    c->statsDone = false;
-    snprintf(c->message, TEXT_LEN, "%s", msg);
-    c->time = (long long)time(NULL);
-    h = Fnv(msg, (int)strlen(msg), h);
-    h = Fnv((const char *)&c->author, (int)sizeof c->author, h);
-    h = Fnv((const char *)&c->time, (int)sizeof c->time, h);
-    if (r->commitCount) h = Fnv(Head(r)->id, 7, h);
-    snprintf(c->id, sizeof c->id, "%07x", (unsigned)(h & 0xFFFFFFFu));
-    r->commits[r->commitCount++] = *c;
 }
 
 /* Returns NULL on success, or a message explaining what went wrong. */
@@ -666,33 +1485,19 @@ static const char *DoCommit(Repo *r, const char *msg)
 
     /* start from the latest commit, then apply your changes */
     Draft *d = GetDraft(r, curUser, false);
-    Commit c;
-    memset(&c, 0, sizeof c);
-    Commit *h = Head(r);
-    if (h) {
-        c.fileCount = h->fileCount;
-        memcpy(c.names, h->names, sizeof c.names);
-        memcpy(c.blobs, h->blobs, sizeof c.blobs);
-    }
-    int adding = 0;
-    for (int i = 0; i < d->count; i++) if (DraftStatus(r, &d->files[i]) == 'A') adding++;
-    if (c.fileCount + adding > MAX_FILES) return TextFormat("A repository can hold up to %d files", MAX_FILES);
+    Snap s;
+    if (!SnapFrom(&s, Head(r))) return "Out of memory";
     for (int i = 0; i < d->count; i++) {
         WorkFile *e = &d->files[i];
         char st = DraftStatus(r, e);
-        int k = FindInCommit(&c, e->name);
-        if (st == 'D') {
-            memmove(&c.names[k], &c.names[k + 1], (size_t)(c.fileCount - k - 1) * NAME_LEN);
-            memmove(&c.blobs[k], &c.blobs[k + 1], (size_t)(c.fileCount - k - 1) * sizeof(int));
-            c.fileCount--;
-            continue;
-        }
+        if (st == 'D') { SnapRemove(&s, e->name); continue; }
         int b = InternBlob(r, e->text, e->len);
-        if (b < 0) return "This repository is out of storage space";
-        if (k < 0) { k = c.fileCount++; snprintf(c.names[k], NAME_LEN, "%.*s", NAME_LEN - 1, e->name); }
-        c.blobs[k] = b;
+        if (b < 0) { SnapFree(&s); return "This repository is out of storage space"; }
+        if (!SnapSet(&s, e->name, b, -1)) { SnapFree(&s); return TextFormat("A repository can hold up to %d files", MAX_FILES); }
     }
-    FinishCommit(r, &c, msg);
+    const char *clash = PathClash(s.names, s.n);
+    if (clash) { SnapFree(&s); return TextFormat("%s is both a file and a folder - rename one of them first", clash); }
+    if (!FinishCommit(r, &s, msg, -1)) return "Couldn't save the commit (out of memory?)";
     DraftClear(r, curUser);                 /* everything is committed now */
     return NULL;
 }
@@ -738,6 +1543,15 @@ static User *FindUserByName(const char *name)
 }
 /* Deleted accounts show up as "ghost", like on GitHub. */
 static const char *UserName(int id) { User *u = FindUserById(id); return u ? u->name : "ghost"; }
+/* The email git puts on commits made here: the one set in your profile, or a made-up one. */
+static const char *UserEmail(int id)
+{
+    static char made[NAME_LEN + 24];
+    User *u = FindUserById(id);
+    if (u && u->email[0]) return u->email;
+    snprintf(made, sizeof made, "%s@minigithub.local", u ? u->name : "ghost");
+    return made;
+}
 
 static bool IsMine(Repo *r) { return curUser >= 0 && r->owner == curUser; }
 
@@ -1226,34 +2040,44 @@ static void ComputeDiff(const char *oldT, const char *newT, int *adds, int *dels
 }
 
 /* The list of files a commit changed, compared with the commit before it. */
-typedef struct { char name[NAME_LEN]; int oldB, newB; char kind; int adds, dels; bool binary; } Change;
+typedef struct { const char *name; int oldB, newB; char kind; int adds, dels; bool binary; } Change;
 static Change changes[MAX_FILES * 2];
 static int    changeCount, totalAdds, totalDels;
 
+/* Walks two commits' file lists side by side (both are sorted by path) and
+   calls back for each file that differs: old or new blob is -1 if it isn't there. */
+typedef void (*DiffEach)(void *ctx, const char *name, int oldB, int newB);
+static void WalkChanges(Commit *p, Commit *c, DiffEach fn, void *ctx)
+{
+    int i = 0, j = 0, pn = p ? p->fileCount : 0, cn = c->fileCount;
+    while (i < pn || j < cn) {
+        int d = i >= pn ? 1 : j >= cn ? -1 : p->names[i] == c->names[j] ? 0 : strcmp(p->names[i], c->names[j]);
+        if (d == 0) { if (p->blobs[i] != c->blobs[j] || p->modes[i] != c->modes[j]) fn(ctx, c->names[j], p->blobs[i], c->blobs[j]); i++; j++; }
+        else if (d < 0) { fn(ctx, p->names[i], p->blobs[i], -1); i++; }
+        else            { fn(ctx, c->names[j], -1, c->blobs[j]); j++; }
+    }
+}
+
+static void AddChange(void *ctx, const char *name, int oldB, int newB)
+{
+    (void)ctx;
+    if (changeCount >= MAX_FILES * 2) return;
+    Change *ch = &changes[changeCount++];
+    memset(ch, 0, sizeof *ch);
+    ch->name = name; ch->oldB = oldB; ch->newB = newB;
+    ch->kind = oldB < 0 ? 'A' : newB < 0 ? 'D' : 'M';
+}
+
+/* The list of files a commit changed, compared with the commit it was built on. */
 static void BuildChanges(Repo *r, int ci)
 {
     changeCount = totalAdds = totalDels = 0;
-    Commit *c = &r->commits[ci];
-    Commit *p = ci > 0 ? &r->commits[ci - 1] : NULL;
-
-    for (int k = 0; k < c->fileCount; k++) {
-        int pk = p ? FindInCommit(p, c->names[k]) : -1;
-        int ob = pk >= 0 ? p->blobs[pk] : -1;
-        if (ob == c->blobs[k]) continue;                 /* same blob = unchanged */
-        Change *ch = &changes[changeCount++];
-        snprintf(ch->name, NAME_LEN, "%s", c->names[k]);
-        ch->oldB = ob; ch->newB = c->blobs[k]; ch->kind = ob < 0 ? 'A' : 'M';
-    }
-    if (p) for (int k = 0; k < p->fileCount; k++) {
-        if (FindInCommit(c, p->names[k]) >= 0) continue;
-        Change *ch = &changes[changeCount++];
-        snprintf(ch->name, NAME_LEN, "%s", p->names[k]);
-        ch->oldB = p->blobs[k]; ch->newB = -1; ch->kind = 'D';
-    }
+    WalkChanges(ParentOf(r, ci), &r->commits[ci], AddChange, NULL);
     for (int k = 0; k < changeCount; k++) {
         Change *ch = &changes[k];
         ch->binary = BlobBinary(r, ch->oldB) || BlobBinary(r, ch->newB);
         if (ch->binary) { ch->adds = ch->dels = 0; continue; }     /* no lines to compare */
+        if (ch->oldB == ch->newB) continue;                        /* only the mode changed */
         ComputeDiff(BlobText(r, ch->oldB), BlobText(r, ch->newB), &ch->adds, &ch->dels);
         totalAdds += changes[k].adds;
         totalDels += changes[k].dels;
@@ -1569,11 +2393,41 @@ static long long RI(FILE *f)
     return v;
 }
 
+/* Which number each path has in the save file (paths are written once per repository). */
+typedef struct { const char **key; int *val; int cap, n; } PtrMap;
+static uint32_t PtrHash(const void *p) { uintptr_t v = (uintptr_t)p; v ^= v >> 17; v *= 0x9E3779B1u; return (uint32_t)(v ^ (v >> 15)); }
+static int PtrGet(PtrMap *m, const char *k)
+{
+    if (!m->cap) return -1;
+    for (uint32_t i = PtrHash(k) & (uint32_t)(m->cap - 1);; i = (i + 1) & (uint32_t)(m->cap - 1)) {
+        if (!m->key[i]) return -1;
+        if (m->key[i] == k) return m->val[i];
+    }
+}
+static void PtrPut(PtrMap *m, const char *k, int v)
+{
+    if ((m->n + 1) * 2 > m->cap) {
+        PtrMap n = {0};
+        n.cap = m->cap ? m->cap * 2 : 256;
+        n.key = calloc((size_t)n.cap, sizeof *n.key);
+        n.val = calloc((size_t)n.cap, sizeof *n.val);
+        if (!n.key || !n.val) { free(n.key); free(n.val); return; }
+        for (int i = 0; i < m->cap; i++) if (m->key[i]) PtrPut(&n, m->key[i], m->val[i]);
+        free(m->key); free(m->val);
+        *m = n;
+    }
+    uint32_t i = PtrHash(k) & (uint32_t)(m->cap - 1);
+    while (m->key[i] && m->key[i] != k) i = (i + 1) & (uint32_t)(m->cap - 1);
+    if (!m->key[i]) m->n++;
+    m->key[i] = k; m->val[i] = v;
+}
+static void PtrFree(PtrMap *m) { free(m->key); free(m->val); memset(m, 0, sizeof *m); }
+
 static void Save(void)
 {
     FILE *f = fopen(SAVE_FILE ".tmp", "wb");
     if (!f) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(f, "MINIGITHUB6\n");
+    fprintf(f, "MINIGITHUB7\n");
     WI(f, nextUserId);
     WS(f, lastUser);
     WI(f, userCount);
@@ -1582,11 +2436,12 @@ static void Save(void)
         WI(f, u->id); WS(f, u->name); WS(f, u->salt); WS(f, u->hash); WI(f, u->created);
         WS(f, u->bio); WI(f, u->theme); WI(f, u->avatarColor); WS(f, u->avatar ? u->avatar : "");
         WS(f, u->rsalt); WS(f, u->rhash);
+        WS(f, u->email);
     }
     WI(f, repoCount);
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
-        WI(f, r->owner); WS(f, r->name); WS(f, r->desc); WI(f, r->created);
+        WI(f, r->owner); WS(f, r->name); WS(f, r->desc); WI(f, r->created); WS(f, r->branch);
         WI(f, r->starCount);
         for (int k = 0; k < r->starCount; k++) WI(f, r->starredBy[k]);
         WI(f, r->collabCount);
@@ -1595,13 +2450,30 @@ static void Save(void)
         for (int k = 0; k < r->inviteCount; k++) { WI(f, r->invites[k]); WI(f, r->inviteTime[k]); }
         WI(f, r->blobCount);
         for (int k = 0; k < r->blobCount; k++) WSN(f, r->blobs[k].data, r->blobs[k].len);
+
+        /* every path used, once, then each commit refers to them by number */
+        PtrMap pm = {0};
+        int pc = 0;
+        for (int k = 0; k < r->commitCount; k++)
+            for (int j = 0; j < r->commits[k].fileCount; j++)
+                if (PtrGet(&pm, r->commits[k].names[j]) < 0) PtrPut(&pm, r->commits[k].names[j], pc++);
+        WI(f, pc);
+        const char **order = calloc((size_t)(pc ? pc : 1), sizeof *order);
+        for (int s = 0; order && s < pm.cap; s++) if (pm.key[s]) order[pm.val[s]] = pm.key[s];
+        for (int k = 0; k < pc; k++) WS(f, order ? order[k] : "");
+        free(order);
+
         WI(f, r->commitCount);
         for (int k = 0; k < r->commitCount; k++) {
             Commit *c = &r->commits[k];
-            WS(f, c->id); WS(f, c->message); WI(f, c->time); WI(f, c->author); WI(f, c->fileCount);
-            for (int j = 0; j < c->fileCount; j++) { WS(f, c->names[j]); WI(f, c->blobs[j]); }
-            WI(f, c->copied);
+            WSN(f, c->raw, c->rawLen);
+            /* the line counts are kept too, so they needn't be worked out again (-1 = not yet) */
+            fprintf(f, "%lld %d %d %d %d %d %d %d %d %d\n", c->time, c->author, (int)c->copied, c->parentCount,
+                    c->parents[0], c->parents[1], c->statsDone ? c->sFiles : -1, c->sAdds, c->sDels, c->fileCount);
+            for (int j = 0; j < c->fileCount; j++) fprintf(f, "%d %d %d\n", PtrGet(&pm, c->names[j]), c->blobs[j], c->modes[j]);
         }
+        PtrFree(&pm);
+
         WI(f, r->issueCount);
         for (int k = 0; k < r->issueCount; k++) {
             Issue *is = &r->issues[k];
@@ -1621,7 +2493,9 @@ static void Save(void)
         }
         WI(f, r->isFork); WI(f, r->forkOwner); WS(f, r->forkName); WS(f, r->forkBase);
     }
-    fclose(f);
+    bool ok = !ferror(f);
+    ok = fclose(f) == 0 && ok;
+    if (!ok) { remove(SAVE_FILE ".tmp"); Toast("Could not save - is the disk full?"); return; }
     remove(SAVE_FILE);
     rename(SAVE_FILE ".tmp", SAVE_FILE);
 }
@@ -1643,8 +2517,49 @@ static bool V3HasProfiles(FILE *f)
     return !isText;
 }
 
-/* Reads every version: 6 (forks), 5 (collaborators + drafts), 4 (profiles + recovery codes),
-   3 (either one), 2 (accounts), 1 (before accounts). */
+/* A blob read from the save file goes exactly where it was (commits refer to it by number). */
+static bool LoadBlob(Repo *r, char *d, int len)
+{
+    r->blobs = GrowArr(r->blobs, &r->blobCap, r->blobCount + 1, sizeof(Blob));
+    if (r->blobCount >= r->blobCap) { free(d); return false; }
+    Blob *b = &r->blobs[r->blobCount];
+    b->data = d; b->len = len; b->binary = LooksBinary(d, len); b->lang = NULL;
+    ObjectSha("blob", d, (size_t)len, b->sha);
+    if (MapGet(&r->blobMap, b->sha) < 0) MapPut(&r->blobMap, b->sha, r->blobCount);
+    r->blobCount++;
+    return true;
+}
+
+typedef struct { const char *name; int blob; } OldEntry;
+static int CmpOldEntry(const void *a, const void *b) { return strcmp(((const OldEntry *)a)->name, ((const OldEntry *)b)->name); }
+
+/* Commits from before version 7 weren't git commits yet. Each is turned into
+   one now - the same files, author, time and message, on top of the commit
+   before it - so it gets a real git fingerprint. */
+static bool UpgradeCommits(Repo *r)
+{
+    for (int k = 0; k < r->commitCount; k++) {
+        Commit *c = &r->commits[k];
+        uint8_t tree[20];
+        const uint8_t *par[1];
+        c->parentCount = k > 0;
+        c->parents[0] = k - 1;
+        if (k > 0) par[0] = r->commits[k - 1].sha;
+        if (!CommitTree(r, c, tree, NULL, NULL)) return false;
+        c->raw = MakeRawCommit(tree, par, k > 0, UserName(c->author), UserEmail(c->author), c->time, c->message, &c->rawLen);
+        if (!c->raw) return false;
+        ObjectSha("commit", c->raw, (size_t)c->rawLen, c->sha);
+        char hx[41];
+        ShaHex(c->sha, hx);
+        snprintf(c->id, sizeof c->id, "%.7s", hx);
+        MapPut(&r->commitMap, c->sha, k);
+    }
+    r->gen++;
+    return true;
+}
+
+/* Reads every version: 7 (git commits, folders), 6 (forks), 5 (collaborators + drafts),
+   4 (profiles + recovery codes), 3 (either one), 2 (accounts), 1 (before accounts). */
 static bool Load(void)
 {
     FILE *f = fopen(SAVE_FILE, "rb");
@@ -1652,14 +2567,8 @@ static bool Load(void)
     loadErr = 0;
     char magic[32] = {0};
     int ver = 0;
-    if (fscanf(f, "%31s", magic) == 1) {
-        if (strcmp(magic, "MINIGITHUB1") == 0) ver = 1;
-        if (strcmp(magic, "MINIGITHUB2") == 0) ver = 2;
-        if (strcmp(magic, "MINIGITHUB3") == 0) ver = 3;
-        if (strcmp(magic, "MINIGITHUB4") == 0) ver = 4;
-        if (strcmp(magic, "MINIGITHUB5") == 0) ver = 5;
-        if (strcmp(magic, "MINIGITHUB6") == 0) ver = 6;
-    }
+    if (fscanf(f, "%31s", magic) == 1 && strncmp(magic, "MINIGITHUB", 10) == 0 && magic[10] >= '1' && magic[10] <= '7' && !magic[11])
+        ver = magic[10] - '0';
     if (!ver) loadErr = 1;
 
     if (ver >= 2) {
@@ -1692,6 +2601,7 @@ static bool Load(void)
                 bool none = !u->rsalt[0] && !u->rhash[0];
                 if (!none && (strlen(u->rsalt) != 32 || strlen(u->rhash) != 64)) loadErr = 1;
             }
+            if (ver >= 7) RSInto(f, u->email, TEXT_LEN);
             if (u->id <= 0 || strlen(u->salt) != 32 || strlen(u->hash) != 64) loadErr = 1;
             if (u->id >= nextUserId) nextUserId = u->id + 1;
         }
@@ -1700,14 +2610,17 @@ static bool Load(void)
     int n = loadErr ? 0 : (int)RI(f);
     if (n < 0 || n > MAX_REPOS) loadErr = 1;
 
+    static OldEntry oldEntries[64];
     for (int i = 0; i < n && !loadErr; i++) {
         Repo *r = &repos[repoCount++];
         memset(r, 0, sizeof *r);
+        snprintf(r->branch, NAME_LEN, "main");
         r->owner = ver >= 2 ? (int)RI(f) : -1;
         RSInto(f, r->name, NAME_LEN);
         RSInto(f, r->desc, TEXT_LEN);
         if (ver == 1) RI(f);                    /* old single-user "starred" flag: dropped */
         r->created = RI(f);
+        if (ver >= 7) { RSInto(f, r->branch, NAME_LEN); if (!r->branch[0]) snprintf(r->branch, NAME_LEN, "main"); }
         if (ver >= 2) {
             int sc = (int)RI(f);
             if (sc < 0 || sc > MAX_USERS) { loadErr = 1; break; }
@@ -1716,7 +2629,7 @@ static bool Load(void)
 
         /* before version 5 there was one working copy per repository (the owner's);
            it's read here and turned into the owner's draft once the commits are in */
-        static WorkFile legacy[MAX_FILES];
+        static WorkFile legacy[64];
         int legacyCount = 0;
         if (ver >= 5) {
             int cc2 = (int)RI(f);
@@ -1727,11 +2640,11 @@ static bool Load(void)
             for (int k = 0; k < ic2; k++) { r->invites[r->inviteCount] = (int)RI(f); r->inviteTime[r->inviteCount++] = RI(f); }
         } else {
             int fc = (int)RI(f);
-            if (fc < 0 || fc > MAX_FILES) { loadErr = 1; break; }
+            if (fc < 0 || fc > 64) { loadErr = 1; break; }
             for (int k = 0; k < fc && !loadErr; k++) {
                 WorkFile *w = &legacy[legacyCount];
                 memset(w, 0, sizeof *w);
-                RSInto(f, w->name, NAME_LEN);
+                RSInto(f, w->name, PATH_LEN);
                 int txLen = 0;
                 char *tx = RSN(f, &txLen);
                 if (tx) { WF_SetN(w, tx, txLen); free(tx); legacyCount++; }
@@ -1743,34 +2656,88 @@ static bool Load(void)
         for (int k = 0; k < bc && !loadErr; k++) {
             int dLen = 0;
             char *d = RSN(f, &dLen);
-            if (!d) break;
-            r->blobs[r->blobCount].data   = d;
-            r->blobs[r->blobCount].len    = dLen;
-            r->blobs[r->blobCount].binary = LooksBinary(d, dLen);
-            r->blobs[r->blobCount].hash   = Fnv(d, dLen, FNV_START);
-            r->blobCount++;
+            if (!d || !LoadBlob(r, d, dLen)) { loadErr = 1; break; }
         }
+        if (loadErr) break;
 
         int cc = (int)RI(f);
-        if (cc < 0 || cc > MAX_COMMITS) { loadErr = 1; break; }
-        for (int k = 0; k < cc && !loadErr; k++) {
-            Commit *c = &r->commits[k];
-            memset(c, 0, sizeof *c);
-            RSInto(f, c->id, (int)sizeof c->id);
-            RSInto(f, c->message, TEXT_LEN);
-            c->time   = RI(f);
-            c->author = ver >= 2 ? (int)RI(f) : -1;
-            int ff = (int)RI(f);
-            if (ff < 0 || ff > MAX_FILES) { loadErr = 1; break; }
-            c->fileCount = ff;
-            for (int j = 0; j < ff; j++) {
-                RSInto(f, c->names[j], NAME_LEN);
-                int b = (int)RI(f);
-                if (b < 0 || b >= r->blobCount) { loadErr = 1; break; }
-                c->blobs[j] = b;
+        if (ver >= 7) {
+            int pc = cc;                                   /* first the table of paths */
+            if (pc < 0 || pc > 10000000) { loadErr = 1; break; }
+            const char **paths = malloc((size_t)(pc ? pc : 1) * sizeof *paths);
+            if (!paths) { loadErr = 1; break; }
+            for (int k = 0; k < pc && !loadErr; k++) {
+                char *s = RS(f);
+                paths[k] = s ? Intern(s) : NULL;
+                if (!paths[k]) loadErr = 1;
+                free(s);
             }
-            if (ver >= 6) c->copied = RI(f) != 0;
-            r->commitCount++;
+            cc = loadErr ? 0 : (int)RI(f);
+            if (cc < 0 || cc > MAX_COMMITS) loadErr = 1;
+            for (int k = 0; k < cc && !loadErr; k++) {
+                Commit c;
+                memset(&c, 0, sizeof c);
+                c.raw = RSN(f, &c.rawLen);
+                c.time = RI(f); c.author = (int)RI(f); c.copied = RI(f) != 0;
+                c.parentCount = (int)RI(f); c.parents[0] = (int)RI(f); c.parents[1] = (int)RI(f);
+                c.sFiles = (int)RI(f); c.sAdds = (int)RI(f); c.sDels = (int)RI(f);
+                bool stats = c.sFiles >= 0 && c.sAdds >= 0 && c.sDels >= 0;
+                int ff = (int)RI(f);
+                if (!c.raw || ff < 0 || ff > MAX_FILES || c.parentCount < 0 || c.parentCount > 2) { free(c.raw); loadErr = 1; break; }
+                for (int q = 0; q < c.parentCount; q++) if (c.parents[q] < 0 || c.parents[q] >= k) loadErr = 1;
+                c.fileCount = ff;
+                c.names = malloc((size_t)(ff ? ff : 1) * sizeof *c.names);
+                c.blobs = malloc((size_t)(ff ? ff : 1) * sizeof *c.blobs);
+                c.modes = malloc((size_t)(ff ? ff : 1));
+                if (!c.names || !c.blobs || !c.modes) { FreeCommit(&c); loadErr = 1; break; }
+                for (int j = 0; j < ff && !loadErr; j++) {
+                    int pi = (int)RI(f), b = (int)RI(f), m = (int)RI(f);
+                    if (pi < 0 || pi >= pc || b < 0 || b >= r->blobCount || m < 0 || m > 2) { loadErr = 1; break; }
+                    c.names[j] = paths[pi]; c.blobs[j] = b; c.modes[j] = (uint8_t)m;
+                }
+                CommitInfo info;
+                if (!loadErr && !ParseCommit(c.raw, c.rawLen, &info)) loadErr = 1;
+                if (loadErr) { FreeCommit(&c); break; }
+                snprintf(c.message, TEXT_LEN, "%s", info.summary);
+                if (!AppendCommit(r, &c)) { FreeCommit(&c); loadErr = 1; break; }
+                r->commits[r->commitCount - 1].statsDone = stats;
+            }
+            free(paths);
+            if (loadErr) break;
+        } else {
+            if (cc < 0 || cc > MAX_COMMITS) { loadErr = 1; break; }
+            r->commits = GrowArr(r->commits, &r->commitCap, cc + 1, sizeof(Commit));
+            if (r->commitCap < cc) { loadErr = 1; break; }
+            for (int k = 0; k < cc && !loadErr; k++) {
+                Commit *c = &r->commits[k];
+                memset(c, 0, sizeof *c);
+                RSInto(f, c->id, (int)sizeof c->id);       /* the old short id: only used to match up forks below */
+                RSInto(f, c->message, TEXT_LEN);
+                c->time   = RI(f);
+                c->author = ver >= 2 ? (int)RI(f) : -1;
+                int ff = (int)RI(f);
+                if (ff < 0 || ff > 64) { loadErr = 1; break; }
+                c->fileCount = ff;
+                for (int j = 0; j < ff; j++) {
+                    char nm[PATH_LEN];
+                    RSInto(f, nm, PATH_LEN);
+                    int b = (int)RI(f);
+                    if (b < 0 || b >= r->blobCount || !nm[0]) { loadErr = 1; break; }
+                    oldEntries[j].name = Intern(nm);
+                    oldEntries[j].blob = b;
+                    if (!oldEntries[j].name) loadErr = 1;
+                }
+                if (ver >= 6) c->copied = RI(f) != 0;
+                if (loadErr) break;
+                qsort(oldEntries, (size_t)ff, sizeof oldEntries[0], CmpOldEntry);
+                c->names = malloc((size_t)(ff ? ff : 1) * sizeof *c->names);
+                c->blobs = malloc((size_t)(ff ? ff : 1) * sizeof *c->blobs);
+                c->modes = calloc((size_t)(ff ? ff : 1), 1);
+                r->commitCount++;
+                if (!c->names || !c->blobs || !c->modes) { loadErr = 1; break; }
+                for (int j = 0; j < ff; j++) { c->names[j] = oldEntries[j].name; c->blobs[j] = oldEntries[j].blob; }
+            }
+            if (loadErr) break;
         }
 
         int ic = (int)RI(f);
@@ -1791,8 +2758,8 @@ static bool Load(void)
                 if (n2 < 0 || n2 > MAX_DRAFT) { loadErr = 1; break; }
                 Draft *d = GetDraft(r, uid, true);
                 for (int j = 0; j < n2 && !loadErr; j++) {
-                    char nm[NAME_LEN];
-                    RSInto(f, nm, NAME_LEN);
+                    char nm[PATH_LEN];
+                    RSInto(f, nm, PATH_LEN);
                     int txLen = 0;
                     char *tx = RSN(f, &txLen);
                     bool del = RI(f) != 0;
@@ -1802,7 +2769,7 @@ static bool Load(void)
                     if (d && !loadErr && d->count < MAX_DRAFT) {
                         WorkFile *e = &d->files[d->count++];
                         memset(e, 0, sizeof *e);
-                        snprintf(e->name, NAME_LEN, "%s", nm);
+                        snprintf(e->name, PATH_LEN, "%s", nm);
                         WF_SetN(e, tx, txLen);
                         e->deleted = del;
                         e->base = base;
@@ -1836,6 +2803,39 @@ static bool Load(void)
         }
     }
     fclose(f);
+
+    /* older saves: turn every commit into a git commit. Forks remember where they
+       started by the original's old short id, so that's matched up first. */
+    if (!loadErr && ver < 7) {
+        static int baseAt[MAX_REPOS];
+        for (int i = 0; i < repoCount; i++) {
+            Repo *r = &repos[i];
+            baseAt[i] = -1;
+            if (!r->isFork || !r->forkBase[0]) continue;
+            for (int j = 0; j < repoCount && baseAt[i] < 0; j++)
+                if (repos[j].owner == r->forkOwner && EqualsCI(repos[j].name, r->forkName))
+                    for (int k = 0; k < repos[j].commitCount; k++)
+                        if (strcmp(repos[j].commits[k].id, r->forkBase) == 0) { baseAt[i] = j * 1000000 + k; break; }
+        }
+        for (int i = 0; i < repoCount && !loadErr; i++) if (!UpgradeCommits(&repos[i])) loadErr = 1;
+        for (int i = 0; i < repoCount && !loadErr; i++) {
+            Repo *r = &repos[i];
+            if (!r->isFork || !r->forkBase[0]) continue;
+            if (baseAt[i] < 0) { snprintf(r->forkBase, sizeof r->forkBase, "%040d", 0); continue; }   /* no longer matches */
+            ShaHex(repos[baseAt[i] / 1000000].commits[baseAt[i] % 1000000].sha, r->forkBase);
+        }
+        if (!loadErr) {
+            /* keep the old file, just in case */
+            char old[64];
+            snprintf(old, sizeof old, "%s.v%d-backup", SAVE_FILE, ver);
+            if (!FileExists(old)) {
+                int sz = 0;
+                unsigned char *d = LoadFileData(SAVE_FILE, &sz);
+                if (d) { SaveFileData(old, d, sz); UnloadFileData(d); }
+            }
+            MarkDirty();
+        }
+    }
 
     if (loadErr) {
         for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);
@@ -2056,7 +3056,7 @@ static int XToCol(const char *line, int lineLen, float x)
    are added, deleted or committed around it. "" means "open the first one". */
 static void SelectFileName(const char *name)
 {
-    snprintf(selName, NAME_LEN, "%.*s", NAME_LEN - 1, name ? name : "");
+    snprintf(selName, PATH_LEN, "%.*s", PATH_LEN - 1, name ? name : "");
     ed.cursor = 0; ed.scrollX = ed.scrollY = 0;
     ed.focused = false;
 }
@@ -2267,47 +3267,41 @@ static const char *RepoLabel(int i)
 
 /* How many files a commit touched and how many lines it added / removed.
    Worked out the first time it's needed, then remembered. */
+typedef struct { Repo *r; int files, adds, dels; } StatCtx;
+static void StatEach(void *ctx, const char *name, int ob, int nb)
+{
+    (void)name;
+    StatCtx *s = ctx;
+    s->files++;
+    if (ob == nb || BlobBinary(s->r, ob) || BlobBinary(s->r, nb)) return;   /* binary: no lines to count */
+    int a, d;
+    ComputeDiff(BlobText(s->r, ob), BlobText(s->r, nb), &a, &d);
+    s->adds += a; s->dels += d;
+}
 static void CommitStats(Repo *r, int ci)
 {
     Commit *c = &r->commits[ci];
     if (c->statsDone) return;
-    Commit *p = ci > 0 ? &r->commits[ci - 1] : NULL;
-    int files = 0, adds = 0, dels = 0, a, d;
-    for (int k = 0; k < c->fileCount; k++) {
-        int pk = p ? FindInCommit(p, c->names[k]) : -1;
-        int ob = pk >= 0 ? p->blobs[pk] : -1;
-        if (ob == c->blobs[k]) continue;
-        files++;
-        if (BlobBinary(r, ob) || BlobBinary(r, c->blobs[k])) continue;   /* binary: no lines to count */
-        ComputeDiff(BlobText(r, ob), BlobText(r, c->blobs[k]), &a, &d);
-        adds += a; dels += d;
-    }
-    if (p) for (int k = 0; k < p->fileCount; k++) {
-        if (FindInCommit(c, p->names[k]) >= 0) continue;          /* file was deleted */
-        files++;
-        if (BlobBinary(r, p->blobs[k])) continue;
-        ComputeDiff(BlobText(r, p->blobs[k]), "", &a, &d);
-        adds += a; dels += d;
-    }
-    c->sFiles = files; c->sAdds = adds; c->sDels = dels;
+    StatCtx s = {r, 0, 0, 0};
+    WalkChanges(ParentOf(r, ci), c, StatEach, &s);
+    c->sFiles = s.files; c->sAdds = s.adds; c->sDels = s.dels;
     c->statsDone = true;
 }
 
 /* The files a commit changed: kind is 'A' added, 'M' modified, 'D' deleted. Cheap - no diffing. */
-static int CommitFileList(Repo *r, int ci, char *kinds, const char **names)
+typedef struct { char *kinds; const char **names; int n, cap; } ListCtx;
+static void ListEach(void *ctx, const char *name, int ob, int nb)
 {
-    Commit *c = &r->commits[ci];
-    Commit *p = ci > 0 ? &r->commits[ci - 1] : NULL;
-    int n = 0;
-    for (int k = 0; k < c->fileCount; k++) {
-        int pk = p ? FindInCommit(p, c->names[k]) : -1;
-        if (pk >= 0 && p->blobs[pk] == c->blobs[k]) continue;
-        kinds[n] = pk < 0 ? 'A' : 'M';
-        names[n++] = c->names[k];
-    }
-    if (p) for (int k = 0; k < p->fileCount; k++)
-        if (FindInCommit(c, p->names[k]) < 0) { kinds[n] = 'D'; names[n++] = p->names[k]; }
-    return n;
+    ListCtx *l = ctx;
+    if (l->n >= l->cap) return;
+    l->kinds[l->n] = ob < 0 ? 'A' : nb < 0 ? 'D' : 'M';
+    l->names[l->n++] = name;
+}
+static int CommitFileList(Repo *r, int ci, char *kinds, const char **names, int cap)
+{
+    ListCtx l = {kinds, names, 0, cap};
+    WalkChanges(ParentOf(r, ci), &r->commits[ci], ListEach, &l);
+    return l.n;
 }
 
 /* Everything one user did on one day. */
@@ -3058,7 +4052,7 @@ static void Unfocus(void)
     tfSearch.active = tfName.active = tfDesc.active = false;
     tfNewFile.active = tfCommit.active = tfIssue.active = false;
     tfUser.active = tfPass.active = tfPass2.active = tfCode.active = false;
-    tfUpPath.active = tfUpMsg.active = tfInvite.active = false;
+    tfUpPath.active = tfUpMsg.active = tfInvite.active = tfEmail.active = false;
     tfOldPass.active = tfNewPass.active = tfNewPass2.active = tfDelPass.active = false;
     ed.focused = false;
     armedId = 0;
@@ -3159,6 +4153,8 @@ static void OpenAccount(void)
     TF_Clear(&tfAvatar);
     snprintf(tfBio.buf, TEXT_LEN, "%s", u ? u->bio : "");
     tfBio.len = (int)strlen(tfBio.buf);
+    snprintf(tfEmail.buf, TEXT_LEN, "%s", u ? u->email : "");
+    tfEmail.len = (int)strlen(tfEmail.buf);
     screen = SCR_ACCOUNT;
 }
 
@@ -3854,6 +4850,58 @@ static void SettingsAccountTab(User *u, float top)
     if (make) ShowRecoveryCode(u, false);
 }
 
+/* ---------- Settings > Git ---------- */
+/* An email git can use: one @, no spaces or < > (they'd break git's author line). "" is fine (= none). */
+static bool UsableEmail(const char *e)
+{
+    if (!e[0]) return true;
+    const char *at = strchr(e, '@');
+    if (!at || at == e || !at[1] || strchr(at + 1, '@')) return false;
+    for (const char *p = e; *p; p++) if (*p == ' ' || *p == '<' || *p == '>' || (unsigned char)*p < 32) return false;
+    return true;
+}
+
+static void SettingsGitTab(User *u, float top)
+{
+    /* the server */
+    Rectangle a = {20, top, (float)W - 40, 222};
+    DrawRectangleRec(a, UI_PANEL);
+    DrawRectangleLinesEx(a, 1, UI_BORDER);
+    float x = a.x + 24, y = a.y, fw = a.width - 48;
+    DrawBold("Using real git", (int)x, (int)y + 18, FS, UI_TEXT);
+    if (gitPort) {
+        DrawCircle((int)x + 6, (int)y + 60, 6, UI_GREENT);
+        DrawFit(TextFormat("Mini GitHub's git server is running at http://localhost:%d  (only this computer can reach it)", gitPort),
+                (int)x + 22, (int)y + 50, FS, (int)fw - 22, UI_TEXT);
+    } else {
+        DrawCircle((int)x + 6, (int)y + 60, 6, UI_REDT);
+        DrawFit(TextFormat("The git server isn't running: %s", gitProblem), (int)x + 22, (int)y + 50, FS, (int)fw - 22, UI_ORANGE);
+    }
+    DrawFit("1.  Open a repository, press Code, and copy its address.", (int)x, (int)y + 88, FS, (int)fw, UI_MUTED);
+    DrawFit("2.  In a terminal, type  git clone  and paste the address.", (int)x, (int)y + 114, FS, (int)fw, UI_MUTED);
+    DrawFit("3.  Change files, git commit, then git push. When git asks, use your Mini GitHub username and password.",
+            (int)x, (int)y + 140, FS, (int)fw, UI_MUTED);
+    DrawFit("To bring in a project you already have: make a new repository without a README, then git push to its address.",
+            (int)x, (int)y + 176, FS, (int)fw, UI_MUTED);
+
+    /* the email */
+    Rectangle b = {20, top + 238, (float)W - 40, 148};
+    DrawRectangleRec(b, UI_PANEL);
+    DrawRectangleLinesEx(b, 1, UI_BORDER);
+    x = b.x + 24; y = b.y;
+    DrawBold("Your email on commits", (int)x, (int)y + 18, FS, UI_TEXT);
+    DrawFit("Commits you make here show it in git. Pushed commits with this email count as yours.",
+            (int)x, (int)y + 46, FS, (int)fw, UI_MUTED);
+    char def[TEXT_LEN];
+    snprintf(def, sizeof def, "%s@minigithub.local (if you leave it empty)", u->name);
+    bool enter = TextFieldUI(&tfEmail, (Rectangle){x, y + 84, fw - 150, 40}, def);
+    bool changed = strcmp(tfEmail.buf, u->email) != 0;
+    if (ButtonEx((Rectangle){x + fw - 140, y + 84, 140, 40}, "Save email", changed ? UI_GREEN : UI_BTN, changed) || (enter && changed)) {
+        if (!UsableEmail(tfEmail.buf)) Toast("That doesn't look like an email address");
+        else { snprintf(u->email, sizeof u->email, "%s", tfEmail.buf); MarkDirty(); Toast(u->email[0] ? "Email saved" : "Email removed"); }
+    }
+}
+
 static void ScreenAccount(void)
 {
     User *u = FindUserById(curUser);
@@ -3865,8 +4913,8 @@ static void ScreenAccount(void)
     if (Button((Rectangle){(float)W - 160, 88, 140, 40}, "Back", UI_BTN)) { GoHome(); return; }
 
     int tx = 20;
-    const char *labels[2] = {"Profile", "Password & account"};
-    for (int t = 0; t < 2; t++) {
+    const char *labels[3] = {"Profile", "Password & account", "Git"};
+    for (int t = 0; t < 3; t++) {
         int w = MeasureText(labels[t], FS) + 28;
         Rectangle tr = {(float)tx, 156, (float)w, 38};
         bool on = settingsTab == t;
@@ -3881,8 +4929,9 @@ static void ScreenAccount(void)
     }
     DrawLine(0, 194, W, 194, UI_BORDER);
 
-    if (settingsTab == 0) SettingsProfileTab(u, 210);
-    else                  SettingsAccountTab(u, 210);
+    if (settingsTab == 0)      SettingsProfileTab(u, 210);
+    else if (settingsTab == 1) SettingsAccountTab(u, 210);
+    else                       SettingsGitTab(u, 210);
 }
 
 /* ------------------------------------------------------------------ */
@@ -4292,6 +5341,8 @@ static void ContentScores(const char *d, int len, unsigned short out[LANG_COUNT]
 
 static int ExtLang(const char *name)
 {
+    const char *slash = strrchr(name, '/');                  /* just the file's own name, not its folders */
+    if (slash) name = slash + 1;
     if (EqualsCI(name, "Makefile") || EqualsCI(name, "GNUmakefile")) return LANG_MAKE;
     const char *dot = strrchr(name, '.');
     if (!dot) return -1;
@@ -4306,7 +5357,9 @@ static int PickLang(const unsigned short sc[LANG_COUNT], const char *name)
     for (int l = 0; l < LANG_COUNT; l++) total[l] = sc[l];
     int ext = ExtLang(name);
     if (ext >= 0) total[ext] += 8;                            /* the ending counts, but content can outvote it */
-    if (ext == LANG_MAKE && !strchr(name, '.')) total[ext] += 8;   /* a file called "Makefile" really is one */
+    const char *base = strrchr(name, '/');
+    base = base ? base + 1 : name;
+    if (ext == LANG_MAKE && !strchr(base, '.')) total[ext] += 8;   /* a file called "Makefile" really is one */
     if (ext == LANG_C) total[LANG_CPP] += 4;                  /* a .h file could be either */
     if (ext == LANG_TEXT) return LANG_TEXT;                   /* .txt is always plain text */
     int best = -1;
@@ -4840,7 +5893,8 @@ static void SavedToast(const char *path)
 /* Saves one file's bytes, exactly as they are. */
 static void DownloadFile(const char *name, const char *data, int len)
 {
-    const char *path = FreePath(DownloadFolder(), name);
+    const char *slash = strrchr(name, '/');                 /* "src/main.c" is saved as main.c */
+    const char *path = FreePath(DownloadFolder(), slash ? slash + 1 : name);
     FILE *f = fopen(path, "wb");
     if (!f) { Toast("Couldn't save the file - is the Downloads folder read-only?"); return; }
     bool ok = fwrite(data, 1, (size_t)len, f) == (size_t)len;
@@ -4888,7 +5942,9 @@ static const char *WriteZip(const char *path, const char *folder, OutFile *files
     unsigned dosTime = (unsigned)(lt->tm_hour << 11 | lt->tm_min << 5 | lt->tm_sec / 2);
     unsigned dosDate = (unsigned)((lt->tm_year - 80) << 9 | (lt->tm_mon + 1) << 5 | lt->tm_mday);
 
-    struct { uint32_t crc, csize, offset; int method; char name[NAME_LEN * 3]; int len; } ent[MAX_FILES + MAX_DRAFT + 1];
+    typedef struct { uint32_t crc, csize, offset; int method; char name[PATH_LEN + NAME_LEN + 24]; int len; } ZipEnt;
+    ZipEnt *ent = malloc((size_t)(n + 1) * sizeof(ZipEnt));
+    if (!ent) { fclose(f); remove(path); return "Out of memory"; }
     int count = 0;
     bool ok = true;
 
@@ -4952,6 +6008,7 @@ static const char *WriteZip(const char *path, const char *folder, OutFile *files
     Put16(f, (unsigned)count); Put16(f, (unsigned)count);
     Put32(f, dirSize); Put32(f, dirStart);
     Put16(f, 0);
+    free(ent);
     ok = !ferror(f) && ok;
     ok = fclose(f) == 0 && ok;
     if (!ok) { remove(path); return "Couldn't save the zip - is the disk full?"; }
@@ -5339,12 +6396,6 @@ static int FindRepoOf(int owner, const char *name)
     return -1;
 }
 
-static int CommitIndexById(Repo *r, const char *id)
-{
-    for (int k = 0; k < r->commitCount; k++) if (strcmp(r->commits[k].id, id) == 0) return k;
-    return -1;
-}
-
 static bool IsForkOf(Repo *fork, Repo *orig)
 {
     return fork->isFork && fork->forkOwner == orig->owner && EqualsCI(fork->forkName, orig->name);
@@ -5369,43 +6420,83 @@ static int FindForkOf(int uid, int orig)
 }
 
 typedef struct {
-    int  up;        /* index of the original, -1 = gone                        */
-    bool related;   /* the original still has the commit this fork started from */
-    int  base;      /* index of that commit in the original (-1 = none)         */
-    int  behind;    /* the original's commits this fork doesn't have yet        */
-    int  ahead;     /* this fork's commits the original doesn't have            */
+    int  up;        /* index of the original, -1 = gone                              */
+    bool related;   /* the two still share history                                   */
+    int  base;      /* the original's newest commit this fork also has (-1 = none)   */
+    int  behind;    /* the original's commits this fork doesn't have yet             */
+    int  ahead;     /* this fork's commits the original doesn't have                 */
 } ForkState;
 
+/* Commits are matched by their git fingerprint, so it doesn't matter how
+   they got here - Sync fork, or pushed with git. Worked out again only
+   when either history changes. */
 static ForkState GetForkState(Repo *r)
 {
+    static struct { const Repo *r, *p; unsigned rg, pg; int rc, pc; ForkState s; } memo[8];
     ForkState s = {-1, false, -1, 0, 0};
     s.up = Upstream(r);
     if (s.up < 0) return s;
     Repo *p = &repos[s.up];
-    s.base    = r->forkBase[0] ? CommitIndexById(p, r->forkBase) : -1;
-    s.related = !r->forkBase[0] || s.base >= 0;
-    if (!s.related) return s;
-    s.behind = p->commitCount - (s.base + 1);
+    int slot = (int)(r - repos) % 8;
+    if (memo[slot].r == r && memo[slot].p == p && memo[slot].rg == r->gen && memo[slot].pg == p->gen &&
+        memo[slot].rc == r->commitCount && memo[slot].pc == p->commitCount && memo[slot].s.up == s.up) return memo[slot].s;
+    for (int k = 0; k < p->commitCount; k++) {
+        if (CommitBySha(r, p->commits[k].sha) >= 0) s.base = k;
+        else s.behind++;
+    }
     for (int k = 0; k < r->commitCount; k++)
-        if (CommitIndexById(p, r->commits[k].id) < 0) s.ahead++;
+        if (CommitBySha(p, r->commits[k].sha) < 0) s.ahead++;
+    s.related = s.base >= 0 || !r->forkBase[0] || !p->commitCount || !r->commitCount;
+    memo[slot].r = r; memo[slot].p = p; memo[slot].rg = r->gen; memo[slot].pg = p->gen;
+    memo[slot].rc = r->commitCount; memo[slot].pc = p->commitCount; memo[slot].s = s;
     return s;
 }
 
-/* Copies commit ci of src onto the end of dst. Blob numbers differ between
-   repositories, so each file's contents are stored again in dst (InternBlob
-   reuses a blob when dst already has the same contents). */
+/* Copies commit ci of src onto the end of dst - the very same git commit,
+   so it keeps its fingerprint. Blob numbers differ between repositories,
+   so each file's contents are stored again in dst (InternBlob reuses a blob
+   when dst already has it). The commits it was built on must already be in dst. */
 static bool CopyCommit(Repo *dst, Repo *src, int ci)
 {
-    if (dst->commitCount >= MAX_COMMITS) return false;
-    Commit c = src->commits[ci];
-    for (int j = 0; j < c.fileCount; j++) {
-        int b = InternBlob(dst, src->blobs[c.blobs[j]].data, src->blobs[c.blobs[j]].len);
-        if (b < 0) return false;
-        c.blobs[j] = b;
+    Commit *s = &src->commits[ci];
+    if (CommitBySha(dst, s->sha) >= 0) return true;               /* already there */
+    Commit c = *s;
+    int n = s->fileCount;
+    c.names = malloc((size_t)(n ? n : 1) * sizeof *c.names);
+    c.blobs = malloc((size_t)(n ? n : 1) * sizeof *c.blobs);
+    c.modes = malloc((size_t)(n ? n : 1));
+    c.raw   = malloc((size_t)s->rawLen + 1);
+    if (!c.names || !c.blobs || !c.modes || !c.raw) { FreeCommit(&c); return false; }
+    memcpy(c.names, s->names, (size_t)n * sizeof *c.names);
+    memcpy(c.modes, s->modes, (size_t)n);
+    memcpy(c.raw, s->raw, (size_t)s->rawLen + 1);
+    for (int j = 0; j < n; j++) {
+        Blob *b = &src->blobs[s->blobs[j]];
+        c.blobs[j] = InternBlobSha(dst, b->data, b->len, b->sha);
+        if (c.blobs[j] < 0) { FreeCommit(&c); return false; }
     }
-    c.copied    = true;
-    c.statsDone = false;
-    dst->commits[dst->commitCount++] = c;
+    for (int q = 0; q < s->parentCount; q++) {
+        c.parents[q] = CommitBySha(dst, src->commits[s->parents[q]].sha);
+        if (c.parents[q] < 0) { FreeCommit(&c); return false; }
+    }
+    c.copied = true;
+    if (!AppendCommit(dst, &c)) { FreeCommit(&c); return false; }
+    return true;
+}
+
+/* Copies every commit of src that dst doesn't have, oldest first.
+   If it fails part way, dst goes back to how it was. */
+static bool CopyMissing(Repo *dst, Repo *src)
+{
+    int before = dst->commitCount;
+    for (int k = 0; k < src->commitCount; k++)
+        if (!CopyCommit(dst, src, k)) {
+            while (dst->commitCount > before) FreeCommit(&dst->commits[--dst->commitCount]);
+            MapFree(&dst->commitMap);
+            for (int j = 0; j < dst->commitCount; j++) MapPut(&dst->commitMap, dst->commits[j].sha, j);
+            dst->gen++;
+            return false;
+        }
     return true;
 }
 
@@ -5426,31 +6517,31 @@ static void TryForkRepo(int orig)
     r->isFork    = true;
     r->forkOwner = p->owner;
     snprintf(r->forkName, NAME_LEN, "%s", p->name);
-    snprintf(r->forkBase, sizeof r->forkBase, "%s", p->commitCount ? Head(p)->id : "");
-    for (int k = 0; k < p->commitCount; k++)
-        if (!CopyCommit(r, p, k)) {
-            DeleteRepo(repoCount - 1);
-            Toast("Couldn't copy that repository - it's too big");
-            return;
-        }
+    snprintf(r->branch, NAME_LEN, "%s", p->branch);
+    if (p->commitCount) ShaHex(Head(p)->sha, r->forkBase); else r->forkBase[0] = 0;
+    if (!CopyMissing(r, p)) {
+        DeleteRepo(repoCount - 1);
+        Toast("Couldn't copy that repository - it's too big");
+        return;
+    }
     MarkDirty();
     OpenRepo(repoCount - 1);
     Toast(TextFormat("Forked %s / %s - this copy is yours to change", UserName(p->owner), p->name));
 }
 
 /* A file's contents in a commit ("has" = false: the file isn't there). */
-typedef struct { bool has; const char *data; int len; } Version;
+typedef struct { bool has; const char *data; int len; int mode; } Version;
 static Version VersionIn(Repo *r, Commit *c, const char *name)
 {
-    Version v = {false, NULL, 0};
+    Version v = {false, NULL, 0, 0};
     int k = c ? FindInCommit(c, name) : -1;
-    if (k >= 0) { v.has = true; v.data = r->blobs[c->blobs[k]].data; v.len = r->blobs[c->blobs[k]].len; }
+    if (k >= 0) { v.has = true; v.data = r->blobs[c->blobs[k]].data; v.len = r->blobs[c->blobs[k]].len; v.mode = c->modes[k]; }
     return v;
 }
 static bool SameVersion(Version a, Version b)
 {
     if (a.has != b.has) return false;
-    return !a.has || (a.len == b.len && memcmp(a.data, b.data, (size_t)a.len) == 0);
+    return !a.has || (a.len == b.len && a.mode == b.mode && memcmp(a.data, b.data, (size_t)a.len) == 0);
 }
 
 /* Brings the original's new commits into fork r.
@@ -5462,38 +6553,38 @@ static const char *SyncFork(Repo *r, char *done, int doneCap)
     if (!s.related)   return "The original repository's history no longer matches this fork";
     if (!s.behind)    return "Already up to date";
     Repo *p = &repos[s.up];
-    const char *who = TextFormat("%s / %s", UserName(p->owner), p->name);
+    char who[96];
+    snprintf(who, sizeof who, "%.40s / %.40s", UserName(p->owner), p->name);
+    int behind = s.behind;
 
     /* 1) fast-forward: you haven't committed anything of your own, so just copy their new commits */
     if (s.ahead == 0) {
-        if (r->commitCount + s.behind > MAX_COMMITS) return "This fork has reached its commit limit";
-        for (int k = s.base + 1; k < p->commitCount; k++) {
-            if (!CopyCommit(r, p, k)) return "This fork is out of storage space";
-            snprintf(r->forkBase, sizeof r->forkBase, "%s", p->commits[k].id);
-        }
-        snprintf(done, (size_t)doneCap, "Synced: copied %d commit%s from %s", s.behind, s.behind == 1 ? "" : "s", who);
+        if (r->commitCount + behind > MAX_COMMITS) return "This fork has reached its commit limit";
+        if (!CopyMissing(r, p)) return "This fork is out of storage space";
+        ShaHex(Head(p)->sha, r->forkBase);
+        snprintf(done, (size_t)doneCap, "Synced: copied %d commit%s from %s", behind, behind == 1 ? "" : "s", who);
         return NULL;
     }
 
     /* 2) three-way merge. For every file, compare
-            base   = the original at forkBase (where the two histories split)
+            base   = the original's newest commit that this fork also has
             theirs = the original now
             ours   = this fork now
           If only one side changed the file, take that side. If both made the
           same change, fine. If both changed it differently, that's a conflict. */
     Commit *cb = s.base >= 0 ? &p->commits[s.base] : NULL, *ct = Head(p), *co = Head(r);
-    const char *names[MAX_FILES * 3];
+    static const char *names[MAX_FILES * 3];
+    static char pick[MAX_FILES * 3];      /* 'o' ours, 't' theirs */
     int nn = 0;
     Commit *sides[3] = {co, ct, cb};
-    for (int sd = 0; sd < 3; sd++)
-        for (int j = 0; sides[sd] && j < sides[sd]->fileCount; j++) {
-            bool seen = false;
-            for (int q = 0; q < nn; q++) if (strcmp(names[q], sides[sd]->names[j]) == 0) seen = true;
-            if (!seen) names[nn++] = sides[sd]->names[j];
-        }
+    Snap all = {0};
+    for (int sd = 0; sd < 3; sd++)                                 /* every path on any side, once */
+        for (int j = 0; sides[sd] && j < sides[sd]->fileCount; j++)
+            if (SnapFind(&all, sides[sd]->names[j]) < 0 && !SnapSet(&all, sides[sd]->names[j], 0, 0)) { SnapFree(&all); return "Out of memory"; }
+    for (int q = 0; q < all.n; q++) names[nn++] = all.names[q];
+    SnapFree(&all);
 
     /* first pass: decide every file, and stop before changing anything if there's a conflict */
-    char pick[MAX_FILES * 3];      /* 'o' ours, 't' theirs */
     int  conflicts = 0, keep = 0;
     const char *firstConflict = NULL;
     bool changesOurs = false;
@@ -5509,29 +6600,42 @@ static const char *SyncFork(Repo *r, char *done, int doneCap)
         return TextFormat("Can't merge: you and %s both changed %s%s", UserName(p->owner), firstConflict,
                           conflicts > 1 ? TextFormat(" (and %d more file%s)", conflicts - 1, conflicts == 2 ? "" : "s") : "");
     if (keep > MAX_FILES) return TextFormat("The merged repository would have more than %d files", MAX_FILES);
+    if (r->commitCount + behind + 1 > MAX_COMMITS) return "This fork has reached its commit limit";
 
-    /* nothing of theirs to bring in (e.g. you'd already made the same changes): just remember we're level */
-    if (!changesOurs) {
-        snprintf(r->forkBase, sizeof r->forkBase, "%s", ct->id);
-        snprintf(done, (size_t)doneCap, "Up to date: you already have everything from %s", who);
-        return NULL;
-    }
-    if (r->commitCount >= MAX_COMMITS) return "This fork has reached its commit limit";
+    /* bring their commits in too (a merge commit points at both sides, so git needs both) */
+    int ourHead = r->commitCount - 1;
+    if (!CopyMissing(r, p)) return "This fork is out of storage space";
+    int theirHead = CommitBySha(r, ct->sha);
+    co = &r->commits[ourHead];                                         /* the list may have moved */
 
-    /* second pass: build the merge commit */
-    Commit m;
+    /* even if nothing of theirs changes your files, the merge commit records that you have their history */
+    Snap m;
     memset(&m, 0, sizeof m);
-    for (int q = 0; q < nn; q++) {
+    bool ok = SnapRoom(&m, keep > 0 ? keep : 1);
+    for (int q = 0; q < nn && ok; q++) {
         Version v = pick[q] == 'o' ? VersionIn(r, co, names[q]) : VersionIn(p, ct, names[q]);
         if (!v.has) continue;                                           /* deleted on the winning side */
         int bl = InternBlob(r, v.data, v.len);
-        if (bl < 0) return "This fork is out of storage space";
-        snprintf(m.names[m.fileCount], NAME_LEN, "%s", names[q]);
-        m.blobs[m.fileCount++] = bl;
+        ok = bl >= 0 && SnapSet(&m, names[q], bl, v.mode);
     }
-    FinishCommit(r, &m, TextFormat("Merge %d commit%s from %s", s.behind, s.behind == 1 ? "" : "s", who));
-    snprintf(r->forkBase, sizeof r->forkBase, "%s", ct->id);
-    snprintf(done, (size_t)doneCap, "Merged %d commit%s from %s into a new commit", s.behind, s.behind == 1 ? "" : "s", who);
+    if (!ok) { SnapFree(&m); return "This fork is out of storage space"; }
+    /* the merge sits on top of your latest commit (git's "first parent") and theirs.
+       FinishCommit builds on the last commit in the list - theirs now - so it's put together here */
+    Commit c;
+    memset(&c, 0, sizeof c);
+    c.fileCount = m.n; c.names = m.names; c.blobs = m.blobs; c.modes = m.modes;
+    c.author = curUser;
+    c.time = (long long)time(NULL);
+    snprintf(c.message, TEXT_LEN, "Merge %d commit%s from %s", behind, behind == 1 ? "" : "s", who);
+    c.parents[0] = ourHead; c.parents[1] = theirHead; c.parentCount = 2;
+    const uint8_t *par[2] = {r->commits[ourHead].sha, r->commits[theirHead].sha};
+    uint8_t tree[20];
+    if (CommitTree(r, &c, tree, NULL, NULL))
+        c.raw = MakeRawCommit(tree, par, 2, UserName(curUser), UserEmail(curUser), c.time, c.message, &c.rawLen);
+    if (!c.raw || !AppendCommit(r, &c)) { FreeCommit(&c); return "Couldn't save the merge commit"; }
+    ShaHex(ct->sha, r->forkBase);
+    if (!changesOurs) snprintf(done, (size_t)doneCap, "Up to date: you already had everything from %s", who);
+    else snprintf(done, (size_t)doneCap, "Merged %d commit%s from %s into a new commit", behind, behind == 1 ? "" : "s", who);
     return NULL;
 }
 
@@ -5567,8 +6671,68 @@ static float DrawForkBar(Repo *r, float top)
     return top + 46 + 12;
 }
 
+/* ---------- the Code menu: clone address and Download ZIP ---------- */
+static const char *CloneUrl(Repo *r);
+static bool      codeMenu;             /* the menu under the Code button is open */
+static Rectangle codeBtn;              /* where the Code button is              */
+
+/* The menu is drawn after everything else on the page so it sits on top,
+   but it takes its clicks first (before the page under it can). So this is
+   called twice a frame: draw = false to handle the mouse, true to draw. */
+static void CodeMenu(Repo *r, bool draw)
+{
+    if (!codeMenu) return;
+    float w = 600, h = gitPort ? 236 : 210;
+    Rectangle m = {codeBtn.x + codeBtn.width - w, codeBtn.y + codeBtn.height + 6, w, h};
+    if (m.x < 20) m.x = 20;
+    const char *url = CloneUrl(r);
+    Rectangle box  = {m.x + 16, m.y + 48, w - 32 - 96, 40};
+    Rectangle copy = {box.x + box.width + 8, box.y, 88, 40};
+    Rectangle zip  = {m.x + 16, m.y + h - 56, w - 32, 40};
+    Vector2 mouse = GetMousePosition();
+
+    if (!draw) {
+        if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+        if (CheckCollisionPointRec(mouse, codeBtn)) return;            /* the button itself toggles it */
+        if (!CheckCollisionPointRec(mouse, m)) { codeMenu = false; return; }
+        clickUsed = true;                                              /* nothing under the menu gets this click */
+        if (gitPort && CheckCollisionPointRec(mouse, copy)) {
+            SetClipboardText(url);
+            Toast("Copied the address - use it with git clone");
+        } else if (CheckCollisionPointRec(mouse, zip)) {
+            codeMenu = false;
+            DownloadRepo(r);
+        }
+        return;
+    }
+    DrawRectangleRounded((Rectangle){m.x + 3, m.y + 5, m.width, m.height}, 0.04f, 6, (Color){0, 0, 0, 110});
+    DrawRectangleRounded(m, 0.04f, 6, (Color){22, 27, 34, 255});
+    DrawRectangleRoundedLinesEx(m, 0.04f, 6, 1, UI_BORDER);
+    DrawBold("Clone with git", (int)m.x + 16, (int)m.y + 14, FS, UI_TEXT);
+    if (gitPort) {
+        DrawRectangleRec(box, UI_BASE);
+        DrawRectangleLinesEx(box, 1, UI_BORDER);
+        DrawFit(url, (int)box.x + 10, (int)box.y + 10, FS, (int)box.width - 20, UI_TEXT);
+        bool hc = CheckCollisionPointRec(mouse, copy);
+        if (hc) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        DrawRectangleRounded(copy, 0.25f, 6, hc ? ColorBrightness(UI_BTN, 0.15f) : UI_BTN);
+        DrawText("Copy", (int)(copy.x + (copy.width - MeasureText("Copy", FS)) / 2), (int)copy.y + 10, FS, UI_TEXT);
+        DrawFit("Works with git clone, pull and push. When git asks, sign", (int)m.x + 16, (int)m.y + 100, FS, (int)w - 32, UI_MUTED);
+        DrawFit("in with your Mini GitHub username and password.", (int)m.x + 16, (int)m.y + 124, FS, (int)w - 32, UI_MUTED);
+    } else {
+        DrawFit("Mini GitHub's git server isn't running:", (int)m.x + 16, (int)m.y + 50, FS, (int)w - 32, UI_ORANGE);
+        DrawFit(gitProblem, (int)m.x + 16, (int)m.y + 76, FS, (int)w - 32, UI_MUTED);
+    }
+    DrawLine((int)m.x + 1, (int)(zip.y - 14), (int)(m.x + m.width - 1), (int)(zip.y - 14), UI_BORDER);
+    bool hz = CheckCollisionPointRec(mouse, zip);
+    if (hz) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+    DrawRectangleRounded(zip, 0.25f, 6, hz ? ColorBrightness(UI_BTN, 0.15f) : UI_BTN);
+    DrawText("Download ZIP", (int)(zip.x + (zip.width - MeasureText("Download ZIP", FS)) / 2), (int)zip.y + 10, FS, UI_TEXT);
+}
+
 static bool DrawRepoHeader(Repo *r, int activeTab)
 {
+    CodeMenu(r, false);                    /* the open menu takes its clicks first */
     int x = 20, y = 72;
     const char *owner = UserName(r->owner);
     int w1 = MeasureText(owner, 30), w2 = MeasureText(" / ", 30), w3 = MeasureText(r->name, 30);
@@ -5614,7 +6778,8 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
         ToggleStar(r, curUser);
         MarkDirty();
     }
-    if (Button((Rectangle){(float)W - (mine ? 550 : 360), (float)y, 180, 38}, "Download ZIP", UI_BTN)) DownloadRepo(r);
+    codeBtn = (Rectangle){(float)W - (mine ? 550 : 360), (float)y, 180, 38};
+    if (Button(codeBtn, codeMenu ? "Code  ^" : "Code  v", UI_GREEN)) codeMenu = !codeMenu;
     if (!mine) {                       /* you can't fork your own repository - you already own it */
         int myFork = FindForkOf(curUser, curRepo);
         if (Button((Rectangle){(float)W - 550, (float)y, 180, 38},
@@ -5656,35 +6821,149 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
     return false;
 }
 
-/* File list on the left. Names come from the working files (yours) or the latest commit (theirs). */
+/* ---------- the file list, as folders ----------
+   Paths like "src/ui/button.c" are shown as a tree: a "src" folder with a
+   "ui" folder inside. Folders start closed (big projects stay tidy) and
+   open with a click; the folders holding the open file, and any folder
+   with changes of yours in it, are opened for you. */
+static const Repo  *openForRepo;
+static const char  *openFolders[512];
+static int          openFolderCount;
+
+static int FolderOpenIndex(const char *path)
+{
+    for (int i = 0; i < openFolderCount; i++) if (openFolders[i] == path) return i;
+    return -1;
+}
+static void OpenFolder(const char *path)
+{
+    if (path && FolderOpenIndex(path) < 0 && openFolderCount < 512) openFolders[openFolderCount++] = path;
+}
+static void ToggleFolder(const char *path)
+{
+    int i = FolderOpenIndex(path);
+    if (i >= 0) openFolders[i] = openFolders[--openFolderCount];
+    else OpenFolder(path);
+}
+/* Opens every folder above a file, e.g. "src" and "src/ui" for "src/ui/button.c". */
+static void RevealPath(const char *name)
+{
+    char buf[PATH_LEN];
+    snprintf(buf, sizeof buf, "%s", name);
+    for (char *s = strchr(buf, '/'); s; s = strchr(s + 1, '/')) { *s = 0; OpenFolder(Intern(buf)); *s = '/'; }
+}
+
+typedef struct { const char *name; int nameLen; int depth; int vi; bool folder; const char *path; int end; char status; } FileRow;
+static FileRow *fileRows;
+static int      fileRowCount, fileRowCap;
+
+/* Turns the (sorted) view into rows: a row for each folder, then its contents. */
+static void BuildFileRows(void)
+{
+    fileRowCount = 0;
+    int stack[64], depth = 0;                        /* rows of the folders we're inside */
+    char buf[PATH_LEN];
+    for (int i = 0; i <= viewCount; i++) {
+        const char *p = i < viewCount ? view[i].name : "";
+        /* how many of the current folders this path is still inside */
+        int keep = 0;
+        while (keep < depth) {
+            FileRow *f = &fileRows[stack[keep]];
+            size_t pl = strlen(f->path);
+            if (i < viewCount && strncmp(p, f->path, pl) == 0 && p[pl] == '/') keep++;
+            else break;
+        }
+        while (depth > keep) fileRows[stack[--depth]].end = fileRowCount;
+        if (i == viewCount) break;
+        /* new folders on the way to this file */
+        const char *seg = p;
+        for (int d = 0; d < keep; d++) seg = strchr(seg, '/') + 1;
+        for (const char *sl = strchr(seg, '/'); sl && depth < 64; sl = strchr(seg, '/')) {
+            fileRows = GrowArr(fileRows, &fileRowCap, fileRowCount + 2, sizeof(FileRow));
+            if (fileRowCount + 2 > fileRowCap) return;
+            snprintf(buf, sizeof buf, "%.*s", (int)(sl - p), p);
+            FileRow *f = &fileRows[fileRowCount];
+            memset(f, 0, sizeof *f);
+            f->name = seg; f->nameLen = (int)(sl - seg); f->depth = depth; f->vi = i; f->folder = true;
+            f->path = Intern(buf);
+            if (!f->path) return;
+            stack[depth++] = fileRowCount++;
+            seg = sl + 1;
+        }
+        fileRows = GrowArr(fileRows, &fileRowCap, fileRowCount + 1, sizeof(FileRow));
+        if (fileRowCount + 1 > fileRowCap) return;
+        FileRow *f = &fileRows[fileRowCount++];
+        memset(f, 0, sizeof *f);
+        f->name = seg; f->nameLen = (int)strlen(seg); f->depth = depth; f->vi = i;
+        /* folders show the "strongest" change inside them: conflict, then any change */
+        char st = view[i].status;
+        for (int d = 0; d < depth && st; d++) {
+            FileRow *fo = &fileRows[stack[d]];
+            if (fo->status != 'C') fo->status = st == 'C' ? 'C' : 'M';
+        }
+    }
+}
+
 /* File list on the left: the latest commit, plus your own changes if you can edit. */
 static void DrawFileList(Repo *r, Rectangle la)
 {
     bool edit = CanEdit(r);
     BuildView(r, edit ? curUser : -1);
-    int n = viewCount;
+    if (openForRepo != r) { openForRepo = r; openFolderCount = 0; }
+    BuildFileRows();
+    for (int i = 0; i < fileRowCount; i++)           /* open folders with your changes in them */
+        if (fileRows[i].folder && fileRows[i].status) OpenFolder(fileRows[i].path);
+    if (selName[0]) RevealPath(selName);
+
+    /* which rows show: everything inside a closed folder is hidden */
+    static int *shown;
+    static int shownCap;
+    shown = GrowArr(shown, &shownCap, fileRowCount + 1, sizeof(int));
+    int n = 0;
+    for (int i = 0; i < fileRowCount && shownCap > fileRowCount; i++) {
+        shown[n++] = i;
+        if (fileRows[i].folder && FolderOpenIndex(fileRows[i].path) < 0) i = fileRows[i].end - 1;
+    }
+
     float rowH = 30;
     ScrollArea(la, &scFiles, n * rowH);
-    if (!n) DrawText(edit ? "No files yet" : "Nothing committed yet", (int)la.x + 14, (int)la.y + 6, FS, UI_MUTED);
+    if (!viewCount) DrawText(edit ? "No files yet" : "Nothing committed yet", (int)la.x + 14, (int)la.y + 6, FS, UI_MUTED);
     BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
-    for (int i = 0; i < n; i++) {
-        ViewFile *v = &view[i];
-        Rectangle row = {la.x, la.y + i * rowH - scFiles, la.width, rowH};
+    for (int k = 0; k < n; k++) {
+        FileRow *f = &fileRows[shown[k]];
+        Rectangle row = {la.x, la.y + k * rowH - scFiles, la.width, rowH};
+        if (row.y > la.y + la.height || row.y + rowH < la.y) continue;
         bool hot = Hover(la) && Hover(row);
+        int x = (int)row.x + 10 + f->depth * 14;
+        const char *label = TextFormat("%.*s", f->nameLen, f->name);
+        if (f->folder) {
+            bool open = FolderOpenIndex(f->path) >= 0;
+            if (hot) { DrawRectangleRec(row, UI_HOVER); wantCursor = MOUSE_CURSOR_POINTING_HAND; }
+            float cx = (float)x + 7, cy = row.y + 15;
+            if (open) DrawTriangle((Vector2){cx - 5, cy - 3}, (Vector2){cx, cy + 4}, (Vector2){cx + 5, cy - 3}, UI_MUTED);
+            else      DrawTriangle((Vector2){cx - 3, cy - 5}, (Vector2){cx - 3, cy + 5}, (Vector2){cx + 4, cy}, UI_MUTED);
+            DrawFit(label, x + 20, (int)row.y + 5, FS, (int)(row.x + row.width) - x - 56, UI_TEXT);
+            if (f->status) DrawCircle((int)(row.x + row.width - 22), (int)row.y + 15, 4, f->status == 'C' ? UI_ORANGE : UI_YELLOW);
+            if (Hover(la) && Clicked(row)) ToggleFolder(f->path);
+            continue;
+        }
+        ViewFile *v = &view[f->vi];
         if (strcmp(v->name, selName) == 0) DrawRectangleRec(row, (Color){56, 139, 253, 40});
         else if (hot)                       DrawRectangleRec(row, UI_HOVER);
         if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
         bool gone = ViewDeleted(v);
         int fl = gone ? LANG_TEXT : ViewLang(r, v, NULL);
-        if (fl >= 0 && fl < LANG_FIRST_NONCODE) DrawCircle((int)row.x + 17, (int)row.y + 15, 5, LangColor(fl));
-        else DrawCircleLines((int)row.x + 17, (int)row.y + 15, 4, UI_BORDER);         /* not code */
-        DrawFit(v->name, (int)row.x + 30, (int)row.y + 5, FS, (int)row.width - 70, gone ? UI_MUTED : UI_TEXT);
-        if (gone) DrawLine((int)row.x + 30, (int)row.y + 15, (int)row.x + 30 + MeasureText(v->name, FS), (int)row.y + 15, UI_MUTED);
+        if (fl >= 0 && fl < LANG_FIRST_NONCODE) DrawCircle(x + 7, (int)row.y + 15, 5, LangColor(fl));
+        else DrawCircleLines(x + 7, (int)row.y + 15, 4, UI_BORDER);         /* not code */
+        int maxW = (int)(row.x + row.width) - x - 60;
+        DrawFit(label, x + 20, (int)row.y + 5, FS, maxW, gone ? UI_MUTED : UI_TEXT);
+        if (gone) { int lw = MeasureText(label, FS); DrawLine(x + 20, (int)row.y + 15, x + 20 + (lw < maxW ? lw : maxW), (int)row.y + 15, UI_MUTED); }
         if (v->status) {
             const char *t = v->status == 'C' ? "!" : TextFormat("%c", v->status);
             Color c = v->status == 'A' ? UI_GREENT : v->status == 'M' ? UI_YELLOW : v->status == 'D' ? UI_REDT : UI_ORANGE;
             DrawBold(t, (int)(row.x + row.width - 28), (int)row.y + 5, FS, c);
         }
+        if (hot && MeasureText(label, FS) > maxW) SetTip(v->name, NULL, NULL);
         if (Hover(la) && Clicked(row)) SelectFileName(v->name);
     }
     EndScissorMode();
@@ -5700,8 +6979,9 @@ static void DrawFileList(Repo *r, Rectangle la)
 /* of the latest commit. Anything else you were in the middle of      */
 /* editing stays as it was, still waiting for its own commit.         */
 /* ------------------------------------------------------------------ */
-typedef struct { char name[NAME_LEN]; char *data; int len; bool binary; int lang; } Staged;
-static Staged staged[MAX_FILES];
+#define MAX_STAGED 200
+typedef struct { char name[PATH_LEN]; char *data; int len; bool binary; int lang; } Staged;
+static Staged staged[MAX_STAGED];
 static int    stagedCount;
 static float  scUpload;
 
@@ -5738,26 +7018,6 @@ static int CountLines(const char *d, int len)
     return d[len - 1] == '\n' ? n : n + 1;
 }
 
-/* Text files are tidied the way the editor needs them: Windows line endings
-   (\r\n) become plain \n, and tab characters become 4 spaces. */
-static char *TidyText(const char *d, int len, int *outLen)
-{
-    int tabs = 0;
-    for (int i = 0; i < len; i++) if (d[i] == '\t') tabs++;
-    char *o = malloc((size_t)len + (size_t)tabs * 3 + 1);
-    if (!o) return NULL;
-    int j = 0;
-    for (int i = 0; i < len; i++) {
-        char c = d[i];
-        if (c == '\r') { if (i + 1 < len && d[i + 1] == '\n') continue; c = '\n'; }
-        if (c == '\t') { memcpy(o + j, "    ", 4); j += 4; continue; }
-        o[j++] = c;
-    }
-    o[j] = 0;
-    *outLen = j;
-    return o;
-}
-
 /* Removes quotes and spaces around a typed or pasted path
    ("Copy as path" on Windows adds quotes). */
 static void CleanPath(const char *raw, char *path, int cap)
@@ -5789,7 +7049,7 @@ static const char *StageFile(const char *raw)
     SanitizeName(base, nm);
     if (!nm[0]) snprintf(nm, NAME_LEN, "file");
     int k = FindStaged(nm);
-    if (k < 0 && stagedCount >= MAX_FILES) return "That's as many files as one upload can hold";
+    if (k < 0 && stagedCount >= MAX_STAGED) return "That's as many files as one upload can hold";
 
     char *data = NULL;
     int len = 0;
@@ -5804,15 +7064,10 @@ static const char *StageFile(const char *raw)
     }
     if (!data) return "Out of memory";
 
-    bool bin = LooksBinary(data, len);
-    if (!bin) {
-        int tl = 0;
-        char *t = TidyText(data, len, &tl);
-        if (t) { free(data); data = t; len = tl; }
-    }
+    bool bin = LooksBinary(data, len);      /* kept exactly as it is, byte for byte, like git does */
     if (k < 0) k = stagedCount++;                                /* same name again: replace it */
     else free(staged[k].data);
-    snprintf(staged[k].name, NAME_LEN, "%s", nm);
+    snprintf(staged[k].name, PATH_LEN, "%s", nm);
     staged[k].data = data;
     staged[k].len = len;
     staged[k].binary = bin;
@@ -5855,26 +7110,19 @@ static const char *DoUploadCommit(Repo *r, const char *msg)
     if (r->commitCount >= MAX_COMMITS) return "This repository has reached its commit limit";
     if ((h ? h->fileCount : 0) + newInCommit > MAX_FILES)
         return TextFormat("A repository can hold up to %d files", MAX_FILES);
-    if (r->blobCount + changed > MAX_BLOBS) return "This repository is out of storage space";
 
     /* start from the latest commit, then put the uploaded files in */
-    Commit c;
-    memset(&c, 0, sizeof c);
-    if (h) {
-        c.fileCount = h->fileCount;
-        memcpy(c.names, h->names, sizeof c.names);
-        memcpy(c.blobs, h->blobs, sizeof c.blobs);
-    }
+    Snap c;
+    if (!SnapFrom(&c, h)) return "Out of memory";
     for (int i = 0; i < stagedCount; i++) {
         Staged *s = &staged[i];
         if (StagedKind(r, s) == '=') continue;
         int b = InternBlob(r, s->data, s->len);
-        if (b < 0) return "This repository is out of storage space";
-        int k = FindInCommit(&c, s->name);
-        if (k < 0) { k = c.fileCount++; snprintf(c.names[k], NAME_LEN, "%.*s", NAME_LEN - 1, s->name); }
-        c.blobs[k] = b;
+        if (b < 0 || !SnapSet(&c, s->name, b, -1)) { SnapFree(&c); return "This repository is out of storage space"; }
     }
-    FinishCommit(r, &c, msg[0] ? msg : "Add files via upload");
+    const char *clash = PathClash(c.names, c.n);
+    if (clash) { SnapFree(&c); return TextFormat("There's already a folder called %s", clash); }
+    if (!FinishCommit(r, &c, msg[0] ? msg : "Add files via upload", -1)) return "Couldn't save the commit (out of memory?)";
     MarkDirty();
 
     /* the uploaded versions replace any uncommitted edits you had to those files */
@@ -6102,8 +7350,8 @@ static void ScreenUpload(Repo *r)
     bool go = ButtonEx((Rectangle){(float)W - 210, bottom + 44, 190, 44}, "Commit changes", changed ? UI_GREEN : UI_BTN, changed > 0);
     if (cancel) { BackToCode(); return; }
     if (go || (msgEnter && changed)) {
-        char first[NAME_LEN];
-        snprintf(first, NAME_LEN, "%s", staged[0].name);
+        char first[PATH_LEN];
+        snprintf(first, PATH_LEN, "%s", staged[0].name);
         const char *err = DoUploadCommit(r, tfUpMsg.buf);
         if (err) { Toast(err); return; }
         Toast(TextFormat("Uploaded %d file%s in commit %s", changed, changed == 1 ? "" : "s", Head(r)->id));
@@ -6149,15 +7397,15 @@ static void DrawFileHeader(Rectangle fh, const char *name, const char *tag, Colo
 static WorkFile    scratch;
 static const Repo *scratchRepo;
 static int         scratchBlob = -2;
-static char        scratchName[NAME_LEN];
+static char        scratchName[PATH_LEN];
 static WorkFile *Scratch(Repo *r, ViewFile *v)
 {
     if (scratchRepo != r || scratchBlob != v->blob || strcmp(scratchName, v->name) != 0) {
         WF_SetN(&scratch, v->data, v->len);
         scratchRepo = r;
         scratchBlob = v->blob;
-        snprintf(scratchName, NAME_LEN, "%s", v->name);
-        snprintf(scratch.name, NAME_LEN, "%s", v->name);
+        snprintf(scratchName, PATH_LEN, "%s", v->name);
+        snprintf(scratch.name, PATH_LEN, "%s", v->name);
     }
     return &scratch;
 }
@@ -6193,6 +7441,21 @@ static bool ConflictBar(Repo *r, ViewFile *v, Rectangle bar)
     return false;
 }
 
+/* Would a new file called nm clash with a folder of the same name (or the
+   other way round, e.g. a new "notes.txt/a.md" when notes.txt is a file)? Uses the current view. */
+static bool FolderOrFileClash(const char *nm)
+{
+    size_t n = strlen(nm);
+    for (int i = 0; i < viewCount; i++) {
+        if (ViewDeleted(&view[i])) continue;
+        const char *v = view[i].name;
+        size_t vl = strlen(v);
+        if (vl > n && strncmp(v, nm, n) == 0 && v[n] == '/') return true;     /* nm is a folder already */
+        if (n > vl && strncmp(nm, v, vl) == 0 && nm[vl] == '/') return true;  /* a file sits where a folder would go */
+    }
+    return false;
+}
+
 static void TabCode(Repo *r)
 {
     bool edit = CanEdit(r);
@@ -6222,11 +7485,13 @@ static void TabCode(Repo *r)
         DrawLine((int)lp.x, (int)by - 10, (int)(lp.x + lp.width), (int)by - 10, UI_BORDER);
         bool addEnter = TextFieldUI(&tfNewFile, (Rectangle){lp.x + 12, by, lp.width - 24, 38}, "new-file.txt");
         if (Button((Rectangle){lp.x + 12, by + 46, 114, 36}, "Add file", UI_GREEN) || addEnter) {
-            char nm[NAME_LEN];
-            SanitizeName(tfNewFile.buf, nm);
+            char nm[PATH_LEN];
+            SanitizePath(tfNewFile.buf, nm);
             BuildView(r, curUser);
             int vi = ViewIndex(nm);
-            if (!nm[0])                                    Toast("Type a file name first, e.g. notes.txt");
+            if (!nm[0])                                    Toast("Type a file name first, e.g. notes.txt or docs/notes.txt");
+            else if (!ValidPath(nm))                       Toast("That isn't a usable file name");
+            else if (FolderOrFileClash(nm))                Toast("That name is already used by a folder (or a file on the way to it)");
             else if (vi >= 0 && !ViewDeleted(&view[vi]))   Toast("A file with that name already exists");
             else if (vi < 0 && ShownCount(r) >= MAX_FILES) Toast(TextFormat("A repository can hold up to %d files", MAX_FILES));
             else {
@@ -6271,7 +7536,7 @@ static void TabCode(Repo *r)
             area.height -= 64;
         }
         WorkFile shown = {0};                      /* what the header describes */
-        snprintf(shown.name, NAME_LEN, "%s", v->name);
+        snprintf(shown.name, PATH_LEN, "%s", v->name);
         shown.text = (char *)v->data; shown.len = v->len; shown.binary = v->binary;
 
         if (ViewDeleted(v)) {
@@ -6333,6 +7598,16 @@ static void TabCode(Repo *r)
         DrawRectangleLinesEx(e, 1, UI_BORDER);
         const char *m = edit ? "Pick a file on the left, add a new one, or upload some." : "This repository has no committed files yet.";
         DrawText(m, (int)(e.x + e.width / 2) - MeasureText(m, FS) / 2, (int)(e.y + e.height / 2) - 10, FS, UI_MUTED);
+        if (edit && !r->commitCount && gitPort) {          /* empty: say how to push a project that's already on this computer */
+            const char *lines[3] = {"Or push a project you already have, from its folder:",
+                                    TextFormat("git push %s main", CloneUrl(r)),
+                                    "(use master instead of main if that's what your branch is called)"};
+            for (int i = 0; i < 3; i++) {
+                int lx = (int)(e.x + e.width / 2) - MeasureText(lines[i], FS) / 2;
+                if (lx < (int)e.x + 10) lx = (int)e.x + 10;
+                DrawFit(lines[i], lx, (int)(e.y + e.height / 2) + 40 + i * 30, FS, (int)e.width - 20, i == 1 ? UI_TEXT : UI_MUTED);
+            }
+        }
     }
 
     if (!edit) {
@@ -6380,7 +7655,7 @@ static void TabCommits(Repo *r)
         DrawRectangleLinesEx(row, 1, UI_BORDER);
         DrawAvatar(c->author, (int)row.x + 36, (int)row.y + 37, 18);
         DrawFit(c->message, (int)row.x + 70, (int)row.y + 14, FS, (int)row.width - 310, UI_TEXT);
-        DrawText(TextFormat("%s committed %s", UserName(c->author), TimeAgo(c->time)), (int)row.x + 70, (int)row.y + 42, FS, UI_MUTED);
+        DrawFit(TextFormat("%s committed %s", CommitAuthorName(c), TimeAgo(c->time)), (int)row.x + 70, (int)row.y + 42, FS, (int)row.width - 310, UI_MUTED);
 
         Rectangle idPill = {row.x + row.width - 120, row.y + 20, 102, 34};
         DrawRectangleRounded(idPill, 0.3f, 6, UI_BTN);
@@ -6536,10 +7811,24 @@ static void ScreenCommit(Repo *r)
     }
 
     DrawFit(c->message, 20, 238, 30, W - 40, UI_TEXT);
-    const char *meta = TextFormat("%s committed %s   |   commit %s   |   %d file%s changed   ",
-                                  UserName(c->author), TimeAgo(c->time), c->id, changeCount, changeCount == 1 ? "" : "s");
+    /* who wrote it according to git, if that isn't simply the Mini GitHub user */
+    CommitInfo info;
+    bool parsed = ParseCommit(c->raw, c->rawLen, &info);
+    const char *who = CommitAuthorName(c);
+    const char *meta = TextFormat("%s committed %s   |   %s %s   |   %d file%s changed   ",
+                                  who, TimeAgo(c->time), c->parentCount > 1 ? "merge" : "commit", c->id,
+                                  changeCount, changeCount == 1 ? "" : "s");
     DrawText(meta, 20, 276, FS, UI_MUTED);
     int mx = 20 + MeasureText(meta, FS);
+    if (Hover((Rectangle){20, 272, (float)mx - 20, 28})) {          /* the details git has */
+        char hx[41], p1[41] = "", p2[41] = "";
+        ShaHex(c->sha, hx);
+        if (c->parentCount > 0) ShaHex(r->commits[c->parents[0]].sha, p1);
+        if (c->parentCount > 1) ShaHex(r->commits[c->parents[1]].sha, p2);
+        SetTip(TextFormat("commit %s", hx),
+               parsed ? TextFormat("Author: %.60s <%.60s>", info.aname, info.aemail) : NULL,
+               c->parentCount > 1 ? TextFormat("Merges %.7s and %.7s", p1, p2) : c->parentCount ? TextFormat("Built on %.7s", p1) : "The first commit");
+    }
     const char *plus = TextFormat("+%d ", totalAdds);
     DrawText(plus, mx, 276, FS, UI_GREENT);
     DrawText(TextFormat("-%d", totalDels), mx + MeasureText(plus, FS) + 4, 276, FS, UI_REDT);
@@ -6674,7 +7963,7 @@ static void ScreenDay(void)
     float total = 0;
     for (int i = 0; i < actCount; i++) {
         Activity *a = &acts[i];
-        int nf = a->kind == 'C' ? CommitFileList(&repos[a->repo], a->idx, kinds, names) : 0;
+        int nf = a->kind == 'C' ? CommitFileList(&repos[a->repo], a->idx, kinds, names, MAX_FILES * 2) : 0;
         cardY[i] = total;
         cardH[i] = 76 + (nf ? nf * 24 + 8 : 0);
         total += cardH[i] + 10;
@@ -6713,7 +8002,7 @@ static void ScreenDay(void)
             DrawText(meta, cx, (int)card.y + 42, FS, UI_MUTED);
             DrawAddsDels(c->sAdds, c->sDels, cx + MeasureText(meta, FS), (int)card.y + 42);
 
-            int nf = CommitFileList(r, a->idx, kinds, names);
+            int nf = CommitFileList(r, a->idx, kinds, names, MAX_FILES * 2);
             for (int f = 0; f < nf; f++) {
                 int fy = (int)card.y + 76 + f * 24;
                 char k[2] = {kinds[f], 0};
@@ -6762,6 +8051,1386 @@ static void DrawToast(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Talking to real git                                                */
+/*                                                                    */
+/* Mini GitHub runs a tiny web server on this computer only           */
+/* (http://localhost:7979), speaking git's "smart HTTP" language:     */
+/*   git clone http://localhost:7979/jo/hello-world.git               */
+/*   git push / git pull / git fetch                                  */
+/* Pushing needs a Mini GitHub username and password, and only the    */
+/* owner and collaborators may push.                                  */
+/*                                                                    */
+/* git sends and receives commits as a "pack": every object (commit,  */
+/* tree, blob) squeezed with zlib, one after another. Inside a pack,  */
+/* an object can also be a "delta": "take that other object, copy     */
+/* these bits of it and add these new bytes" - which saves space.     */
+/* ------------------------------------------------------------------ */
+enum { OBJ_COMMIT = 1, OBJ_TREE = 2, OBJ_BLOB = 3, OBJ_TAG = 4, OBJ_OFS_DELTA = 6, OBJ_REF_DELTA = 7 };
+static const char *KindName(int t) { return t == OBJ_COMMIT ? "commit" : t == OBJ_TREE ? "tree" : t == OBJ_BLOB ? "blob" : "tag"; }
+
+#define MAX_PUSH   (512u * 1024 * 1024)       /* biggest request git can send: 512 MB */
+#define MAX_OBJECT (256u * 1024 * 1024)       /* biggest single object in a pack       */
+
+/* ---------- reading a pack ---------- */
+typedef struct {
+    size_t   off;                /* where it starts in the pack           */
+    int      type;               /* OBJ_..., for deltas the final type    */
+    uint8_t *data; size_t len;   /* the object (or, until resolved, the delta) */
+    bool     delta, done, busy;
+    size_t   baseOff;            /* OBJ_OFS_DELTA: where its base starts  */
+    uint8_t  baseSha[20];        /* OBJ_REF_DELTA: its base's fingerprint */
+    int      baseType;
+    uint8_t  sha[20];
+} PObj;
+typedef struct { PObj *o; int n, cap; ShaMap map; } PackSet;
+
+static void PackFree(PackSet *ps)
+{
+    for (int i = 0; i < ps->n; i++) free(ps->o[i].data);
+    free(ps->o);
+    MapFree(&ps->map);
+    memset(ps, 0, sizeof *ps);
+}
+
+/* "take bits of base, add new bytes": builds the new object from a delta. */
+static uint8_t *ApplyDelta(const uint8_t *base, size_t blen, const uint8_t *d, size_t dlen, size_t *outLen)
+{
+    size_t p = 0;
+    uint64_t sz[2] = {0, 0};
+    for (int k = 0; k < 2; k++) {
+        int shift = 0;
+        uint8_t c;
+        do { if (p >= dlen || shift > 56) return NULL; c = d[p++]; sz[k] |= (uint64_t)(c & 0x7F) << shift; shift += 7; } while (c & 0x80);
+    }
+    if (sz[0] != blen || sz[1] > MAX_OBJECT) return NULL;
+    uint8_t *out = malloc((size_t)sz[1] + 1);
+    if (!out) return NULL;
+    size_t o = 0;
+    while (p < dlen) {
+        uint8_t c = d[p++];
+        if (c & 0x80) {                                   /* copy from the base */
+            size_t off = 0, n = 0;
+            for (int k = 0; k < 4; k++) if (c & (1 << k)) { if (p >= dlen) goto bad; off |= (size_t)d[p++] << (8 * k); }
+            for (int k = 0; k < 3; k++) if (c & (16 << k)) { if (p >= dlen) goto bad; n |= (size_t)d[p++] << (8 * k); }
+            if (!n) n = 0x10000;
+            if (off + n > blen || o + n > sz[1]) goto bad;
+            memcpy(out + o, base + off, n);
+            o += n;
+        } else if (c) {                                   /* new bytes */
+            if (p + c > dlen || o + c > sz[1]) goto bad;
+            memcpy(out + o, d + p, c);
+            p += c; o += c;
+        } else goto bad;
+    }
+    if (o != sz[1]) goto bad;
+    out[o] = 0;
+    *outLen = o;
+    return out;
+bad:
+    free(out);
+    return NULL;
+}
+
+static int PackAt(PackSet *ps, size_t off)
+{
+    int lo = 0, hi = ps->n - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (ps->o[mid].off == off) return mid;
+        if (ps->o[mid].off < off) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
+}
+
+/* Something the repository already has, for a delta built on it ("thin" packs). */
+static bool RepoObject(Repo *r, const uint8_t *sha, const uint8_t **data, size_t *len, int *type);
+
+/* Turns a delta into the real object (its base first, if that's a delta too). */
+static bool Resolve(PackSet *ps, int i, Repo *r)
+{
+    PObj *o = &ps->o[i];
+    if (!o->delta || o->done) return true;
+    if (o->busy) return false;                            /* a loop: damaged pack */
+    o->busy = true;
+    const uint8_t *base = NULL;
+    size_t blen = 0;
+    int btype = 0;
+    if (o->type == OBJ_OFS_DELTA) {
+        int b = PackAt(ps, o->baseOff);
+        if (b < 0 || !Resolve(ps, b, r)) return false;
+        base = ps->o[b].data; blen = ps->o[b].len; btype = ps->o[b].type;
+    } else {
+        int b = MapGet(&ps->map, o->baseSha);
+        if (b >= 0) { if (!Resolve(ps, b, r)) return false; base = ps->o[b].data; blen = ps->o[b].len; btype = ps->o[b].type; }
+        else if (!RepoObject(r, o->baseSha, &base, &blen, &btype)) return false;
+    }
+    size_t nl = 0;
+    uint8_t *n = ApplyDelta(base, blen, o->data, o->len, &nl);
+    if (!n) return false;
+    free(o->data);
+    o->data = n; o->len = nl; o->type = btype;
+    o->done = true; o->busy = false;
+    ObjectSha(KindName(o->type), o->data, o->len, o->sha);
+    MapPut(&ps->map, o->sha, i);
+    return true;
+}
+
+/* Unpacks a whole pack. Returns NULL if it worked, or what was wrong. */
+static const char *ReadPack(const uint8_t *p, size_t len, PackSet *ps, Repo *r)
+{
+    memset(ps, 0, sizeof *ps);
+    if (len < 32 || memcmp(p, "PACK", 4) != 0) return "not a git pack";
+    uint32_t ver = (uint32_t)p[4] << 24 | (uint32_t)p[5] << 16 | (uint32_t)p[6] << 8 | p[7];
+    uint32_t count = (uint32_t)p[8] << 24 | (uint32_t)p[9] << 16 | (uint32_t)p[10] << 8 | p[11];
+    if (ver != 2 && ver != 3) return "unknown pack version";
+    if (count > 10000000) return "too many objects";
+    uint8_t sum[20];
+    Sha1 s;
+    Sha1Init(&s); Sha1Update(&s, p, len - 20); Sha1Final(&s, sum);
+    if (memcmp(sum, p + len - 20, 20) != 0) return "the pack is damaged (checksum)";
+    size_t at = 12, end = len - 20;
+    for (uint32_t k = 0; k < count; k++) {
+        ps->o = GrowArr(ps->o, &ps->cap, ps->n + 1, sizeof(PObj));
+        if (ps->n >= ps->cap) return "out of memory";
+        PObj *o = &ps->o[ps->n];
+        memset(o, 0, sizeof *o);
+        o->off = at;
+        if (at >= end) return "the pack is cut short";
+        uint8_t c = p[at++];
+        o->type = (c >> 4) & 7;
+        uint64_t size = c & 15;
+        int shift = 4;
+        while (c & 0x80) { if (at >= end || shift > 56) return "the pack is damaged"; c = p[at++]; size |= (uint64_t)(c & 0x7F) << shift; shift += 7; }
+        if (size > MAX_OBJECT) return "an object is too big";
+        if (o->type == OBJ_OFS_DELTA) {
+            if (at >= end) return "the pack is damaged";
+            c = p[at++];
+            uint64_t ofs = c & 0x7F;
+            while (c & 0x80) { if (at >= end) return "the pack is damaged"; c = p[at++]; ofs = ((ofs + 1) << 7) | (c & 0x7F); }
+            if (ofs == 0 || ofs > o->off) return "the pack is damaged (delta)";
+            o->baseOff = o->off - (size_t)ofs;
+            o->delta = true;
+        } else if (o->type == OBJ_REF_DELTA) {
+            if (at + 20 > end) return "the pack is damaged";
+            memcpy(o->baseSha, p + at, 20);
+            at += 20;
+            o->delta = true;
+        } else if (o->type < 1 || o->type > 4) return "the pack has an unknown kind of object";
+        size_t used = 0, ol = 0;
+        o->data = InflateZlib(p + at, end - at, &used, &ol, (size_t)size);
+        if (!o->data || ol != size) return "the pack is damaged (couldn't unpack an object)";
+        o->len = ol;
+        at += used;
+        if (!o->delta) {
+            o->done = true;
+            ObjectSha(KindName(o->type), o->data, o->len, o->sha);
+            MapPut(&ps->map, o->sha, ps->n);
+        }
+        ps->n++;
+    }
+    if (at != end) return "the pack has extra data at the end";
+    for (int i = 0; i < ps->n; i++) if (!Resolve(ps, i, r)) return "a delta's base object is missing";
+    return NULL;
+}
+
+/* ---------- every folder (tree) the repository has ----------
+   A push only sends what's new, so a commit's unchanged folders are
+   looked up here. Kept between pushes and topped up with new commits. */
+static struct {
+    const Repo *r; int done; uint8_t last[20];
+    ShaMap map; Buf store; size_t *off; int *len; int count, cap;
+} tix;
+static void TixReset(void)
+{
+    MapFree(&tix.map); BufFree(&tix.store); free(tix.off); free(tix.len);
+    memset(&tix, 0, sizeof tix);
+}
+static void TixEmit(void *ctx, const uint8_t sha[20], const uint8_t *data, size_t len)
+{
+    (void)ctx;
+    if (MapGet(&tix.map, sha) >= 0) return;
+    if (tix.count >= tix.cap) {
+        int nc = tix.cap ? tix.cap * 2 : 256;
+        size_t *o = realloc(tix.off, (size_t)nc * sizeof *o);
+        if (o) tix.off = o;
+        int *l = realloc(tix.len, (size_t)nc * sizeof *l);
+        if (l) tix.len = l;
+        if (!o || !l) return;
+        tix.cap = nc;
+    }
+    tix.off[tix.count] = tix.store.n;
+    tix.len[tix.count] = (int)len;
+    BufAdd(&tix.store, data, len);
+    MapPut(&tix.map, sha, tix.count++);
+}
+static void TixUpdate(Repo *r)
+{
+    if (tix.r != r || tix.done > r->commitCount || (tix.done && memcmp(r->commits[tix.done - 1].sha, tix.last, 20) != 0)) {
+        TixReset();
+        tix.r = r;
+    }
+    uint8_t t[20];
+    for (; tix.done < r->commitCount; tix.done++) CommitTree(r, &r->commits[tix.done], t, TixEmit, NULL);
+    if (tix.done) memcpy(tix.last, r->commits[tix.done - 1].sha, 20);
+}
+static bool RepoObject(Repo *r, const uint8_t *sha, const uint8_t **data, size_t *len, int *type)
+{
+    int b = MapGet(&r->blobMap, sha);
+    if (b >= 0) { *data = (const uint8_t *)r->blobs[b].data; *len = (size_t)r->blobs[b].len; *type = OBJ_BLOB; return true; }
+    int c = CommitBySha(r, sha);
+    if (c >= 0) { *data = (const uint8_t *)r->commits[c].raw; *len = (size_t)r->commits[c].rawLen; *type = OBJ_COMMIT; return true; }
+    TixUpdate(r);
+    int t = MapGet(&tix.map, sha);
+    if (t >= 0) { *data = tix.store.d + tix.off[t]; *len = (size_t)tix.len[t]; *type = OBJ_TREE; return true; }
+    return false;
+}
+
+/* ---------- taking in a push ---------- */
+
+/* Whose commit is this? Matched by the email (yours from your profile, or
+   the made-up name@minigithub.local), then by name; otherwise it counts
+   as the work of the person pushing. */
+static int UserForAuthor(const char *name, const char *email, int pusher)
+{
+    for (int i = 0; i < userCount; i++) if (users[i].email[0] && EqualsCI(users[i].email, email)) return users[i].id;
+    for (int i = 0; i < userCount; i++) if (EqualsCI(email, TextFormat("%s@minigithub.local", users[i].name))) return users[i].id;
+    for (int i = 0; i < userCount; i++) if (EqualsCI(users[i].name, name)) return users[i].id;
+    return pusher;
+}
+
+/* One file of a pushed commit, before it's stored. */
+typedef struct { const char *path; uint8_t sha[20]; uint8_t mode; } PEntry;
+typedef struct { PEntry *e; int n, cap; } PList;
+
+static int CmpPEntry(const void *a, const void *b) { return strcmp(((const PEntry *)a)->path, ((const PEntry *)b)->path); }
+
+/* Unfolds a tree (and the trees inside it) into a flat list of paths. */
+static const char *ExpandTree(PackSet *ps, Repo *r, const uint8_t *sha, const char *prefix, PList *out, int depth)
+{
+    if (depth > 60) return "folders nested too deeply";
+    const uint8_t *d = NULL;
+    size_t len = 0;
+    int type = 0;
+    int k = MapGet(&ps->map, sha);
+    if (k >= 0) { d = ps->o[k].data; len = ps->o[k].len; type = ps->o[k].type; }
+    else if (!RepoObject(r, sha, &d, &len, &type)) return "a folder (tree) is missing from the push";
+    if (type != OBJ_TREE) return "something that should be a folder isn't";
+    size_t p = 0;
+    char path[PATH_LEN + 8];
+    while (p < len) {
+        const uint8_t *sp = memchr(d + p, ' ', len - p);
+        if (!sp) return "a folder is damaged";
+        int mlen = (int)(sp - (d + p));
+        char mode[8];
+        if (mlen <= 0 || mlen > 6) return "a folder is damaged";
+        memcpy(mode, d + p, (size_t)mlen); mode[mlen] = 0;
+        p += (size_t)mlen + 1;
+        const uint8_t *z = memchr(d + p, 0, len - p);
+        if (!z || (size_t)(z - d) + 21 > len) return "a folder is damaged";
+        const char *name = (const char *)(d + p);
+        const uint8_t *esha = z + 1;
+        p = (size_t)(z - d) + 21;
+        int n = snprintf(path, sizeof path, "%s%s", prefix, name);
+        if (n >= PATH_LEN) return TextFormat("a file path is too long (Mini GitHub allows %d characters)", PATH_LEN - 1);
+        if (!ValidPath(path)) return TextFormat("\"%.80s\" isn't a file name Mini GitHub can store", path);
+        if (strcmp(mode, "40000") == 0) {
+            char sub[PATH_LEN + 16];
+            snprintf(sub, sizeof sub, "%s/", path);
+            const char *err = ExpandTree(ps, r, esha, sub, out, depth + 1);
+            if (err) return err;
+            continue;
+        }
+        int m = strcmp(mode, "100644") == 0 ? MODE_FILE : strcmp(mode, "100755") == 0 ? MODE_EXEC : strcmp(mode, "120000") == 0 ? MODE_LINK : -1;
+        if (strcmp(mode, "160000") == 0) return "submodules aren't supported";
+        if (m < 0) return "a file has an unusual mode";
+        if (out->n >= MAX_FILES) return TextFormat("a commit has more than %d files", MAX_FILES);
+        out->e = GrowArr(out->e, &out->cap, out->n + 1, sizeof(PEntry));
+        if (out->n >= out->cap) return "out of memory";
+        PEntry *e = &out->e[out->n++];
+        e->path = Intern(path);
+        if (!e->path) return "out of memory";
+        memcpy(e->sha, esha, 20);
+        e->mode = (uint8_t)m;
+    }
+    return NULL;
+}
+
+/* A new commit from the push, checked and ready to store. */
+typedef struct { int obj; CommitInfo info; PList files; int state; } PCommit;
+
+/* Updates repository r's branch from old to new using the objects in ps.
+   Returns NULL if it worked, or the reason to give git. *added gets how many commits came in. */
+static const char *ApplyPush(Repo *r, int pusher, const uint8_t old[20], const uint8_t nw[20], const char *ref, PackSet *ps, int *added)
+{
+    *added = 0;
+    Commit *h = Head(r);
+    if (strncmp(ref, "refs/tags/", 10) == 0) return "Mini GitHub doesn't keep tags";
+    if (strncmp(ref, "refs/heads/", 11) != 0) return "only branches can be pushed";
+    const char *br = ref + 11;
+    if (h && strcmp(br, r->branch) != 0)
+        return TextFormat("Mini GitHub keeps one branch, \"%s\" - push with: git push origin HEAD:%s", r->branch, r->branch);
+    if (memcmp(nw, ZERO_SHA, 20) == 0) return "the branch can't be deleted";
+    if (memcmp(old, h ? h->sha : ZERO_SHA, 20) != 0) return "fetch first - someone else pushed or committed in the meantime";
+    if (h && memcmp(nw, h->sha, 20) == 0) return NULL;          /* nothing new */
+    if (!h && (!br[0] || strlen(br) >= NAME_LEN || strchr(br, '/'))) return "please push to a simple branch name such as main";
+
+    /* 1) find every new commit, oldest first (each one after the commits it's built on) */
+    PCommit *pc = NULL;
+    int pcn = 0, pccap = 0;
+    ShaMap seen = {0};
+    int *stack = NULL, sn = 0, scap = 0;
+    bool reachedHead = false;
+    const char *err = NULL;
+    int *order = NULL, on = 0, ocap = 0;
+
+    #define PUSH_STACK(x) do { stack = GrowArr(stack, &scap, sn + 1, sizeof(int)); if (sn >= scap) { err = "out of memory"; goto done; } stack[sn++] = (x); } while (0)
+    {
+        int o = MapGet(&ps->map, nw);
+        if (o < 0 || ps->o[o].type != OBJ_COMMIT) { err = "the pushed commit is missing from the pack"; goto done; }
+        pc = GrowArr(pc, &pccap, 1, sizeof(PCommit));
+        if (!pccap) { err = "out of memory"; goto done; }
+        memset(&pc[0], 0, sizeof pc[0]);
+        pc[0].obj = o;
+        if (!ParseCommit((const char *)ps->o[o].data, (int)ps->o[o].len, &pc[0].info)) { err = "a commit is damaged"; goto done; }
+        pcn = 1;
+        MapPut(&seen, nw, 0);
+        PUSH_STACK(0);
+    }
+    while (sn) {
+        int i = stack[sn - 1];
+        if (pc[i].state == 0) {
+            pc[i].state = 1;
+            for (int q = 0; q < pc[i].info.np; q++) {
+                uint8_t ps1[20];                              /* a copy: pc[] may move as it grows */
+                memcpy(ps1, pc[i].info.parents[q], 20);
+                if (h && memcmp(ps1, h->sha, 20) == 0) reachedHead = true;
+                if (CommitBySha(r, ps1) >= 0 || MapGet(&seen, ps1) >= 0) continue;
+                int o = MapGet(&ps->map, ps1);
+                if (o < 0 || ps->o[o].type != OBJ_COMMIT) {
+                    err = h ? "the push doesn't build on Mini GitHub's latest commit - pull first (git pull), then push again"
+                            : "a commit is missing from the pack";
+                    goto done;
+                }
+                if (pcn >= MAX_COMMITS) { err = "too many commits"; goto done; }
+                pc = GrowArr(pc, &pccap, pcn + 1, sizeof(PCommit));
+                if (pcn >= pccap) { err = "out of memory"; goto done; }
+                memset(&pc[pcn], 0, sizeof pc[pcn]);
+                pc[pcn].obj = o;
+                if (!ParseCommit((const char *)ps->o[o].data, (int)ps->o[o].len, &pc[pcn].info)) { err = "a commit is damaged"; goto done; }
+                MapPut(&seen, ps1, pcn);
+                PUSH_STACK(pcn);
+                pcn++;
+            }
+        } else {
+            sn--;
+            if (pc[i].state == 1) {
+                pc[i].state = 2;
+                order = GrowArr(order, &ocap, on + 1, sizeof(int));
+                if (on >= ocap) { err = "out of memory"; goto done; }
+                order[on++] = i;
+            }
+        }
+    }
+    #undef PUSH_STACK
+    if (h && !reachedHead) {
+        err = "the push doesn't build on Mini GitHub's latest commit - pull first (git pull), then push again";
+        goto done;
+    }
+    if (r->commitCount + on > MAX_COMMITS) { err = "the repository would have too many commits"; goto done; }
+
+    /* 2) unfold each commit's folders, and check every file is there */
+    for (int k = 0; k < on; k++) {
+        PCommit *c = &pc[order[k]];
+        err = ExpandTree(ps, r, c->info.tree, "", &c->files, 0);
+        if (err) goto done;
+        qsort(c->files.e, (size_t)c->files.n, sizeof(PEntry), CmpPEntry);
+        const char **names = malloc((size_t)(c->files.n + 1) * sizeof *names);
+        uint8_t (*shas)[20] = malloc((size_t)(c->files.n + 1) * 20);
+        uint8_t *modes = malloc((size_t)c->files.n + 1);
+        if (!names || !shas || !modes) { free(names); free(shas); free(modes); err = "out of memory"; goto done; }
+        for (int j = 0; j < c->files.n; j++) {
+            PEntry *e = &c->files.e[j];
+            if (j && strcmp(e->path, c->files.e[j - 1].path) == 0) { err = "a commit has the same file twice"; break; }
+            int o = MapGet(&ps->map, e->sha);
+            if ((o < 0 || ps->o[o].type != OBJ_BLOB) && MapGet(&r->blobMap, e->sha) < 0) { err = TextFormat("the contents of %.80s are missing from the push", e->path); break; }
+            if (o >= 0 && ps->o[o].len > 0x7FFFFFF0u) { err = "a file is too big"; break; }
+            names[j] = e->path; memcpy(shas[j], e->sha, 20); modes[j] = e->mode;
+        }
+        /* Mini GitHub rebuilds the folders itself, so make sure it gets exactly git's fingerprint */
+        uint8_t t[20];
+        if (!err && (!BuildTree(names, (const uint8_t (*)[20])shas, modes, 0, c->files.n, 0, t, NULL, NULL) || memcmp(t, c->info.tree, 20) != 0))
+            err = "a commit has a folder Mini GitHub can't store exactly (empty or oddly sorted folders?)";
+        free(names); free(shas); free(modes);
+        if (err) goto done;
+    }
+
+    /* 3) all good: store the commits */
+    {
+        int up = Upstream(r);
+        for (int k = 0; k < on; k++) {
+            PCommit *pcm = &pc[order[k]];
+            PObj *o = &ps->o[pcm->obj];
+            Commit c;
+            memset(&c, 0, sizeof c);
+            int n = pcm->files.n;
+            c.fileCount = n;
+            c.names = malloc((size_t)(n ? n : 1) * sizeof *c.names);
+            c.blobs = malloc((size_t)(n ? n : 1) * sizeof *c.blobs);
+            c.modes = malloc((size_t)(n ? n : 1));
+            c.raw = malloc(o->len + 1);
+            if (!c.names || !c.blobs || !c.modes || !c.raw) { FreeCommit(&c); err = "out of memory"; break; }
+            memcpy(c.raw, o->data, o->len + 1);
+            c.rawLen = (int)o->len;
+            for (int j = 0; j < n && !err; j++) {
+                PEntry *e = &pcm->files.e[j];
+                int b = MapGet(&r->blobMap, e->sha);
+                if (b < 0) {
+                    int po = MapGet(&ps->map, e->sha);
+                    b = InternBlobSha(r, (const char *)ps->o[po].data, (int)ps->o[po].len, e->sha);
+                }
+                if (b < 0) err = "the repository is out of storage space";
+                c.names[j] = e->path; c.blobs[j] = b; c.modes[j] = e->mode;
+            }
+            if (err) { FreeCommit(&c); break; }
+            for (int q = 0; q < pcm->info.np && q < 2; q++) c.parents[q] = CommitBySha(r, pcm->info.parents[q]);
+            c.parentCount = pcm->info.np < 2 ? pcm->info.np : 2;
+            c.time = pcm->info.atime;
+            snprintf(c.message, TEXT_LEN, "%s", pcm->info.summary);
+            int inUp = up >= 0 ? CommitBySha(&repos[up], o->sha) : -1;
+            if (inUp >= 0) { c.copied = true; c.author = repos[up].commits[inUp].author; }   /* the original's work, not new work */
+            else c.author = UserForAuthor(pcm->info.aname, pcm->info.aemail, pusher);
+            if (!AppendCommit(r, &c)) { FreeCommit(&c); err = "the repository has too many commits"; break; }
+            (*added)++;
+        }
+        if (!h && *added) snprintf(r->branch, NAME_LEN, "%s", br);
+    }
+
+done:
+    for (int i = 0; i < pcn; i++) free(pc[i].files.e);
+    free(pc); free(stack); free(order);
+    MapFree(&seen);
+    return err;
+}
+
+/* ---------- making a pack, for clone / fetch / pull ---------- */
+
+/* A delta: the instructions that turn file version src into version dst
+   ("copy bytes 0-4000 of the old one, add these 12 new bytes, copy..."),
+   found by looking up 16-byte pieces of dst in an index of src.
+   false if it wouldn't come out smaller than limit. */
+#define DBLOCK 16
+static void DeltaSize(Buf *o, size_t v) { do { uint8_t c = v & 0x7F; v >>= 7; if (v) c |= 0x80; BufByte(o, c); } while (v); }
+static void DeltaInsert(Buf *o, const uint8_t *d, size_t n)
+{
+    while (n) { size_t k = n > 127 ? 127 : n; BufByte(o, (uint8_t)k); BufAdd(o, d, k); d += k; n -= k; }
+}
+static void DeltaCopy(Buf *o, size_t off, size_t n)
+{
+    while (n) {
+        size_t k = n > 0xFFFFFF ? 0xFFFFFF : n;
+        uint8_t cmd = 0x80, b[8];
+        int nb = 0;
+        for (int i = 0; i < 4; i++) if ((off >> (8 * i)) & 0xFF) { cmd |= (uint8_t)(1 << i); b[nb++] = (uint8_t)(off >> (8 * i)); }
+        for (int i = 0; i < 3; i++) if ((k >> (8 * i)) & 0xFF) { cmd |= (uint8_t)(16 << i); b[nb++] = (uint8_t)(k >> (8 * i)); }
+        BufByte(o, cmd); BufAdd(o, b, (size_t)nb);
+        off += k; n -= k;
+    }
+}
+static uint32_t BlockHash(const uint8_t *p)
+{
+    uint32_t h = 0;
+    for (int i = 0; i < DBLOCK; i++) h = h * 257u + p[i];
+    return h;
+}
+static bool MakeDelta(const uint8_t *src, size_t sn, const uint8_t *dst, size_t dn, Buf *out, size_t limit)
+{
+    if (sn < DBLOCK * 4 || dn < DBLOCK * 4 || sn > 0x7FFFFFFF) return false;
+    size_t nb = sn / DBLOCK, tsize = 64;
+    while (tsize < nb * 2) tsize *= 2;
+    int *head = malloc(tsize * sizeof(int)), *next = malloc(nb * sizeof(int));
+    if (!head || !next) { free(head); free(next); return false; }
+    for (size_t i = 0; i < tsize; i++) head[i] = -1;
+    int shift = 32;
+    for (size_t t = tsize; t > 1; t >>= 1) shift--;
+    for (size_t i = 0; i < nb; i++) {
+        uint32_t s = (BlockHash(src + i * DBLOCK) * 2654435761u) >> shift;
+        next[i] = head[s]; head[s] = (int)i;
+    }
+    uint32_t top = 1;                                       /* 257^(DBLOCK-1), to roll the hash along */
+    for (int i = 0; i < DBLOCK - 1; i++) top *= 257u;
+    size_t start = out->n;
+    DeltaSize(out, sn); DeltaSize(out, dn);
+    size_t j = 0, ins = 0;
+    uint32_t h = BlockHash(dst);
+    bool ok = true;
+    while (j + DBLOCK <= dn) {
+        size_t bestLen = 0, bestPos = 0;
+        int tries = 0;
+        for (int c = head[(h * 2654435761u) >> shift]; c >= 0 && tries < 8; c = next[c], tries++) {
+            size_t pos = (size_t)c * DBLOCK;
+            if (memcmp(src + pos, dst + j, DBLOCK) != 0) continue;
+            size_t len = DBLOCK;
+            while (pos + len < sn && j + len < dn && src[pos + len] == dst[j + len]) len++;
+            if (len > bestLen) { bestLen = len; bestPos = pos; }
+        }
+        if (bestLen >= DBLOCK) {
+            while (bestPos > 0 && j > ins && src[bestPos - 1] == dst[j - 1]) { bestPos--; j--; bestLen++; }
+            DeltaInsert(out, dst + ins, j - ins);
+            DeltaCopy(out, bestPos, bestLen);
+            j += bestLen; ins = j;
+            if (out->n - start > limit) { ok = false; break; }
+            if (j + DBLOCK <= dn) h = BlockHash(dst + j);
+            continue;
+        }
+        if (j + DBLOCK < dn) h = (h - dst[j] * top) * 257u + dst[j + DBLOCK];
+        j++;
+    }
+    if (ok) {
+        DeltaInsert(out, dst + ins, dn - ins);
+        ok = out->n - start <= limit && !out->oom;
+    }
+    free(head); free(next);
+    if (!ok) out->n = start;
+    return ok;
+}
+
+typedef struct { int type; const uint8_t *data; size_t len; size_t storeOff; bool stored; uint8_t base[20]; } OutObj;
+typedef struct { OutObj *o; int n, cap; ShaMap have; Buf store; } OutSet;
+
+static void OutAdd(OutSet *s, int type, const uint8_t sha[20], const uint8_t *data, size_t len, bool copy)
+{
+    if (MapGet(&s->have, sha) >= 0) return;
+    s->o = GrowArr(s->o, &s->cap, s->n + 1, sizeof(OutObj));
+    if (s->n >= s->cap) return;
+    OutObj *o = &s->o[s->n];
+    o->type = type; o->len = len;
+    if (copy) { o->stored = true; o->storeOff = s->store.n; BufAdd(&s->store, data, len); o->data = NULL; }
+    else { o->stored = false; o->data = data; }
+    MapPut(&s->have, sha, s->n++);
+}
+static void OutTreeEmit(void *ctx, const uint8_t sha[20], const uint8_t *data, size_t len) { OutAdd(ctx, OBJ_TREE, sha, data, len, true); }
+static ShaMap knownTrees;                                   /* trees the other side already has */
+static void KnownTreeEmit(void *ctx, const uint8_t sha[20], const uint8_t *data, size_t len)
+{
+    (void)ctx; (void)data; (void)len;
+    MapPut(&knownTrees, sha, 1);
+}
+static void OutTreeEmitNew(void *ctx, const uint8_t sha[20], const uint8_t *data, size_t len)
+{
+    if (MapGet(&knownTrees, sha) < 0) OutTreeEmit(ctx, sha, data, len);
+}
+
+/* Marks commit i and everything it was built on. */
+static void MarkAncestors(Repo *r, int i, uint8_t *mark, uint8_t bit)
+{
+    int *st = NULL, n = 0, cap = 0;
+    st = GrowArr(st, &cap, 1, sizeof(int));
+    if (!cap) return;
+    st[n++] = i;
+    while (n) {
+        int k = st[--n];
+        if (mark[k] & bit) continue;
+        mark[k] |= bit;
+        CommitInfo ci;
+        if (!ParseCommit(r->commits[k].raw, r->commits[k].rawLen, &ci)) continue;
+        for (int q = 0; q < ci.np; q++) {
+            int p = CommitBySha(r, ci.parents[q]);
+            if (p < 0 || (mark[p] & bit)) continue;
+            st = GrowArr(st, &cap, n + 1, sizeof(int));
+            if (n < cap) st[n++] = p;
+        }
+    }
+    free(st);
+}
+
+/* The pack for "I want these commits; I already have those". */
+static bool BuildPack(Repo *r, const int *wants, int nw, const int *haves, int nh, Buf *out)
+{
+    uint8_t *mark = calloc((size_t)(r->commitCount ? r->commitCount : 1), 1);
+    uint8_t *sentBlob = calloc((size_t)(r->blobCount ? r->blobCount : 1), 1);
+    if (!mark || !sentBlob) { free(mark); free(sentBlob); return false; }
+    for (int i = 0; i < nh; i++) MarkAncestors(r, haves[i], mark, 2);
+    for (int i = 0; i < nw; i++) MarkAncestors(r, wants[i], mark, 1);
+
+    /* what the other side has right next to what it's getting: don't send those files and folders again */
+    MapFree(&knownTrees);
+    uint8_t t[20];
+    for (int j = 0; j < r->commitCount; j++) {              /* a commit they have, with a child they don't */
+        if (mark[j] != 1) continue;
+        for (int q = 0; q < r->commits[j].parentCount; q++) {
+            int k = r->commits[j].parents[q];
+            if (mark[k] & 2) mark[k] |= 4;
+        }
+    }
+    for (int k = 0; k < r->commitCount; k++) {
+        if (!(mark[k] & 4)) continue;
+        mark[k] &= 3;
+        Commit *c = &r->commits[k];
+        for (int f = 0; f < c->fileCount; f++) sentBlob[c->blobs[f]] = 1;
+        CommitTree(r, c, t, KnownTreeEmit, NULL);
+    }
+
+    OutSet s;
+    memset(&s, 0, sizeof s);
+    /* a file's new version usually goes as a delta of the version before it (if that's in this pack too) */
+    uint8_t *depth = calloc((size_t)(r->blobCount ? r->blobCount : 1), 1);   /* 0 = not in the pack; else 1 + delta depth */
+    Buf delta = {0};
+    for (int k = 0; k < r->commitCount && depth; k++) {
+        if (mark[k] != 1) continue;                         /* wanted, and they don't have it */
+        Commit *c = &r->commits[k], *p = ParentOf(r, k);
+        OutAdd(&s, OBJ_COMMIT, c->sha, (const uint8_t *)c->raw, (size_t)c->rawLen, false);
+        CommitTree(r, c, t, OutTreeEmitNew, &s);
+        for (int f = 0; f < c->fileCount; f++) {
+            int b = c->blobs[f];
+            if (sentBlob[b]) continue;
+            sentBlob[b] = 1;
+            Blob *bl = &r->blobs[b];
+            int q = p ? FindInCommit(p, c->names[f]) : -1, pb = q >= 0 ? p->blobs[q] : -1;
+            delta.n = 0;
+            if (pb >= 0 && depth[pb] && depth[pb] < 50 &&
+                MakeDelta((const uint8_t *)r->blobs[pb].data, (size_t)r->blobs[pb].len, (const uint8_t *)bl->data, (size_t)bl->len, &delta, (size_t)bl->len / 2)) {
+                int at = s.n;
+                OutAdd(&s, OBJ_REF_DELTA, bl->sha, delta.d, delta.n, true);
+                if (s.n > at) memcpy(s.o[at].base, r->blobs[pb].sha, 20);
+                depth[b] = (uint8_t)(depth[pb] + 1);
+            } else {
+                OutAdd(&s, OBJ_BLOB, bl->sha, (const uint8_t *)bl->data, (size_t)bl->len, false);
+                depth[b] = 1;
+            }
+        }
+    }
+    BufFree(&delta);
+    bool built = depth != NULL;
+    free(depth);
+    free(mark); free(sentBlob);
+    MapFree(&knownTrees);
+    bool ok = !s.store.oom && built;
+
+    /* write it: header, each object (kind + size, then zlib), then a SHA-1 of it all */
+    size_t start = out->n;
+    BufStr(out, "PACK");
+    uint8_t hd[8] = {0, 0, 0, 2, (uint8_t)(s.n >> 24), (uint8_t)(s.n >> 16), (uint8_t)(s.n >> 8), (uint8_t)s.n};
+    BufAdd(out, hd, 8);
+    for (int i = 0; i < s.n && ok; i++) {
+        OutObj *o = &s.o[i];
+        const uint8_t *d = o->stored ? s.store.d + o->storeOff : o->data;
+        size_t n = o->len;
+        uint8_t c = (uint8_t)(o->type << 4 | (n & 15));
+        n >>= 4;
+        while (n) { BufByte(out, c | 0x80); c = n & 0x7F; n >>= 7; }
+        BufByte(out, c);
+        if (o->type == OBJ_REF_DELTA) BufAdd(out, o->base, 20);    /* which object it's a delta of */
+        ZlibCompress(out, d ? d : (const uint8_t *)"", o->len);
+        if (out->oom) ok = false;
+    }
+    if (ok) {
+        Sha1 h;
+        uint8_t sum[20];
+        Sha1Init(&h); Sha1Update(&h, out->d + start, out->n - start); Sha1Final(&h, sum);
+        BufAdd(out, sum, 20);
+    }
+    free(s.o); MapFree(&s.have); BufFree(&s.store);
+    return ok && !out->oom;
+}
+
+/* ---------- pkt-lines ----------
+   git's messages are "pkt-lines": 4 hex digits giving the length
+   (including those 4), then the text. "0000" means "end of this part". */
+static void Pkt(Buf *b, const char *s, size_t n)
+{
+    char hx[5];
+    snprintf(hx, sizeof hx, "%04x", (unsigned)(n + 4));
+    BufAdd(b, hx, 4);
+    BufAdd(b, s, n);
+}
+static void PktStr(Buf *b, const char *s) { Pkt(b, s, strlen(s)); }
+static void PktFlush(Buf *b) { BufAdd(b, "0000", 4); }
+
+/* Reads the next pkt-line. Returns its length (-1 = a flush "0000", -2 = damaged or the end). */
+static int PktRead(const uint8_t *d, size_t len, size_t *at, const char **line)
+{
+    if (*at + 4 > len) return -2;
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        if (!isxdigit(d[*at + i])) return -2;
+        n = n * 16 + HexVal((char)d[*at + i]);
+    }
+    *at += 4;
+    if (n == 0) return -1;
+    if (n < 4 || *at + (size_t)(n - 4) > len) return -2;
+    *line = (const char *)d + *at;
+    *at += (size_t)(n - 4);
+    n -= 4;
+    if (n > 0 && (*line)[n - 1] == '\n') n--;             /* the newline isn't part of it */
+    return n;
+}
+
+/* ---------- network connections ----------
+   On Windows the network functions live in ws2_32.dll, which is loaded
+   while the program runs - so building Mini GitHub needs nothing extra. */
+#ifdef _WIN32
+typedef uintptr_t Sock;
+#define BAD_SOCK (~(uintptr_t)0)
+struct MgAddr { unsigned short family, port; uint32_t addr; char zero[8]; };
+__declspec(dllimport) void *__stdcall LoadLibraryA(const char *name);
+__declspec(dllimport) void *__stdcall GetProcAddress(void *module, const char *name);
+static int  (__stdcall *wsStartup)(unsigned short, void *);
+static Sock (__stdcall *wsSocket)(int, int, int);
+static int  (__stdcall *wsBind)(Sock, const void *, int);
+static int  (__stdcall *wsListen)(Sock, int);
+static Sock (__stdcall *wsAccept)(Sock, void *, int *);
+static int  (__stdcall *wsRecv)(Sock, char *, int, int);
+static int  (__stdcall *wsSend)(Sock, const char *, int, int);
+static int  (__stdcall *wsClose)(Sock);
+static int  (__stdcall *wsIoctl)(Sock, long, unsigned long *);
+static int  (__stdcall *wsError)(void);
+static bool NetInit(void)
+{
+    static int state;                                   /* 0 not tried, 1 ready, -1 failed */
+    if (state) return state > 0;
+    state = -1;
+    void *dll = LoadLibraryA("ws2_32.dll");
+    if (!dll) return false;
+    *(void **)&wsStartup = GetProcAddress(dll, "WSAStartup");
+    *(void **)&wsSocket  = GetProcAddress(dll, "socket");
+    *(void **)&wsBind    = GetProcAddress(dll, "bind");
+    *(void **)&wsListen  = GetProcAddress(dll, "listen");
+    *(void **)&wsAccept  = GetProcAddress(dll, "accept");
+    *(void **)&wsRecv    = GetProcAddress(dll, "recv");
+    *(void **)&wsSend    = GetProcAddress(dll, "send");
+    *(void **)&wsClose   = GetProcAddress(dll, "closesocket");
+    *(void **)&wsIoctl   = GetProcAddress(dll, "ioctlsocket");
+    *(void **)&wsError   = GetProcAddress(dll, "WSAGetLastError");
+    if (!wsStartup || !wsSocket || !wsBind || !wsListen || !wsAccept || !wsRecv || !wsSend || !wsClose || !wsIoctl || !wsError) return false;
+    static uint8_t wsaData[1024];
+    if (wsStartup(0x0202, wsaData) != 0) return false;
+    state = 1;
+    return true;
+}
+static Sock SockListen(int port)
+{
+    Sock s = wsSocket(2 /* AF_INET */, 1 /* SOCK_STREAM */, 6 /* TCP */);
+    if (s == BAD_SOCK) return BAD_SOCK;
+    struct MgAddr a = {2, (unsigned short)((port >> 8) | ((port & 0xFF) << 8)), 0x0100007Fu, {0}};   /* 127.0.0.1 */
+    unsigned long on = 1;
+    if (wsBind(s, &a, (int)sizeof a) != 0 || wsListen(s, 16) != 0 || wsIoctl(s, (long)0x8004667Eu /* FIONBIO */, &on) != 0) { wsClose(s); return BAD_SOCK; }
+    return s;
+}
+static Sock SockAccept(Sock l)
+{
+    Sock s = wsAccept(l, NULL, NULL);
+    if (s == BAD_SOCK) return BAD_SOCK;
+    unsigned long on = 1;
+    wsIoctl(s, (long)0x8004667Eu, &on);
+    return s;
+}
+/* >0 bytes, 0 = closed, -1 = nothing yet, -2 = broken */
+static int SockRecv(Sock s, uint8_t *b, int n)
+{
+    int r = wsRecv(s, (char *)b, n, 0);
+    if (r > 0) return r;
+    if (r == 0) return 0;
+    return wsError() == 10035 /* WSAEWOULDBLOCK */ ? -1 : -2;
+}
+static int SockSend(Sock s, const uint8_t *b, int n)
+{
+    int r = wsSend(s, (const char *)b, n, 0);
+    if (r >= 0) return r;
+    return wsError() == 10035 ? -1 : -2;
+}
+static void SockClose(Sock s) { wsClose(s); }
+#else
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+typedef int Sock;
+#define BAD_SOCK (-1)
+static bool NetInit(void)
+{
+    signal(SIGPIPE, SIG_IGN);                            /* a client hanging up mustn't stop the program */
+    return true;
+}
+static Sock SockListen(int port)
+{
+    Sock s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) return BAD_SOCK;
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &on, sizeof on);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    a.sin_addr.s_addr = htonl(0x7F000001u);              /* 127.0.0.1: this computer only */
+    if (bind(s, (struct sockaddr *)&a, sizeof a) != 0 || listen(s, 16) != 0) { close(s); return BAD_SOCK; }
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+    return s;
+}
+static Sock SockAccept(Sock l)
+{
+    Sock s = accept(l, NULL, NULL);
+    if (s < 0) return BAD_SOCK;
+    fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK);
+#ifdef SO_NOSIGPIPE
+    int on = 1;
+    setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
+#endif
+    return s;
+}
+static int SockRecv(Sock s, uint8_t *b, int n)
+{
+    ssize_t r = recv(s, b, (size_t)n, 0);
+    if (r > 0) return (int)r;
+    if (r == 0) return 0;
+    return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? -1 : -2;
+}
+static int SockSend(Sock s, const uint8_t *b, int n)
+{
+    ssize_t r = send(s, b, (size_t)n, 0);
+    if (r >= 0) return (int)r;
+    return (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) ? -1 : -2;
+}
+static void SockClose(Sock s) { close(s); }
+#endif
+
+/* ---------- the web server ----------
+   It runs inside the normal frame loop: each frame it takes in whatever
+   has arrived and sends what it can, without ever waiting. */
+#define GIT_PORT  7979
+#define MAX_CONNS 16
+typedef struct {
+    bool used; Sock s; Buf in, out; size_t sent; bool replied, continued; double last;
+    int headLen;                         /* bytes of the request's header, once it's all arrived */
+} Conn;
+static Conn conns[MAX_CONNS];
+static Sock gitListen = BAD_SOCK;
+static int  gitPushes, gitClones;        /* since the program started */
+
+static void GitServerStart(void)
+{
+    if (!NetInit()) { snprintf(gitProblem, sizeof gitProblem, "this computer's network functions couldn't be loaded"); return; }
+    for (int p = GIT_PORT; p < GIT_PORT + 10; p++) {
+        gitListen = SockListen(p);
+        if (gitListen != BAD_SOCK) { gitPort = p; return; }
+    }
+    snprintf(gitProblem, sizeof gitProblem, "ports %d to %d are all in use by other programs", GIT_PORT, GIT_PORT + 9);
+}
+static void GitServerStop(void)
+{
+    for (int i = 0; i < MAX_CONNS; i++) if (conns[i].used) { SockClose(conns[i].s); BufFree(&conns[i].in); BufFree(&conns[i].out); }
+    if (gitListen != BAD_SOCK) SockClose(gitListen);
+    gitListen = BAD_SOCK;
+    gitPort = 0;
+}
+/* The address git uses for a repository. */
+static const char *CloneUrl(Repo *r)
+{
+    return TextFormat("http://localhost:%d/%s/%s.git", gitPort ? gitPort : GIT_PORT, UserName(r->owner), r->name);
+}
+
+/* What arrived: just the parts Mini GitHub needs. */
+typedef struct {
+    char method[8], path[512], query[256];
+    long long contentLength;
+    bool chunked, gzip, expect;
+    char auth[512], host[128];
+    const uint8_t *body; size_t bodyLen;
+    uint8_t *bodyOwned;                  /* if the body had to be put back together */
+} Req;
+
+static const char *Status(int code)
+{
+    switch (code) {
+    case 100: return "Continue";        case 200: return "OK";
+    case 400: return "Bad Request";     case 401: return "Unauthorized";
+    case 403: return "Forbidden";       case 404: return "Not Found";
+    case 405: return "Method Not Allowed"; case 413: return "Payload Too Large";
+    default:  return "Internal Server Error";
+    }
+}
+static void Reply(Conn *c, int code, const char *type, const uint8_t *body, size_t n, const char *extra)
+{
+    char head[640];
+    int hn = snprintf(head, sizeof head,
+                      "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: no-cache\r\n"
+                      "Connection: close\r\nServer: Mini-GitHub\r\n%s\r\n",
+                      code, Status(code), type, n, extra ? extra : "");
+    BufAdd(&c->out, head, (size_t)hn);
+    BufAdd(&c->out, body, n);
+    c->replied = true;
+}
+static void ReplyText(Conn *c, int code, const char *text, const char *extra)
+{
+    Reply(c, code, "text/plain; charset=utf-8", (const uint8_t *)text, strlen(text), extra);
+}
+
+/* Header lines are "Name: value"; case doesn't matter in the name. */
+static bool HeaderIs(const char *line, int n, const char *name, const char **val, int *vn)
+{
+    int k = (int)strlen(name);
+    if (n <= k || line[k] != ':') return false;
+    for (int i = 0; i < k; i++) if (tolower((unsigned char)line[i]) != tolower((unsigned char)name[i])) return false;
+    int s = k + 1;
+    while (s < n && line[s] == ' ') s++;
+    *val = line + s;
+    *vn = n - s;
+    return true;
+}
+static bool ValueHas(const char *v, int n, const char *word)
+{
+    int k = (int)strlen(word);
+    for (int i = 0; i + k <= n; i++) {
+        int j = 0;
+        while (j < k && tolower((unsigned char)v[i + j]) == word[j]) j++;
+        if (j == k) return true;
+    }
+    return false;
+}
+
+/* Reads the request line and headers. false if they don't make sense. */
+static bool ParseHead(const uint8_t *d, int len, Req *q)
+{
+    memset(q, 0, sizeof *q);
+    q->contentLength = -1;
+    int p = 0, line = 0;
+    while (p < len) {
+        int e = p;
+        while (e + 1 < len && !(d[e] == '\r' && d[e + 1] == '\n')) e++;
+        const char *l = (const char *)d + p;
+        int n = e - p;
+        if (n == 0) break;
+        if (line++ == 0) {
+            char target[800];
+            if (sscanf(l, "%7s %799s", q->method, target) != 2) return false;
+            char *qm = strchr(target, '?');
+            if (qm) { snprintf(q->query, sizeof q->query, "%s", qm + 1); *qm = 0; }
+            /* undo %20-style escapes */
+            int j = 0;
+            for (int i = 0; target[i] && j < (int)sizeof q->path - 1; i++) {
+                if (target[i] == '%' && isxdigit((unsigned char)target[i + 1]) && isxdigit((unsigned char)target[i + 2])) {
+                    q->path[j++] = (char)(HexVal(target[i + 1]) * 16 + HexVal(target[i + 2])); i += 2;
+                } else q->path[j++] = target[i];
+            }
+            q->path[j] = 0;
+        } else {
+            const char *v;
+            int vn;
+            if (HeaderIs(l, n, "Content-Length", &v, &vn)) q->contentLength = strtoll(v, NULL, 10);
+            else if (HeaderIs(l, n, "Transfer-Encoding", &v, &vn)) q->chunked = ValueHas(v, vn, "chunked");
+            else if (HeaderIs(l, n, "Content-Encoding", &v, &vn)) q->gzip = ValueHas(v, vn, "gzip");
+            else if (HeaderIs(l, n, "Expect", &v, &vn)) q->expect = ValueHas(v, vn, "100-continue");
+            else if (HeaderIs(l, n, "Authorization", &v, &vn)) snprintf(q->auth, sizeof q->auth, "%.*s", vn, v);
+            else if (HeaderIs(l, n, "Host", &v, &vn)) snprintf(q->host, sizeof q->host, "%.*s", vn, v);
+        }
+        p = e + 2;
+    }
+    return line > 0;
+}
+
+/* "chunked": the body arrives in pieces, each with its size in hex first.
+   Returns 1 when it's all there (and puts it together), 0 if not yet, -1 if damaged. */
+static int Unchunk(const uint8_t *d, size_t len, Req *q)
+{
+    size_t p = 0;
+    Buf b = {0};
+    for (;;) {
+        size_t e = p;
+        while (e + 1 < len && !(d[e] == '\r' && d[e + 1] == '\n')) e++;
+        if (e + 1 >= len) { BufFree(&b); return 0; }
+        unsigned long long n = 0;
+        size_t i = p;
+        if (i == e || !isxdigit(d[i])) { BufFree(&b); return -1; }
+        while (i < e && isxdigit(d[i])) { n = n * 16 + (unsigned long long)HexVal((char)d[i]); i++; if (n > MAX_PUSH) { BufFree(&b); return -1; } }
+        p = e + 2;
+        if (n == 0) {                                        /* the end (skip any trailer lines) */
+            for (;;) {
+                size_t e2 = p;
+                while (e2 + 1 < len && !(d[e2] == '\r' && d[e2 + 1] == '\n')) e2++;
+                if (e2 + 1 >= len) { BufFree(&b); return 0; }
+                if (e2 == p) break;
+                p = e2 + 2;
+            }
+            BufByte(&b, 0);
+            if (b.oom) { BufFree(&b); return -1; }
+            q->bodyOwned = b.d;
+            q->body = b.d;
+            q->bodyLen = b.n - 1;
+            return 1;
+        }
+        if (p + n + 2 > len) { BufFree(&b); return 0; }
+        BufAdd(&b, d + p, (size_t)n);
+        p += (size_t)n + 2;
+    }
+}
+
+/* ---------- who's asking ----------
+   git sends "Authorization: Basic <base64 of name:password>". Checking a
+   password takes a moment (that's what makes guessing slow), so a correct
+   one is remembered for a few minutes. */
+static int B64Val(int c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+}
+static struct { uint8_t key[32]; int uid; double until; } authMemo[8];
+static double authBlockedUntil;
+static int authFails;
+
+/* The user id if the request carries a right name + password, else -1. */
+static int Authenticate(Req *q)
+{
+    if (strncmp(q->auth, "Basic ", 6) != 0) return -1;
+    uint8_t key[32];
+    Sha256 h;
+    ShaInit(&h); ShaUpdate(&h, q->auth, strlen(q->auth)); ShaFinal(&h, key);
+    double now = GetTime();
+    for (int i = 0; i < 8; i++)
+        if (authMemo[i].until > now && memcmp(authMemo[i].key, key, 32) == 0 && FindUserById(authMemo[i].uid)) return authMemo[i].uid;
+    if (now < authBlockedUntil) return -1;                  /* too many wrong passwords: wait a little */
+
+    char dec[400];
+    int n = 0;
+    unsigned acc = 0;
+    int bits = 0;
+    for (const char *s = q->auth + 6; *s && n < (int)sizeof dec - 1; s++) {
+        int v = B64Val((unsigned char)*s);
+        if (v < 0) continue;
+        acc = acc << 6 | (unsigned)v; bits += 6;
+        if (bits >= 8) { bits -= 8; dec[n++] = (char)((acc >> bits) & 0xFF); }
+    }
+    dec[n] = 0;
+    char *colon = strchr(dec, ':');
+    int uid = -1;
+    if (colon) {
+        *colon = 0;
+        User *u = FindUserByName(dec);
+        if (u && CheckPassword(u, colon + 1)) uid = u->id;
+    }
+    memset(dec, 0, sizeof dec);
+    if (uid < 0) {
+        if (++authFails >= 5) { authBlockedUntil = now + 10; authFails = 0; }
+        return -1;
+    }
+    authFails = 0;
+    int slot = 0;
+    for (int i = 1; i < 8; i++) if (authMemo[i].until < authMemo[slot].until) slot = i;
+    memcpy(authMemo[slot].key, key, 32);
+    authMemo[slot].uid = uid;
+    authMemo[slot].until = now + 300;
+    return uid;
+}
+static void AskForPassword(Conn *c)
+{
+    ReplyText(c, 401, "Mini GitHub: sign in with your Mini GitHub username and password.\n",
+              "WWW-Authenticate: Basic realm=\"Mini GitHub\"\r\n");
+}
+
+/* ---------- git's requests ---------- */
+#define GIT_AGENT "agent=mini-github/1.0"
+
+/* "GET /owner/repo.git/info/refs?service=git-upload-pack": the list of branches. */
+static void InfoRefs(Conn *c, Req *q, Repo *r, bool push)
+{
+    Buf b = {0};
+    char hx[41], line[512];
+    PktStr(&b, push ? "# service=git-receive-pack\n" : "# service=git-upload-pack\n");
+    PktFlush(&b);
+    Commit *h = Head(r);
+    char caps[256];
+    if (push) snprintf(caps, sizeof caps, "report-status no-thin ofs-delta %s", GIT_AGENT);
+    else      snprintf(caps, sizeof caps, "multi_ack_detailed symref=HEAD:refs/heads/%s %s", r->branch, GIT_AGENT);
+    if (!h) {
+        int n = snprintf(line, sizeof line, "%040d capabilities^{}%c%s\n", 0, 0, caps);
+        Pkt(&b, line, (size_t)n);
+    } else {
+        ShaHex(h->sha, hx);
+        if (!push) {
+            int n = snprintf(line, sizeof line, "%s HEAD%c%s\n", hx, 0, caps);
+            Pkt(&b, line, (size_t)n);
+            n = snprintf(line, sizeof line, "%s refs/heads/%s\n", hx, r->branch);
+            Pkt(&b, line, (size_t)n);
+        } else {
+            int n = snprintf(line, sizeof line, "%s refs/heads/%s%c%s\n", hx, r->branch, 0, caps);
+            Pkt(&b, line, (size_t)n);
+        }
+    }
+    PktFlush(&b);
+    (void)q;
+    Reply(c, 200, push ? "application/x-git-receive-pack-advertisement" : "application/x-git-upload-pack-advertisement", b.d, b.n, NULL);
+    BufFree(&b);
+}
+
+/* "POST /owner/repo.git/git-upload-pack": clone, fetch and pull.
+   git says which commits it wants, then (in rounds) which it already has;
+   Mini GitHub says "ACK" to each one it knows too, and once git says
+   "done", answers with a pack of everything missing. This is git's
+   "multi_ack_detailed" way of talking, which is what git expects over HTTP. */
+static void UploadPack(Conn *c, Req *q, Repo *r)
+{
+    const uint8_t *d = q->body;
+    size_t len = q->bodyLen, at = 0, ul = 0;
+    uint8_t *unz = NULL;
+    if (q->gzip) {
+        unz = InflateGzip(d, len, &ul, MAX_PUSH);
+        if (!unz) { ReplyText(c, 400, "couldn't unpack the request\n", NULL); return; }
+        d = unz; len = ul;
+    }
+    int *wants = NULL, nw = 0, wcap = 0, *haves = NULL, nh = 0, hcap = 0;
+    const char *l;
+    int n;
+    bool done = false, bad = false;
+    Buf b = {0};
+    /* the wants, up to a flush */
+    while ((n = PktRead(d, len, &at, &l)) >= 0) {
+        uint8_t sha[20];
+        if (n >= 45 && strncmp(l, "want ", 5) == 0 && ParseHex40(l + 5, sha)) {
+            int k = CommitBySha(r, sha);
+            if (k < 0) { bad = true; break; }
+            wants = GrowArr(wants, &wcap, nw + 1, sizeof(int));
+            if (nw < wcap) wants[nw++] = k;
+        }
+    }
+    if (bad) { PktStr(&b, TextFormat("ERR upload-pack: not our ref\n")); }
+    else if (n == -1 && nw) {
+        /* then what they have */
+        char last[41] = "";
+        while ((n = PktRead(d, len, &at, &l)) != -2) {
+            if (n == -1) { PktStr(&b, "NAK\n"); break; }                   /* the end of a round, without "done" */
+            uint8_t sha[20];
+            if (n >= 45 && strncmp(l, "have ", 5) == 0 && ParseHex40(l + 5, sha)) {
+                int k = CommitBySha(r, sha);
+                if (k < 0) continue;
+                haves = GrowArr(haves, &hcap, nh + 1, sizeof(int));
+                if (nh < hcap) haves[nh++] = k;
+                ShaHex(sha, last);
+                PktStr(&b, TextFormat("ACK %s common\n", last));
+            } else if (n == 4 && strncmp(l, "done", 4) == 0) { done = true; break; }
+        }
+        if (done) {
+            if (nh) PktStr(&b, TextFormat("ACK %s\n", last));
+            else    PktStr(&b, "NAK\n");
+            if (!BuildPack(r, wants, nw, haves, nh, &b)) { BufFree(&b); ReplyText(c, 500, "out of memory\n", NULL); goto out; }
+            gitClones++;
+        }
+    }
+    Reply(c, 200, "application/x-git-upload-pack-result", b.d ? b.d : (const uint8_t *)"", b.n, NULL);
+    BufFree(&b);
+out:
+    free(wants); free(haves); free(unz);
+}
+
+/* "POST /owner/repo.git/git-receive-pack": git push.
+   First the branch updates ("old new refs/heads/main"), then a pack. */
+static void ReceivePack(Conn *c, Req *q, Repo *r, int uid)
+{
+    const uint8_t *d = q->body;
+    size_t len = q->bodyLen, at = 0;
+    typedef struct { uint8_t old[20], nw[20]; char ref[256]; } Cmd;
+    Cmd cmds[16];
+    int nc = 0;
+    const char *l;
+    int n;
+    while ((n = PktRead(d, len, &at, &l)) >= 0) {
+        if (nc >= 16) continue;
+        int k = 0;
+        while (k < n && l[k]) k++;                         /* the first line has extra settings after a zero byte */
+        if (k < 83 || l[40] != ' ' || l[81] != ' ') continue;
+        if (!ParseHex40(l, cmds[nc].old) || !ParseHex40(l + 41, cmds[nc].nw)) continue;
+        snprintf(cmds[nc].ref, sizeof cmds[nc].ref, "%.*s", k - 82, l + 82);
+        nc++;
+    }
+    if (!nc) { Reply(c, 200, "application/x-git-receive-pack-result", (const uint8_t *)"", 0, NULL); return; }
+
+    Buf b = {0};
+    PackSet ps;
+    memset(&ps, 0, sizeof ps);
+    const char *perr = NULL;
+    if (at < len) perr = ReadPack(d + at, len - at, &ps, r);
+    if (perr) {
+        PktStr(&b, TextFormat("unpack %s\n", perr));
+        for (int i = 0; i < nc; i++) PktStr(&b, TextFormat("ng %s unpacker error\n", cmds[i].ref));
+    } else {
+        PktStr(&b, "unpack ok\n");
+        int total = 0;
+        for (int i = 0; i < nc; i++) {
+            const char *why = NULL;
+            int added = 0;
+            if (!CanEditBy(r, uid))
+                why = TextFormat("%s can't push here - only %s and invited collaborators can", UserName(uid), UserName(r->owner));
+            if (!why) why = ApplyPush(r, uid, cmds[i].old, cmds[i].nw, cmds[i].ref, &ps, &added);
+            if (why) PktStr(&b, TextFormat("ng %s %s\n", cmds[i].ref, why));
+            else     PktStr(&b, TextFormat("ok %s\n", cmds[i].ref));
+            total += added;
+        }
+        if (total) {
+            MarkDirty();
+            ForgetScratch();
+            gitPushes++;
+            Toast(TextFormat("%s pushed %d commit%s to %s", UserName(uid), total, total == 1 ? "" : "s", r->name));
+        }
+    }
+    PktFlush(&b);
+    PackFree(&ps);
+    Reply(c, 200, "application/x-git-receive-pack-result", b.d, b.n, NULL);
+    BufFree(&b);
+}
+
+/* Works out what a complete request is for, and answers it. */
+static void HandleRequest(Conn *c, Req *q)
+{
+    /* Only requests addressed to this computer: a web page can't trick your browser into reaching it */
+    char hostOnly[128];
+    snprintf(hostOnly, sizeof hostOnly, "%s", q->host);
+    char *colon = hostOnly[0] == '[' ? strchr(hostOnly, ']') : strchr(hostOnly, ':');
+    if (colon) colon[hostOnly[0] == '['] = 0;
+    if (q->host[0] && !EqualsCI(hostOnly, "localhost") && strcmp(hostOnly, "127.0.0.1") != 0 && strcmp(hostOnly, "[::1]") != 0) {
+        ReplyText(c, 403, "Mini GitHub only answers requests to localhost\n", NULL);
+        return;
+    }
+    if (strcmp(q->path, "/") == 0) {
+        ReplyText(c, 200, "This is Mini GitHub's git server.\n"
+                          "Use it with git, for example:  git clone http://localhost:7979/<user>/<repository>.git\n", NULL);
+        return;
+    }
+    /* /owner/repo(.git)/rest */
+    char owner[NAME_LEN], name[NAME_LEN + 8], rest[128];
+    const char *p = q->path;
+    if (*p++ != '/') { ReplyText(c, 404, "Not found\n", NULL); return; }
+    const char *s1 = strchr(p, '/');
+    if (!s1 || s1 - p >= NAME_LEN) { ReplyText(c, 404, "Not found\n", NULL); return; }
+    snprintf(owner, sizeof owner, "%.*s", (int)(s1 - p), p);
+    p = s1 + 1;
+    const char *s2 = strchr(p, '/');
+    if (!s2 || s2 - p >= NAME_LEN + 4) { ReplyText(c, 404, "Not found\n", NULL); return; }
+    snprintf(name, sizeof name, "%.*s", (int)(s2 - p), p);
+    snprintf(rest, sizeof rest, "%s", s2 + 1);
+    size_t nl = strlen(name);
+    if (nl > 4 && strcmp(name + nl - 4, ".git") == 0) name[nl - 4] = 0;
+
+    User *ou = FindUserByName(owner);
+    int ri = ou ? FindRepoOf(ou->id, name) : -1;
+    if (ri < 0) {
+        ReplyText(c, 404, TextFormat("Mini GitHub has no repository called %s/%s\n", owner, name), NULL);
+        return;
+    }
+    Repo *r = &repos[ri];
+    bool wantPush = strcmp(rest, "git-receive-pack") == 0 || (strcmp(rest, "info/refs") == 0 && strstr(q->query, "service=git-receive-pack"));
+    bool wantPull = strcmp(rest, "git-upload-pack") == 0 || (strcmp(rest, "info/refs") == 0 && strstr(q->query, "service=git-upload-pack"));
+    if (!wantPush && !wantPull) {
+        ReplyText(c, 404, "Mini GitHub only speaks git's \"smart\" protocol - please use a recent version of git.\n", NULL);
+        return;
+    }
+    int uid = -1;
+    if (wantPush) {
+        uid = Authenticate(q);
+        if (uid < 0) { AskForPassword(c); return; }
+    }
+    if (strcmp(rest, "info/refs") == 0) {
+        if (strcmp(q->method, "GET") != 0) { ReplyText(c, 405, "Use GET\n", NULL); return; }
+        InfoRefs(c, q, r, wantPush);
+        return;
+    }
+    if (strcmp(q->method, "POST") != 0) { ReplyText(c, 405, "Use POST\n", NULL); return; }
+    if (wantPull) UploadPack(c, q, r);
+    else          ReceivePack(c, q, r, uid);
+}
+
+static void DropConn(Conn *c)
+{
+    SockClose(c->s);
+    BufFree(&c->in); BufFree(&c->out);
+    memset(c, 0, sizeof *c);
+}
+
+/* Called once per frame: new connections, incoming data, replies going out. */
+static void GitServerPoll(void)
+{
+    if (gitListen == BAD_SOCK) return;
+    double now = GetTime();
+    for (;;) {
+        Sock s = SockAccept(gitListen);
+        if (s == BAD_SOCK) break;
+        int k = -1;
+        for (int i = 0; i < MAX_CONNS; i++) if (!conns[i].used) { k = i; break; }
+        if (k < 0) { SockClose(s); continue; }
+        memset(&conns[k], 0, sizeof conns[k]);
+        conns[k].used = true; conns[k].s = s; conns[k].last = now;
+    }
+    static uint8_t chunk[256 * 1024];
+    for (int i = 0; i < MAX_CONNS; i++) {
+        Conn *c = &conns[i];
+        if (!c->used) continue;
+        if (!c->replied) {
+            size_t got = 0;
+            bool closed = false;
+            while (got < 64u * 1024 * 1024) {               /* take up to 64 MB a frame */
+                int r = SockRecv(c->s, chunk, (int)sizeof chunk);
+                if (r == -1) break;
+                if (r <= 0) { closed = true; break; }
+                BufAdd(&c->in, chunk, (size_t)r);
+                got += (size_t)r;
+                c->last = now;
+            }
+            if (c->in.oom || c->in.n > MAX_PUSH + 65536) { ReplyText(c, 413, "That's too big for Mini GitHub\n", NULL); }
+            else if (c->in.n) {
+                /* has the whole request arrived? */
+                if (!c->headLen) {
+                    for (size_t k = 3; k < c->in.n; k++)
+                        if (c->in.d[k - 3] == '\r' && c->in.d[k - 2] == '\n' && c->in.d[k - 1] == '\r' && c->in.d[k] == '\n') { c->headLen = (int)k + 1; break; }
+                    if (!c->headLen && c->in.n > 16384) ReplyText(c, 400, "Bad request\n", NULL);
+                }
+                if (c->headLen && !c->replied) {
+                    Req q;
+                    if (!ParseHead(c->in.d, c->headLen, &q)) ReplyText(c, 400, "Bad request\n", NULL);
+                    else {
+                        const uint8_t *body = c->in.d + c->headLen;
+                        size_t have = c->in.n - (size_t)c->headLen;
+                        int ready = 0;
+                        if (q.chunked) ready = Unchunk(body, have, &q);
+                        else if (q.contentLength > (long long)MAX_PUSH) ready = -2;
+                        else if (q.contentLength <= 0 || have >= (size_t)q.contentLength) {
+                            ready = 1;
+                            q.body = body;
+                            q.bodyLen = q.contentLength > 0 ? (size_t)q.contentLength : 0;
+                        }
+                        if (ready == 0 && q.expect && !c->continued) {          /* "go ahead and send the rest" */
+                            const char *go = "HTTP/1.1 100 Continue\r\n\r\n";
+                            SockSend(c->s, (const uint8_t *)go, (int)strlen(go));
+                            c->continued = true;
+                        }
+                        if (ready == 1) HandleRequest(c, &q);
+                        else if (ready == -1) ReplyText(c, 400, "Bad request\n", NULL);
+                        else if (ready == -2) ReplyText(c, 413, "That's too big for Mini GitHub\n", NULL);
+                        free(q.bodyOwned);
+                    }
+                }
+            }
+            if (closed && !c->replied) { DropConn(c); continue; }
+        }
+        if (c->replied) {
+            while (c->sent < c->out.n) {
+                size_t left = c->out.n - c->sent;
+                int r = SockSend(c->s, c->out.d + c->sent, (int)(left > (1u << 20) ? (1u << 20) : left));
+                if (r == -1) break;
+                if (r < 0) { c->sent = c->out.n; break; }
+                c->sent += (size_t)r;
+                c->last = now;
+            }
+            if (c->sent >= c->out.n) { DropConn(c); continue; }
+        }
+        if (now - c->last > 120) DropConn(c);               /* given up on */
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
 int main(void)
@@ -6773,6 +9442,7 @@ int main(void)
     SetTargetFPS(60);
 
     Load();
+    GitServerStart();
     if (userCount == 0) {
         GoRegister();
         if (OrphanCount() > 0) Toast("Create an account to take over your existing repositories");
@@ -6787,6 +9457,7 @@ int main(void)
         clickUsed  = false;
         wantCursor = MOUSE_CURSOR_DEFAULT;
         float dt = GetFrameTime();
+        GitServerPoll();
         if (toastT > 0) toastT -= dt;
         if (lockT > 0)  lockT  -= dt;
         if (armedId && (armedT -= dt) <= 0) armedId = 0;
@@ -6833,8 +9504,9 @@ int main(void)
                             tfNewFile.active || tfCommit.active || tfIssue.active || tfUser.active ||
                             tfPass.active || tfPass2.active || tfOldPass.active || tfNewPass.active ||
                             tfNewPass2.active || tfDelPass.active || tfBio.active || tfAvatar.active || tfCode.active ||
-                            tfUpPath.active || tfUpMsg.active || tfInvite.active;
-            if (anyFocus) Unfocus();
+                            tfUpPath.active || tfUpMsg.active || tfInvite.active || tfEmail.active;
+            if (codeMenu) codeMenu = false;
+            else if (anyFocus) Unfocus();
             else if (screen == SCR_FORGOT) GoLogin();
             else if (screen == SCR_RECOVERY) GoHome();
             else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT || screen == SCR_PEOPLE) GoHome();
@@ -6880,6 +9552,8 @@ int main(void)
         } break;
         }
 
+        if (screen == SCR_REPO || screen == SCR_COMMIT || screen == SCR_UPLOAD) CodeMenu(&repos[curRepo], true);
+        else codeMenu = false;
         DrawTip();
         DrawToast();
         EndDrawing();
@@ -6890,6 +9564,7 @@ int main(void)
         if (dirty && saveTimer > 0.75f) { Save(); dirty = false; saveTimer = 0; }
     }
 
+    GitServerStop();
     if (dirty) Save();
     ClearSecrets();
     for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);
