@@ -1,5 +1,5 @@
 #define main app_main
-#include "/home/claude/v6/main.c"
+#include "main.c"
 #undef main
 #include <assert.h>
 static int fails = 0;

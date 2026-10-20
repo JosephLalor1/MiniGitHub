@@ -15,6 +15,8 @@
  *   - Uploads: drag files from your computer onto one of your repositories (or
  *     paste their paths), check the list, and save them as one commit. Text files
  *     can then be edited; pictures are previewed; any other file is stored as-is
+ *   - Language detection: reads each file and guesses what it's written in (20
+ *     languages), and shows each repository's breakdown of languages
  *   - Downloads: any file, a whole repository (as a .zip), or the files as they
  *     were in any commit - saved to your Downloads folder
  *   - Commits: a snapshot of every file, saved with a message and an author
@@ -124,7 +126,8 @@ typedef struct {
    contents are stored only once, just like real git.
    "Binary" files (pictures, zips, programs...) are stored byte for byte;
    they just can't be shown as text or edited. */
-typedef struct { uint32_t hash; char *data; int len; bool binary; } Blob;
+typedef struct LangCache LangCache;   /* a file's language clues, worked out once (see "Language detection") */
+typedef struct { uint32_t hash; char *data; int len; bool binary; LangCache *lang; } Blob;
 
 /* A commit is a snapshot: a list of file names, each pointing at a blob. */
 typedef struct {
@@ -146,6 +149,8 @@ typedef struct {
    same file in the meantime. */
 typedef struct {
     char name[NAME_LEN]; char *text; int len, cap; bool binary;
+    unsigned ver, langVer;           /* ver goes up with every change; langVer = the version lang was worked out for */
+    LangCache *lang;
     bool deleted;                    /* in a draft: "I've deleted this file"               */
     int  base;                       /* in a draft: blob it started from (-1 = a new file) */
 } WorkFile;
@@ -345,6 +350,7 @@ static int filesGen;
 static void WF_SetN(WorkFile *f, const char *data, int n)
 {
     filesGen++;
+    f->ver++;
     if (f->cap < n + 1) { f->cap = n + 64; f->text = realloc(f->text, (size_t)f->cap); }
     memcpy(f->text, data, (size_t)n);
     f->text[n] = 0;                                  /* always ends in a zero, handy for text */
@@ -358,13 +364,15 @@ static void WF_Insert(WorkFile *f, int at, const char *s, int n)
     memmove(f->text + at + n, f->text + at, (size_t)(f->len - at + 1));
     memcpy(f->text + at, s, (size_t)n);
     f->len += n;
+    f->ver++;
 }
 static void WF_Delete(WorkFile *f, int at, int n)
 {
     memmove(f->text + at, f->text + at + n, (size_t)(f->len - at - n + 1));
     f->len -= n;
+    f->ver++;
 }
-static void WF_Free(WorkFile *f) { free(f->text); f->text = NULL; f->len = f->cap = 0; filesGen++; }
+static void WF_Free(WorkFile *f) { free(f->text); f->text = NULL; f->len = f->cap = 0; free(f->lang); f->lang = NULL; filesGen++; }
 
 /* ------------------------------------------------------------------ */
 /* Repositories, blobs and commits                                    */
@@ -393,7 +401,7 @@ static void FreeRepo(Repo *r)
 {
     for (int i = 0; i < r->draftCount; i++) FreeDraft(&r->drafts[i]);
     r->draftCount = 0;
-    for (int i = 0; i < r->blobCount; i++) free(r->blobs[i].data);
+    for (int i = 0; i < r->blobCount; i++) { free(r->blobs[i].data); free(r->blobs[i].lang); }
     filesGen++;
 }
 
@@ -420,6 +428,7 @@ static int InternBlob(Repo *r, const char *data, int len)
     b->data[len] = 0;
     b->len = len;
     b->binary = LooksBinary(data, len);
+    b->lang = NULL;
     return r->blobCount++;
 }
 
@@ -3876,6 +3885,622 @@ static void ScreenAccount(void)
     else                  SettingsAccountTab(u, 210);
 }
 
+/* ------------------------------------------------------------------ */
+/* Language detection                                                 */
+/*                                                                    */
+/* Reads a file and guesses what it's written in. Each language has a */
+/* list of clues: words it uses (like "def" or "fn"), bits of text it */
+/* uses ("std::", "console.log("), and how its lines start            */
+/* ("#include", "import "). Every clue found adds points to its       */
+/* language; the language with the most points wins.                  */
+/*                                                                    */
+/* A clue only scores up to 4 times, so one common word can't win on  */
+/* its own - a file has to look like the language in several ways.    */
+/* The file's ending (.c, .py...) is used as one extra clue, worth a  */
+/* few points, so a tiny file can still be recognised.                */
+/* ------------------------------------------------------------------ */
+enum {
+    LANG_C, LANG_CPP, LANG_CSHARP, LANG_JAVA, LANG_PYTHON, LANG_JS, LANG_TS, LANG_RUST, LANG_GO,
+    LANG_HTML, LANG_CSS, LANG_SQL, LANG_SHELL, LANG_PHP, LANG_RUBY, LANG_KOTLIN, LANG_SWIFT,
+    LANG_ASM, LANG_LUA, LANG_MAKE,
+    LANG_FIRST_NONCODE,                       /* everything below isn't counted as code */
+    LANG_MARKDOWN = LANG_FIRST_NONCODE, LANG_JSON, LANG_YAML, LANG_TEXT,
+    LANG_COUNT
+};
+static const char *LANG_NAMES[LANG_COUNT] = {
+    "C", "C++", "C#", "Java", "Python", "JavaScript", "TypeScript", "Rust", "Go",
+    "HTML", "CSS", "SQL", "Shell", "PHP", "Ruby", "Kotlin", "Swift",
+    "Assembly", "Lua", "Makefile",
+    "Markdown", "JSON", "YAML", "Plain text"
+};
+#define LANG_BINARY (-2)                      /* not text at all (pictures and so on) */
+
+/* how a clue is matched */
+enum { K_WORD,      /* a whole word, e.g. "def" but not "define"             */
+       K_WORDI,     /* a whole word, any capitals (SQL: select = SELECT)     */
+       K_SUB,       /* this text anywhere                                    */
+       K_START,     /* a line starts with this (after any spaces)            */
+       K_STARTI,    /* the same, any capitals                                */
+       K_END,       /* a line ends with this                                 */
+       K_SHEBANG }; /* the first line is "#!..." and contains this           */
+
+typedef struct { unsigned char lang, kind, weight; const char *text; } Clue;
+
+static const Clue CLUES[] = {
+    /* ---- C ---- */
+    {LANG_C, K_START, 3, "#include"}, {LANG_C, K_SUB, 3, "#include <stdio.h>"}, {LANG_C, K_SUB, 3, "#include <stdlib.h>"},
+    {LANG_C, K_SUB, 2, ".h\""}, {LANG_C, K_SUB, 2, "printf("}, {LANG_C, K_SUB, 3, "malloc("}, {LANG_C, K_SUB, 2, "free("},
+    {LANG_C, K_SUB, 2, "typedef struct"}, {LANG_C, K_START, 2, "#define"}, {LANG_C, K_START, 2, "#ifdef"}, {LANG_C, K_START, 2, "#ifndef"},
+    {LANG_C, K_START, 2, "#endif"}, {LANG_C, K_WORD, 1, "unsigned"}, {LANG_C, K_WORD, 1, "sizeof"}, {LANG_C, K_SUB, 1, "->"},
+    {LANG_C, K_WORD, 1, "static"}, {LANG_C, K_WORD, 1, "void"}, {LANG_C, K_WORD, 1, "int"}, {LANG_C, K_SUB, 2, "int main("},
+    {LANG_C, K_WORD, 1, "struct"}, {LANG_C, K_SUB, 2, "NULL"}, {LANG_C, K_WORD, 1, "const"}, {LANG_C, K_SUB, 1, "/*"},
+    /* ---- C++ (on top of C: these are things C doesn't have) ---- */
+    {LANG_CPP, K_START, 3, "#include"}, {LANG_CPP, K_SUB, 4, "std::"}, {LANG_CPP, K_WORD, 4, "namespace"}, {LANG_CPP, K_SUB, 4, "template <"},
+    {LANG_CPP, K_SUB, 4, "template<"}, {LANG_CPP, K_SUB, 3, "#include <iostream>"}, {LANG_CPP, K_SUB, 3, "#include <vector>"},
+    {LANG_CPP, K_SUB, 3, "#include <string>"}, {LANG_CPP, K_WORD, 3, "cout"}, {LANG_CPP, K_WORD, 3, "nullptr"},
+    {LANG_CPP, K_START, 3, "public:"}, {LANG_CPP, K_START, 3, "private:"}, {LANG_CPP, K_START, 3, "protected:"},
+    {LANG_CPP, K_WORD, 2, "class"}, {LANG_CPP, K_SUB, 2, "::"}, {LANG_CPP, K_WORD, 2, "virtual"}, {LANG_CPP, K_WORD, 2, "override"},
+    {LANG_CPP, K_SUB, 3, "using namespace"}, {LANG_CPP, K_WORD, 2, "constexpr"}, {LANG_CPP, K_WORD, 2, "typename"},
+    {LANG_CPP, K_START, 2, "#define"}, {LANG_CPP, K_START, 2, "#ifndef"}, {LANG_CPP, K_START, 2, "#endif"}, {LANG_CPP, K_WORD, 1, "const"},
+    {LANG_CPP, K_WORD, 1, "void"}, {LANG_CPP, K_WORD, 1, "int"}, {LANG_CPP, K_SUB, 2, "auto "},
+    /* ---- C# ---- */
+    {LANG_CSHARP, K_START, 5, "using System"}, {LANG_CSHARP, K_SUB, 4, "Console.Write"}, {LANG_CSHARP, K_WORD, 3, "namespace"},
+    {LANG_CSHARP, K_SUB, 4, "{ get; set; }"}, {LANG_CSHARP, K_SUB, 3, "{ get;"}, {LANG_CSHARP, K_WORD, 2, "public"}, {LANG_CSHARP, K_WORD, 2, "class"},
+    {LANG_CSHARP, K_WORD, 2, "string"}, {LANG_CSHARP, K_WORD, 2, "var"}, {LANG_CSHARP, K_SUB, 3, "static void Main"},
+    {LANG_CSHARP, K_WORD, 3, "readonly"}, {LANG_CSHARP, K_START, 3, "[Test"}, {LANG_CSHARP, K_WORD, 2, "async"}, {LANG_CSHARP, K_SUB, 2, "await "},
+    {LANG_CSHARP, K_WORD, 2, "foreach"}, {LANG_CSHARP, K_START, 2, "///"}, {LANG_CSHARP, K_WORD, 2, "internal"},
+    /* ---- Java ---- */
+    {LANG_JAVA, K_START, 5, "import java."}, {LANG_JAVA, K_START, 4, "package "}, {LANG_JAVA, K_SUB, 5, "System.out.print"},
+    {LANG_JAVA, K_SUB, 5, "public static void main(String"}, {LANG_JAVA, K_WORD, 2, "public"}, {LANG_JAVA, K_WORD, 2, "class"},
+    {LANG_JAVA, K_WORD, 2, "private"}, {LANG_JAVA, K_WORD, 2, "extends"}, {LANG_JAVA, K_WORD, 3, "implements"}, {LANG_JAVA, K_START, 3, "@Override"},
+    {LANG_JAVA, K_WORD, 2, "String"}, {LANG_JAVA, K_WORD, 3, "throws"}, {LANG_JAVA, K_WORD, 2, "new"}, {LANG_JAVA, K_WORD, 2, "final"},
+    {LANG_JAVA, K_START, 2, "import "}, {LANG_JAVA, K_START, 2, "/**"},
+    /* ---- Python ---- */
+    {LANG_PYTHON, K_START, 4, "def "}, {LANG_PYTHON, K_START, 3, "import "}, {LANG_PYTHON, K_START, 4, "from "}, {LANG_PYTHON, K_SUB, 3, " import "},
+    {LANG_PYTHON, K_WORD, 4, "self"}, {LANG_PYTHON, K_WORD, 4, "elif"}, {LANG_PYTHON, K_SUB, 4, "__init__"}, {LANG_PYTHON, K_SUB, 3, "__name__"},
+    {LANG_PYTHON, K_END, 1, ":"}, {LANG_PYTHON, K_START, 3, "if __name__"}, {LANG_PYTHON, K_START, 2, "return "},
+    {LANG_PYTHON, K_START, 3, "raise "}, {LANG_PYTHON, K_START, 3, "try:"}, {LANG_PYTHON, K_START, 3, "with "}, {LANG_PYTHON, K_SUB, 2, "f\""}, {LANG_PYTHON, K_WORD, 2, "None"}, {LANG_PYTHON, K_WORD, 2, "True"}, {LANG_PYTHON, K_WORD, 2, "False"},
+    {LANG_PYTHON, K_START, 3, "class "}, {LANG_PYTHON, K_SUB, 2, "print("}, {LANG_PYTHON, K_START, 2, "#"}, {LANG_PYTHON, K_SUB, 3, "\"\"\""},
+    {LANG_PYTHON, K_WORD, 2, "lambda"}, {LANG_PYTHON, K_WORD, 2, "except"}, {LANG_PYTHON, K_START, 3, "@"}, {LANG_PYTHON, K_SHEBANG, 9, "python"},
+    {LANG_PYTHON, K_WORD, 1, "not"}, {LANG_PYTHON, K_WORD, 1, "in"}, {LANG_PYTHON, K_WORD, 2, "pass"},
+    /* ---- JavaScript ---- */
+    {LANG_JS, K_WORD, 3, "function"}, {LANG_JS, K_START, 2, "const "}, {LANG_JS, K_START, 2, "let "}, {LANG_JS, K_WORD, 2, "var"},
+    {LANG_JS, K_SUB, 3, "=>"}, {LANG_JS, K_SUB, 4, "console.log("}, {LANG_JS, K_SUB, 4, "require("}, {LANG_JS, K_SUB, 4, "module.exports"},
+    {LANG_JS, K_SUB, 3, "document."}, {LANG_JS, K_SUB, 3, "===",}, {LANG_JS, K_SUB, 2, "!=="}, {LANG_JS, K_WORD, 2, "undefined"},
+    {LANG_JS, K_START, 3, "export "}, {LANG_JS, K_START, 3, "import "}, {LANG_JS, K_WORD, 2, "async"}, {LANG_JS, K_WORD, 2, "await"},
+    {LANG_JS, K_WORD, 2, "this"}, {LANG_JS, K_SUB, 2, "});"}, {LANG_JS, K_SHEBANG, 9, "node"}, {LANG_JS, K_START, 2, "'use strict'"},
+    {LANG_JS, K_START, 2, "\"use strict\""}, {LANG_JS, K_WORD, 1, "return"}, {LANG_JS, K_WORD, 1, "null"},
+    /* ---- TypeScript (on top of JavaScript: types) ---- */
+    {LANG_TS, K_WORD, 3, "function"}, {LANG_TS, K_START, 2, "const "}, {LANG_TS, K_START, 2, "let "}, {LANG_TS, K_SUB, 3, "=>"},
+    {LANG_TS, K_START, 3, "export "}, {LANG_TS, K_START, 3, "import "}, {LANG_TS, K_SUB, 2, "==="}, {LANG_TS, K_WORD, 2, "async"},
+    {LANG_TS, K_WORD, 2, "this"}, {LANG_TS, K_WORD, 1, "return"}, {LANG_TS, K_WORD, 1, "null"}, {LANG_TS, K_WORD, 2, "undefined"},
+    {LANG_TS, K_SUB, 5, ": string;"}, {LANG_TS, K_SUB, 5, ": string)"}, {LANG_TS, K_SUB, 5, ": string,"}, {LANG_TS, K_SUB, 4, ": string ="},
+    {LANG_TS, K_SUB, 5, ": number;"}, {LANG_TS, K_SUB, 5, ": number)"}, {LANG_TS, K_SUB, 5, ": number,"}, {LANG_TS, K_SUB, 5, ": boolean;"},
+    {LANG_TS, K_SUB, 4, ": boolean)"}, {LANG_TS, K_SUB, 4, "): string"}, {LANG_TS, K_SUB, 4, "): number"}, {LANG_TS, K_SUB, 4, "): boolean"},
+    {LANG_TS, K_SUB, 3, "?: "}, {LANG_TS, K_WORD, 4, "interface"},
+    {LANG_TS, K_START, 5, "export type"}, {LANG_TS, K_START, 5, "export interface"}, {LANG_TS, K_START, 5, "declare "},
+    {LANG_TS, K_SUB, 4, "): void"}, {LANG_TS, K_SUB, 3, "readonly "}, {LANG_TS, K_SUB, 3, "<T>"}, {LANG_TS, K_SUB, 3, ": any;"},
+    {LANG_TS, K_SUB, 3, ": any)"},
+    {LANG_TS, K_SUB, 3, "): Promise<"}, {LANG_TS, K_WORD, 2, "enum"},
+    /* ---- Rust ---- */
+    {LANG_RUST, K_START, 4, "fn "}, {LANG_RUST, K_START, 4, "pub fn "}, {LANG_RUST, K_SUB, 5, "let mut "}, {LANG_RUST, K_SUB, 5, "println!("},
+    {LANG_RUST, K_START, 4, "use std::"}, {LANG_RUST, K_START, 3, "impl "}, {LANG_RUST, K_SUB, 3, "&mut "}, {LANG_RUST, K_WORD, 3, "match"},
+    {LANG_RUST, K_SUB, 3, "::new("}, {LANG_RUST, K_SUB, 3, "Vec<"}, {LANG_RUST, K_SUB, 3, "Option<"}, {LANG_RUST, K_SUB, 3, "Result<"},
+    {LANG_RUST, K_START, 3, "#[derive("}, {LANG_RUST, K_SUB, 2, "-> "}, {LANG_RUST, K_WORD, 3, "struct"}, {LANG_RUST, K_SUB, 3, ".unwrap()"},
+    {LANG_RUST, K_START, 3, "mod "}, {LANG_RUST, K_WORD, 2, "pub"}, {LANG_RUST, K_SUB, 2, "Some("}, {LANG_RUST, K_WORD, 2, "enum"},
+    /* ---- Go ---- */
+    {LANG_GO, K_START, 5, "package "}, {LANG_GO, K_START, 4, "func "}, {LANG_GO, K_SUB, 4, ":="}, {LANG_GO, K_SUB, 4, "fmt."},
+    {LANG_GO, K_START, 4, "import ("}, {LANG_GO, K_SUB, 3, "err != nil"}, {LANG_GO, K_WORD, 3, "chan"}, {LANG_GO, K_WORD, 2, "defer"},
+    {LANG_GO, K_SUB, 3, "go func"}, {LANG_GO, K_WORD, 2, "struct"}, {LANG_GO, K_WORD, 1, "nil"}, {LANG_GO, K_SUB, 2, "[]string"},
+    {LANG_GO, K_SUB, 2, "interface{}"}, {LANG_GO, K_START, 3, "type "},
+    /* ---- HTML ---- */
+    {LANG_HTML, K_SUB, 6, "<!DOCTYPE"}, {LANG_HTML, K_SUB, 6, "<!doctype"}, {LANG_HTML, K_SUB, 5, "<html"}, {LANG_HTML, K_SUB, 3, "<head"},
+    {LANG_HTML, K_SUB, 3, "<body"}, {LANG_HTML, K_SUB, 3, "<div"}, {LANG_HTML, K_SUB, 3, "</div>"}, {LANG_HTML, K_SUB, 2, "<p>"},
+    {LANG_HTML, K_SUB, 2, "</p>"}, {LANG_HTML, K_SUB, 2, "href=\""}, {LANG_HTML, K_SUB, 2, "<a "}, {LANG_HTML, K_SUB, 2, "<span"},
+    {LANG_HTML, K_SUB, 2, "<meta"}, {LANG_HTML, K_SUB, 2, "<script"}, {LANG_HTML, K_SUB, 2, "<title>"}, {LANG_HTML, K_SUB, 2, "class=\""},
+    {LANG_HTML, K_SUB, 2, "<li>"}, {LANG_HTML, K_SUB, 2, "<br"}, {LANG_HTML, K_SUB, 2, "<table"}, {LANG_HTML, K_SUB, 3, "</"},
+    {LANG_HTML, K_SUB, 2, "<!--"}, {LANG_HTML, K_SUB, 2, "<h1"}, {LANG_HTML, K_SUB, 2, "<h2"}, {LANG_HTML, K_SUB, 2, "<h3"},
+    {LANG_HTML, K_SUB, 2, "<ul"}, {LANG_HTML, K_SUB, 2, "<img"}, {LANG_HTML, K_SUB, 2, "<link"}, {LANG_HTML, K_SUB, 2, "<style"},
+    {LANG_HTML, K_SUB, 2, "<input"}, {LANG_HTML, K_SUB, 2, "<form"}, {LANG_HTML, K_SUB, 2, "<button"}, {LANG_HTML, K_SUB, 2, "<nav"},
+    {LANG_HTML, K_SUB, 2, "<section"}, {LANG_HTML, K_SUB, 2, "<footer"}, {LANG_HTML, K_SUB, 2, "<header"}, {LANG_HTML, K_SUB, 2, "<td"},
+    {LANG_HTML, K_SUB, 2, "<tr"}, {LANG_HTML, K_SUB, 2, "<code"}, {LANG_HTML, K_SUB, 2, "<pre"}, {LANG_HTML, K_SUB, 2, "<svg"},
+    {LANG_HTML, K_SUB, 2, "{% "}, {LANG_HTML, K_SUB, 2, "{{ "},
+    /* ---- CSS ---- */
+    {LANG_CSS, K_SUB, 3, "px;"}, {LANG_CSS, K_START, 3, "color:"}, {LANG_CSS, K_START, 3, "margin"}, {LANG_CSS, K_START, 3, "padding"},
+    {LANG_CSS, K_START, 3, "@media"}, {LANG_CSS, K_START, 3, "display:"}, {LANG_CSS, K_START, 3, "font-"}, {LANG_CSS, K_START, 2, "background"},
+    {LANG_CSS, K_SUB, 2, "!important"}, {LANG_CSS, K_START, 2, "border"}, {LANG_CSS, K_START, 2, "width:"}, {LANG_CSS, K_START, 2, "height:"},
+    {LANG_CSS, K_SUB, 2, "em;"}, {LANG_CSS, K_SUB, 2, "rgba("}, {LANG_CSS, K_START, 2, "text-align:"}, {LANG_CSS, K_START, 2, "position:"},
+    {LANG_CSS, K_START, 2, "cursor:"}, {LANG_CSS, K_START, 2, "transition:"}, {LANG_CSS, K_START, 2, "opacity:"}, {LANG_CSS, K_START, 2, "--"},
+    {LANG_CSS, K_SUB, 2, ":hover"}, {LANG_CSS, K_SUB, 2, "var(--"}, {LANG_CSS, K_START, 2, "@import"}, {LANG_CSS, K_START, 2, "@font-face"},
+    /* ---- SQL ---- */
+    {LANG_SQL, K_WORDI, 3, "select"}, {LANG_SQL, K_WORDI, 3, "from"}, {LANG_SQL, K_WORDI, 3, "where"}, {LANG_SQL, K_SUB, 4, "INSERT INTO"},
+    {LANG_SQL, K_SUB, 4, "CREATE TABLE"}, {LANG_SQL, K_SUB, 4, "create table"}, {LANG_SQL, K_WORDI, 2, "join"}, {LANG_SQL, K_SUB, 3, "VALUES"},
+    {LANG_SQL, K_SUB, 3, "PRIMARY KEY"}, {LANG_SQL, K_WORDI, 2, "varchar"}, {LANG_SQL, K_SUB, 3, "GROUP BY"}, {LANG_SQL, K_SUB, 3, "ORDER BY"},
+    {LANG_SQL, K_START, 2, "--"}, {LANG_SQL, K_WORDI, 2, "update"}, {LANG_SQL, K_WORDI, 2, "delete"}, {LANG_SQL, K_END, 1, ";"},
+    {LANG_SQL, K_SUB, 3, "CREATE "}, {LANG_SQL, K_SUB, 3, "DROP "}, {LANG_SQL, K_SUB, 3, "SELECT "}, {LANG_SQL, K_SUB, 2, "BEGIN;"},
+    /* ---- Shell ---- */
+    {LANG_SHELL, K_SHEBANG, 9, "sh"}, {LANG_SHELL, K_SHEBANG, 9, "bash"}, {LANG_SHELL, K_START, 3, "echo "}, {LANG_SHELL, K_START, 3, "fi"},
+    {LANG_SHELL, K_SUB, 3, "; then"}, {LANG_SHELL, K_START, 2, "then"}, {LANG_SHELL, K_START, 3, "done"}, {LANG_SHELL, K_SUB, 3, "; do"},
+    {LANG_SHELL, K_SUB, 3, "$("}, {LANG_SHELL, K_SUB, 2, "${"}, {LANG_SHELL, K_WORD, 3, "esac"}, {LANG_SHELL, K_START, 2, "export "},
+    {LANG_SHELL, K_SUB, 2, "[ -"}, {LANG_SHELL, K_SUB, 2, "[[ "}, {LANG_SHELL, K_SUB, 2, " 2>&1"}, {LANG_SHELL, K_SUB, 2, "$1"},
+    {LANG_SHELL, K_SUB, 2, "\"$@\""}, {LANG_SHELL, K_START, 2, "#"}, {LANG_SHELL, K_START, 2, "set -e"},
+    /* ---- PHP ---- */
+    {LANG_PHP, K_SUB, 9, "<?php"}, {LANG_PHP, K_SHEBANG, 9, "php"}, {LANG_PHP, K_SUB, 4, "$this->"}, {LANG_PHP, K_SUB, 2, "->"}, {LANG_PHP, K_WORD, 2, "function"},
+    {LANG_PHP, K_START, 2, "echo "}, {LANG_PHP, K_SUB, 3, "array("}, {LANG_PHP, K_SUB, 2, "$_"}, {LANG_PHP, K_SUB, 2, "=> "},
+    {LANG_PHP, K_START, 3, "namespace "}, {LANG_PHP, K_START, 3, "use "}, {LANG_PHP, K_WORD, 2, "public"},
+    /* ---- Ruby ---- */
+    {LANG_RUBY, K_START, 3, "def "}, {LANG_RUBY, K_START, 4, "end"}, {LANG_RUBY, K_END, 3, " do"}, {LANG_RUBY, K_SUB, 3, "#{"},
+    {LANG_RUBY, K_SUB, 2, ".new"}, {LANG_RUBY, K_SUB, 2, "nil?"}, {LANG_RUBY, K_START, 3, "require "}, {LANG_RUBY, K_START, 3, "require_relative"},
+    {LANG_RUBY, K_SUB, 3, " do |"}, {LANG_RUBY, K_SUB, 3, ".each"}, {LANG_RUBY, K_START, 3, "puts "}, {LANG_RUBY, K_SUB, 3, "attr_"},
+    {LANG_RUBY, K_START, 3, "module "}, {LANG_RUBY, K_START, 2, "class "}, {LANG_RUBY, K_WORD, 2, "unless"}, {LANG_RUBY, K_WORD, 2, "nil"},
+    {LANG_RUBY, K_SUB, 2, "@"}, {LANG_RUBY, K_SHEBANG, 9, "ruby"}, {LANG_RUBY, K_START, 2, "#"}, {LANG_RUBY, K_WORD, 2, "elsif"},
+    {LANG_RUBY, K_SUB, 2, " => "}, {LANG_RUBY, K_SUB, 2, ":symbol"},
+    /* ---- Kotlin ---- */
+    {LANG_KOTLIN, K_START, 4, "fun "}, {LANG_KOTLIN, K_START, 3, "val "}, {LANG_KOTLIN, K_START, 2, "var "}, {LANG_KOTLIN, K_START, 4, "import kotlin"},
+    {LANG_KOTLIN, K_SUB, 3, "println("}, {LANG_KOTLIN, K_START, 3, "package "}, {LANG_KOTLIN, K_SUB, 3, "data class"}, {LANG_KOTLIN, K_WORD, 3, "when"},
+    {LANG_KOTLIN, K_SUB, 2, "?."}, {LANG_KOTLIN, K_SUB, 2, "!!"}, {LANG_KOTLIN, K_WORD, 2, "override"}, {LANG_KOTLIN, K_SUB, 2, ": String"},
+    {LANG_KOTLIN, K_SUB, 2, ": Int"},
+    /* ---- Swift ---- */
+    {LANG_SWIFT, K_START, 4, "func "}, {LANG_SWIFT, K_START, 4, "import Foundation"}, {LANG_SWIFT, K_START, 4, "import UIKit"},
+    {LANG_SWIFT, K_START, 4, "import SwiftUI"}, {LANG_SWIFT, K_WORD, 3, "guard"}, {LANG_SWIFT, K_START, 2, "let "}, {LANG_SWIFT, K_START, 2, "var "},
+    {LANG_SWIFT, K_SUB, 2, "print("}, {LANG_SWIFT, K_SUB, 3, "-> "}, {LANG_SWIFT, K_SUB, 2, "?? "}, {LANG_SWIFT, K_WORD, 2, "struct"},
+    {LANG_SWIFT, K_SUB, 3, ": View"}, {LANG_SWIFT, K_SUB, 2, "@State"},
+    /* ---- Assembly (x86 and 68k) ---- */
+    {LANG_ASM, K_STARTI, 3, "mov"}, {LANG_ASM, K_STARTI, 3, "move."}, {LANG_ASM, K_SUB, 4, "section .text"}, {LANG_ASM, K_SUB, 4, "section .data"},
+    {LANG_ASM, K_START, 4, "global _start"}, {LANG_ASM, K_STARTI, 3, "syscall"}, {LANG_ASM, K_SUB, 3, "int 0x80"}, {LANG_ASM, K_WORDI, 2, "eax"},
+    {LANG_ASM, K_WORDI, 2, "rax"}, {LANG_ASM, K_WORDI, 2, "rsp"}, {LANG_ASM, K_STARTI, 2, "jmp"}, {LANG_ASM, K_STARTI, 2, "push"},
+    {LANG_ASM, K_STARTI, 2, "pop"}, {LANG_ASM, K_STARTI, 2, "lea"}, {LANG_ASM, K_STARTI, 2, "ret"}, {LANG_ASM, K_STARTI, 2, "call"},
+    {LANG_ASM, K_STARTI, 2, "cmp"}, {LANG_ASM, K_STARTI, 2, "dc.b"}, {LANG_ASM, K_START, 3, ".globl"}, {LANG_ASM, K_START, 3, ".text"},
+    {LANG_ASM, K_START, 2, ".section"}, {LANG_ASM, K_START, 2, ".align"}, {LANG_ASM, K_SUB, 2, "%rsp"}, {LANG_ASM, K_SUB, 2, "%eax"},
+    {LANG_ASM, K_START, 2, ";"}, {LANG_ASM, K_STARTI, 2, "add"}, {LANG_ASM, K_STARTI, 2, "sub"}, {LANG_ASM, K_STARTI, 2, "bne"},
+    {LANG_ASM, K_STARTI, 2, "beq"}, {LANG_ASM, K_START, 2, ".type"}, {LANG_ASM, K_START, 2, ".size"}, {LANG_ASM, K_STARTI, 2, "xor"},
+    {LANG_ASM, K_STARTI, 2, "movq"}, {LANG_ASM, K_STARTI, 2, "movl"}, {LANG_ASM, K_STARTI, 2, "movb"}, {LANG_ASM, K_STARTI, 2, "leaq"},
+    {LANG_ASM, K_STARTI, 2, "addq"}, {LANG_ASM, K_STARTI, 2, "subq"}, {LANG_ASM, K_STARTI, 2, "cmpq"}, {LANG_ASM, K_STARTI, 2, "testq"},
+    {LANG_ASM, K_STARTI, 2, "jne"}, {LANG_ASM, K_STARTI, 2, "je"}, {LANG_ASM, K_STARTI, 2, "jz"}, {LANG_ASM, K_STARTI, 2, "jnz"},
+    {LANG_ASM, K_STARTI, 2, "jl"}, {LANG_ASM, K_STARTI, 2, "jg"}, {LANG_ASM, K_STARTI, 2, "pushq"}, {LANG_ASM, K_STARTI, 2, "popq"},
+    {LANG_ASM, K_STARTI, 2, "xorl"}, {LANG_ASM, K_STARTI, 2, "andq"}, {LANG_ASM, K_STARTI, 2, "shlq"}, {LANG_ASM, K_STARTI, 2, "shrq"},
+    {LANG_ASM, K_STARTI, 2, "ldr"}, {LANG_ASM, K_STARTI, 2, "str"}, {LANG_ASM, K_STARTI, 2, "bl"}, {LANG_ASM, K_STARTI, 2, "stp"},
+    {LANG_ASM, K_STARTI, 2, "ldp"}, {LANG_ASM, K_STARTI, 2, "nop"}, {LANG_ASM, K_STARTI, 2, "inc"}, {LANG_ASM, K_STARTI, 2, "dec"},
+    {LANG_ASM, K_STARTI, 2, "trap"}, {LANG_ASM, K_STARTI, 2, "rts"}, {LANG_ASM, K_STARTI, 2, "bra"}, {LANG_ASM, K_STARTI, 2, "jsr"},
+    {LANG_ASM, K_STARTI, 2, "dc.l"}, {LANG_ASM, K_STARTI, 2, "dc.w"}, {LANG_ASM, K_STARTI, 2, "org"},
+    {LANG_ASM, K_START, 2, ".cfi_"}, {LANG_ASM, K_START, 2, ".long"}, {LANG_ASM, K_START, 2, ".quad"}, {LANG_ASM, K_START, 2, ".byte"},
+    {LANG_ASM, K_START, 2, ".p2align"}, {LANG_ASM, K_START, 2, ".data"}, {LANG_ASM, K_START, 2, ".file"}, {LANG_ASM, K_START, 2, ".word"},
+    {LANG_ASM, K_START, 3, "TEXT "}, {LANG_ASM, K_SUB, 3, "(SB)"}, {LANG_ASM, K_SUB, 3, "(FP)"}, {LANG_ASM, K_SUB, 2, "(%r"},
+    {LANG_ASM, K_SUB, 2, ", $"}, {LANG_ASM, K_SUB, 1, ",%"}, {LANG_ASM, K_START, 2, "ENTRY("}, {LANG_ASM, K_START, 2, "END("},
+    /* ---- Lua ---- */
+    {LANG_LUA, K_START, 4, "local "}, {LANG_LUA, K_SUB, 3, "local function"}, {LANG_LUA, K_WORD, 2, "function"}, {LANG_LUA, K_START, 2, "end"},
+    {LANG_LUA, K_WORD, 2, "then"}, {LANG_LUA, K_WORD, 3, "elseif"}, {LANG_LUA, K_WORD, 2, "nil"}, {LANG_LUA, K_START, 2, "--"},
+    {LANG_LUA, K_SUB, 3, "~="}, {LANG_LUA, K_SUB, 3, "require(\""}, {LANG_LUA, K_SUB, 3, "require \""}, {LANG_LUA, K_SUB, 2, " .. "},
+    {LANG_LUA, K_WORD, 2, "pairs"}, {LANG_LUA, K_WORD, 2, "ipairs"}, {LANG_LUA, K_START, 2, "return "},
+    /* ---- Makefile ---- */
+    {LANG_MAKE, K_SUB, 4, "$(CC)"}, {LANG_MAKE, K_SUB, 3, "$(CFLAGS)"}, {LANG_MAKE, K_START, 4, ".PHONY"}, {LANG_MAKE, K_SUB, 3, "$@"},
+    {LANG_MAKE, K_SUB, 3, "$<"}, {LANG_MAKE, K_SUB, 3, "$^"}, {LANG_MAKE, K_START, 2, "all:"}, {LANG_MAKE, K_START, 2, "clean:"},
+    {LANG_MAKE, K_SUB, 3, " := "}, {LANG_MAKE, K_SUB, 2, " ?= "}, {LANG_MAKE, K_SUB, 2, "$("}, {LANG_MAKE, K_START, 2, "include "},
+    {LANG_MAKE, K_START, 2, "ifeq"}, {LANG_MAKE, K_START, 2, "endif"}, {LANG_MAKE, K_SUB, 3, "@echo"}, {LANG_MAKE, K_SUB, 3, "$(MAKE)"},
+    {LANG_MAKE, K_SUB, 3, " += "}, {LANG_MAKE, K_START, 2, "-include"}, {LANG_MAKE, K_SUB, 3, "%.o"}, {LANG_MAKE, K_SUB, 2, "$(RM)"},
+    {LANG_MAKE, K_START, 2, "ifdef"}, {LANG_MAKE, K_START, 2, "ifneq"}, {LANG_MAKE, K_START, 2, "install:"},
+    /* ---- the C family's comment styles (Python, Ruby, Shell... never use these) ---- */
+    {LANG_C, K_START, 2, "//"}, {LANG_CPP, K_START, 2, "//"}, {LANG_CSHARP, K_START, 2, "//"}, {LANG_JAVA, K_START, 2, "//"},
+    {LANG_JS, K_START, 2, "//"}, {LANG_TS, K_START, 2, "//"}, {LANG_RUST, K_START, 2, "//"}, {LANG_GO, K_START, 2, "//"},
+    {LANG_KOTLIN, K_START, 2, "//"}, {LANG_SWIFT, K_START, 2, "//"}, {LANG_PHP, K_START, 1, "//"},
+    {LANG_C, K_START, 2, "/*"}, {LANG_CPP, K_START, 2, "/*"}, {LANG_JAVA, K_START, 2, "/*"}, {LANG_JS, K_START, 1, "/*"},
+    {LANG_CSS, K_START, 2, "/*"}, {LANG_CSHARP, K_START, 1, "/*"}, {LANG_GO, K_START, 1, "/*"},
+    /* ---- Markdown ---- */
+    {LANG_MARKDOWN, K_START, 3, "# "}, {LANG_MARKDOWN, K_START, 3, "## "}, {LANG_MARKDOWN, K_START, 3, "### "}, {LANG_MARKDOWN, K_START, 2, "- "},
+    {LANG_MARKDOWN, K_START, 1, "* "}, {LANG_MARKDOWN, K_START, 3, "```"}, {LANG_MARKDOWN, K_SUB, 3, "]("}, {LANG_MARKDOWN, K_SUB, 2, "**"},
+    {LANG_MARKDOWN, K_START, 2, "> "}, {LANG_MARKDOWN, K_START, 2, "1. "}, {LANG_MARKDOWN, K_SUB, 2, "`"}, {LANG_MARKDOWN, K_START, 2, "| "},
+    /* ---- JSON ---- */
+    {LANG_JSON, K_SUB, 3, "\": "}, {LANG_JSON, K_SUB, 2, "\":"}, {LANG_JSON, K_END, 2, "\","}, {LANG_JSON, K_END, 2, "},"},
+    {LANG_JSON, K_END, 1, "["}, {LANG_JSON, K_END, 1, "{"}, {LANG_JSON, K_WORD, 1, "true"}, {LANG_JSON, K_WORD, 1, "false"},
+    /* ---- YAML ---- */
+    {LANG_YAML, K_START, 3, "---"}, {LANG_YAML, K_START, 2, "- name:"}, {LANG_YAML, K_END, 2, ":"}, {LANG_YAML, K_SUB, 2, ": "},
+    {LANG_YAML, K_START, 1, "- "}, {LANG_YAML, K_START, 1, "#"},
+};
+#define CLUE_COUNT ((int)(sizeof CLUES / sizeof CLUES[0]))
+
+/* File endings, each worth a few points to its language. */
+static const struct { const char *ext; int lang; } EXTS[] = {
+    {"c", LANG_C}, {"h", LANG_C}, {"cpp", LANG_CPP}, {"cc", LANG_CPP}, {"cxx", LANG_CPP}, {"hpp", LANG_CPP}, {"hh", LANG_CPP},
+    {"cs", LANG_CSHARP}, {"java", LANG_JAVA}, {"py", LANG_PYTHON}, {"pyw", LANG_PYTHON}, {"js", LANG_JS}, {"mjs", LANG_JS},
+    {"cjs", LANG_JS}, {"jsx", LANG_JS}, {"ts", LANG_TS}, {"tsx", LANG_TS}, {"mts", LANG_TS}, {"rs", LANG_RUST}, {"go", LANG_GO},
+    {"html", LANG_HTML}, {"htm", LANG_HTML}, {"css", LANG_CSS}, {"sql", LANG_SQL}, {"sh", LANG_SHELL}, {"bash", LANG_SHELL},
+    {"php", LANG_PHP}, {"rb", LANG_RUBY}, {"kt", LANG_KOTLIN}, {"kts", LANG_KOTLIN}, {"swift", LANG_SWIFT}, {"s", LANG_ASM},
+    {"asm", LANG_ASM}, {"x68", LANG_ASM}, {"lua", LANG_LUA}, {"mk", LANG_MAKE}, {"md", LANG_MARKDOWN}, {"markdown", LANG_MARKDOWN},
+    {"json", LANG_JSON}, {"yml", LANG_YAML}, {"yaml", LANG_YAML}, {"txt", LANG_TEXT},
+};
+
+#define LANG_SCAN (48 * 1024)   /* only the start of a big file is read: plenty to tell */
+
+static bool WordChar(char c) { return isalnum((unsigned char)c) || c == '_'; }
+
+/* Is this text anywhere in the first n bytes? */
+static bool Contains(const char *d, int n, const char *text)
+{
+    int tl = (int)strlen(text);
+    for (int i = 0; i + tl <= n; i++) if (d[i] == text[0] && memcmp(d + i, text, (size_t)tl) == 0) return true;
+    return false;
+}
+
+/* Same letters, ignoring capitals (strncasecmp isn't on every compiler). */
+static bool SameCI(const char *a, const char *b, int n)
+{
+    for (int i = 0; i < n; i++) if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return true;
+}
+
+/* Points for each language, from the content alone. */
+static void ContentScores(const char *d, int len, unsigned short out[LANG_COUNT])
+{
+    int n = len < LANG_SCAN ? len : LANG_SCAN;
+
+    /* Markdown code blocks (between ``` lines) are examples quoted in the
+       document, not what the file itself is written in: blank them out,
+       keeping the ``` lines themselves as a clue that this is Markdown. */
+    char *clean = NULL;
+    bool hasFence = false;
+    for (int i = 0; i + 2 < n && !hasFence; i++) if (d[i] == '`' && d[i + 1] == '`' && d[i + 2] == '`') hasFence = true;
+    if (hasFence && (clean = malloc((size_t)n + 1)) != NULL) {
+        bool inFence = false;
+        int o = 0;
+        for (int p0 = 0; p0 < n; ) {
+            int e = p0;
+            while (e < n && d[e] != '\n') e++;
+            int s = p0;
+            while (s < e && (d[s] == ' ' || d[s] == '\t')) s++;
+            bool fence = e - s >= 3 && ((d[s] == '`' && d[s + 1] == '`' && d[s + 2] == '`') || (d[s] == '~' && d[s + 1] == '~' && d[s + 2] == '~'));
+            if (fence) inFence = !inFence;
+            if (fence || !inFence) { memcpy(clean + o, d + p0, (size_t)(e - p0)); o += e - p0; }
+            if (e < n) clean[o++] = '\n';
+            p0 = e + 1;
+        }
+        clean[o] = 0;
+        d = clean;
+        n = o;
+    }
+    int hits[sizeof CLUES / sizeof CLUES[0]];
+    memset(hits, 0, sizeof hits);
+    #define HIT(i) do { if (hits[i] < 4) hits[i]++; } while (0)
+
+    /* line by line. Lines that are C-style comments (starting with // or
+       slash-star) only count as "this language uses these comments": their
+       words are English, not code, so they're skipped for everything else. */
+    int p = 0, lineNo = 0, yamlKeys = 0, makeVars = 0, tabLines = 0;
+    bool inBlock = false;
+    while (p < n) {
+        int e = p;
+        while (e < n && d[e] != '\n') e++;
+        int s = p;
+        while (s < e && (d[s] == ' ' || d[s] == '\t')) s++;
+        int t = e;
+        while (t > s && (d[t - 1] == ' ' || d[t - 1] == '\t' || d[t - 1] == '\r')) t--;
+        bool comment = false, opened = false;
+        if (inBlock) {
+            comment = true;
+            for (int k = s; k + 1 < t; k++) if (d[k] == '*' && d[k + 1] == '/') { inBlock = false; break; }
+        } else if (t - s >= 2 && d[s] == '/' && (d[s + 1] == '/' || d[s + 1] == '*')) {
+            comment = true;
+            if (d[s + 1] == '*') {
+                opened = true;
+                for (int k = s + 2; k + 1 < t; k++) if (d[k] == '*' && d[k + 1] == '/') { opened = false; break; }
+            }
+        }
+        if (p < n && d[p] == '\t' && t > s) tabLines++;
+
+        for (int i = 0; i < CLUE_COUNT; i++) {
+            const Clue *c = &CLUES[i];
+            if (comment && !(c->kind == K_START && c->text[0] == '/')) continue;
+            int cl;
+            switch (c->kind) {
+            case K_START: case K_STARTI:
+                cl = (int)strlen(c->text);
+                if (t - s < cl) break;
+                if (c->kind == K_START ? memcmp(d + s, c->text, (size_t)cl) == 0 : SameCI(d + s, c->text, cl)) {
+                    /* for word-like clues ("fi", "end", "mov") the next character mustn't continue the word */
+                    char last = c->text[cl - 1], next = s + cl < t ? d[s + cl] : ' ';
+                    if (!(WordChar(last) && WordChar(next))) HIT(i);
+                }
+                break;
+            case K_END:
+                cl = (int)strlen(c->text);
+                if (t - s >= cl && memcmp(d + t - cl, c->text, (size_t)cl) == 0) HIT(i);
+                break;
+            case K_SHEBANG:
+                if (lineNo == 0 && e - p > 2 && d[p] == '#' && d[p + 1] == '!') {
+                    char line[160];
+                    snprintf(line, sizeof line, "%.*s", e - p, d + p);
+                    if (strstr(line, c->text)) HIT(i);
+                }
+                break;
+            }
+        }
+        if (opened) inBlock = true;
+
+        if (!comment) {
+            /* whole words on this line */
+            for (int i = s; i < t; ) {
+                if (!WordChar(d[i]) || (i > s && WordChar(d[i - 1]))) { i++; continue; }
+                int j = i;
+                while (j < t && WordChar(d[j])) j++;
+                int wl = j - i;
+                for (int k = 0; k < CLUE_COUNT; k++) {
+                    const Clue *c = &CLUES[k];
+                    if ((c->kind != K_WORD && c->kind != K_WORDI) || hits[k] >= 4) continue;
+                    if ((int)strlen(c->text) != wl) continue;
+                    if (c->kind == K_WORD ? memcmp(d + i, c->text, (size_t)wl) == 0 : SameCI(d + i, c->text, wl)) HIT(k);
+                }
+                i = j;
+            }
+            /* YAML: "key: value" or "key:" lines (also "- key: value") */
+            int k = s;
+            if (k + 1 < t && d[k] == '-' && d[k + 1] == ' ') k += 2;
+            int ks = k;
+            while (k < t && (WordChar(d[k]) || d[k] == '-' || d[k] == '.')) k++;
+            if (k > ks && k < t && d[k] == ':' && (k + 1 == t || d[k + 1] == ' ') && isalpha((unsigned char)d[ks])) {
+                char last = d[t - 1];
+                bool pyWord = (k - ks == 4 && memcmp(d + ks, "else", 4) == 0) || (k - ks == 3 && memcmp(d + ks, "try", 3) == 0);
+                if (!pyWord && last != '{' && last != ';' && last != ',' && last != ')') yamlKeys++;
+            }
+            /* Make: $(NAME) with a capital-letter name */
+            for (int q = s; q + 3 < t; q++)
+                if (d[q] == '$' && d[q + 1] == '(' && isupper((unsigned char)d[q + 2])) {
+                    int z = q + 2;
+                    while (z < t && (isupper((unsigned char)d[z]) || d[z] == '_' || isdigit((unsigned char)d[z]))) z++;
+                    if (z < t && d[z] == ')') makeVars++;
+                }
+        }
+        p = e + 1;
+        lineNo++;
+    }
+
+    /* text anywhere (memmem isn't everywhere, so a simple search) */
+    for (int k = 0; k < CLUE_COUNT; k++) {
+        const Clue *c = &CLUES[k];
+        if (c->kind != K_SUB) continue;
+        int cl = (int)strlen(c->text);
+        for (int i = 0; i + cl <= n && hits[k] < 4; i++)
+            if (d[i] == c->text[0] && memcmp(d + i, c->text, (size_t)cl) == 0) { HIT(k); i += cl - 1; }
+    }
+    #undef HIT
+
+    int total[LANG_COUNT] = {0};
+    for (int k = 0; k < CLUE_COUNT; k++) total[CLUES[k].lang] += hits[k] * CLUES[k].weight;
+
+    /* the special counters */
+    total[LANG_YAML] += 2 * (yamlKeys < 6 ? yamlKeys : 6);
+    total[LANG_MAKE] += 3 * (makeVars < 5 ? makeVars : 5) + (tabLines < 4 ? tabLines : 4);
+    /* a few markers that settle it */
+    if (Contains(d, n, "<!DOCTYPE html") || Contains(d, n, "<!doctype html") || Contains(d, n, "<html")) total[LANG_HTML] += 20;
+    for (int i = 0; i + 5 <= n; i++)                          /* <?php starting a line (not just mentioned) */
+        if ((i == 0 || d[i - 1] == '\n') && memcmp(d + i, "<?php", 5) == 0) { total[LANG_PHP] += 40; break; }
+
+    /* JSON has to start like JSON: { then a "name" (or }), or [ then a value */
+    int q = 0;
+    while (q < n && isspace((unsigned char)d[q])) q++;
+    bool jsonStart = false;
+    if (q < n && (d[q] == '{' || d[q] == '[')) {
+        int r2 = q + 1;
+        while (r2 < n && isspace((unsigned char)d[r2])) r2++;
+        char c = r2 < n ? d[r2] : 0;
+        jsonStart = d[q] == '{' ? (c == '"' || c == '}') : (c == '{' || c == '[' || c == '"' || c == ']' || c == '-' || isdigit((unsigned char)c));
+    }
+    if (!jsonStart) total[LANG_JSON] = 0;
+    else total[LANG_JSON] += 10;
+
+    for (int l = 0; l < LANG_COUNT; l++) out[l] = (unsigned short)(total[l] > 65000 ? 65000 : total[l]);
+    free(clean);
+}
+
+static int ExtLang(const char *name)
+{
+    if (EqualsCI(name, "Makefile") || EqualsCI(name, "GNUmakefile")) return LANG_MAKE;
+    const char *dot = strrchr(name, '.');
+    if (!dot) return -1;
+    for (int i = 0; i < (int)(sizeof EXTS / sizeof EXTS[0]); i++) if (EqualsCI(dot + 1, EXTS[i].ext)) return EXTS[i].lang;
+    return -1;
+}
+
+/* Picks the language from the content's points plus the file ending. */
+static int PickLang(const unsigned short sc[LANG_COUNT], const char *name)
+{
+    int total[LANG_COUNT];
+    for (int l = 0; l < LANG_COUNT; l++) total[l] = sc[l];
+    int ext = ExtLang(name);
+    if (ext >= 0) total[ext] += 8;                            /* the ending counts, but content can outvote it */
+    if (ext == LANG_MAKE && !strchr(name, '.')) total[ext] += 8;   /* a file called "Makefile" really is one */
+    if (ext == LANG_C) total[LANG_CPP] += 4;                  /* a .h file could be either */
+    if (ext == LANG_TEXT) return LANG_TEXT;                   /* .txt is always plain text */
+    int best = -1;
+    for (int l = 0; l < LANG_COUNT; l++) if (best < 0 || total[l] > total[best]) best = l;
+    /* C++ and TypeScript are "C plus extra" and "JavaScript plus types". C-style code in a
+       .cpp file is C++ (that's how it gets compiled), and plain JavaScript in a .ts file is TypeScript */
+    if (best == LANG_C && ext == LANG_CPP) best = LANG_CPP;
+    if (best == LANG_JS && ext == LANG_TS) best = LANG_TS;
+    /* otherwise only call it C++ if it clearly has C++-only things */
+    if (best == LANG_CPP && total[LANG_C] >= total[LANG_CPP] - 3 && ext != LANG_CPP) best = LANG_C;
+    /* TypeScript is "JavaScript plus types": same idea */
+    if (best == LANG_TS && total[LANG_JS] >= total[LANG_TS] - 3 && ext != LANG_TS) best = LANG_JS;
+    if (total[best] < 8) return LANG_TEXT;                    /* not enough clues for anything */
+    return best;
+}
+
+/* Remembers a file's points so they're only worked out once. */
+struct LangCache { unsigned short sc[LANG_COUNT]; int lines; bool done; bool binary; };
+
+static void FillLangCache(LangCache *c, const char *data, int len, bool binary)
+{
+    c->binary = binary;
+    c->lines = 0;
+    if (!binary) {
+        ContentScores(data, len, c->sc);
+        c->lines = len ? 1 : 0;
+        for (int i = 0; i < len; i++) if (data[i] == '\n' && i + 1 < len) c->lines++;
+    }
+    c->done = true;
+}
+static int LangOf(LangCache *c, const char *name) { return c->binary ? LANG_BINARY : PickLang(c->sc, name); }
+
+
+static void SetTip(const char *a, const char *b, const char *c);
+
+/* ---------- remembering each file's language ----------
+   Working it out means reading the file, so it's done once and kept:
+   for committed versions (blobs never change) until the program closes,
+   and for files you're editing until you next change them. */
+static LangCache *BlobLangCache(Repo *r, int b)
+{
+    Blob *bl = &r->blobs[b];
+    if (!bl->lang) {
+        bl->lang = calloc(1, sizeof(LangCache));
+        if (!bl->lang) return NULL;
+        FillLangCache(bl->lang, bl->data, bl->len, bl->binary);
+    }
+    return bl->lang;
+}
+static LangCache *WorkLangCache(WorkFile *f)
+{
+    if (!f->lang) { f->lang = calloc(1, sizeof(LangCache)); if (!f->lang) return NULL; f->langVer = f->ver - 1; }
+    if (f->langVer != f->ver) { FillLangCache(f->lang, f->text, f->len, f->binary); f->langVer = f->ver; }
+    return f->lang;
+}
+
+/* The language of a file as you see it, and how many lines it has. */
+static int ViewLang(Repo *r, ViewFile *v, int *lines)
+{
+    LangCache *c = v->mine ? WorkLangCache(v->mine) : v->blob >= 0 ? BlobLangCache(r, v->blob) : NULL;
+    if (lines) *lines = c ? c->lines : 0;
+    return c ? LangOf(c, v->name) : LANG_TEXT;
+}
+
+static const char *LangLabel(int lang) { return lang == LANG_BINARY ? "Binary" : LANG_NAMES[lang]; }
+
+/* ---------- colours ----------
+   Each language has its own fixed colour from the same colour-blind-checked
+   set as the contributions pie, so Python looks the same in every repository.
+   There are only 8 colours for 20 languages, so if two languages in one
+   repository share a colour, the second takes the next free one. */
+static const Color LANG_PALETTE[8] = {
+    {0x39, 0x87, 0xe5, 255}, {0xd9, 0x59, 0x26, 255}, {0x19, 0x9e, 0x70, 255}, {0xc9, 0x85, 0x00, 255},
+    {0xd5, 0x51, 0x81, 255}, {0x00, 0x83, 0x00, 255}, {0x90, 0x85, 0xe9, 255}, {0xe6, 0x67, 0x67, 255}
+};
+static const Color LANG_OTHER = {0x6e, 0x76, 0x81, 255};
+static const unsigned char LANG_SLOT[LANG_FIRST_NONCODE] = {
+    /* C */ 2, /* C++ */ 4, /* C# */ 5, /* Java */ 1, /* Python */ 0, /* JavaScript */ 3, /* TypeScript */ 0,
+    /* Rust */ 1, /* Go */ 2, /* HTML */ 1, /* CSS */ 6, /* SQL */ 7, /* Shell */ 5, /* PHP */ 6, /* Ruby */ 7,
+    /* Kotlin */ 6, /* Swift */ 1, /* Assembly */ 7, /* Lua */ 0, /* Makefile */ 3
+};
+
+/* ---------- the breakdown ---------- */
+typedef struct { int lang; int lines; int files; Color color; } LangPart;   /* lang -1 = "Other" */
+static LangPart langParts[6];
+static int      langPartCount, langTotal;
+static char     langSkipped[TEXT_LEN];       /* the kinds of file that aren't counted, e.g. "Markdown, JSON" */
+
+/* Counts the lines of code in each language: the latest commit, plus your
+   own changes if uid can edit. Text that isn't code (Markdown, JSON, YAML,
+   plain text) and binary files aren't counted - the same as GitHub. */
+static void BuildLanguages(Repo *r, int uid)
+{
+    int lines[LANG_COUNT] = {0}, files[LANG_COUNT] = {0};
+    bool skipped[LANG_COUNT] = {0}, binary = false;
+    BuildView(r, uid);
+    for (int i = 0; i < viewCount; i++) {
+        if (ViewDeleted(&view[i])) continue;
+        int n = 0, l = ViewLang(r, &view[i], &n);
+        if (l == LANG_BINARY) { binary = true; continue; }
+        if (l >= LANG_FIRST_NONCODE) { skipped[l] = true; continue; }
+        lines[l] += n;
+        files[l]++;
+    }
+    /* biggest first */
+    int order[LANG_FIRST_NONCODE], n = 0;
+    for (int l = 0; l < LANG_FIRST_NONCODE; l++) if (files[l]) order[n++] = l;
+    for (int a = 0; a < n; a++)
+        for (int b = a + 1; b < n; b++)
+            if (lines[order[b]] > lines[order[a]]) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+
+    langPartCount = langTotal = 0;
+    bool used[8] = {0};
+    for (int i = 0; i < n; i++) {
+        int l = order[i];
+        langTotal += lines[l];
+        if (n > 6 && i >= 5) {                    /* more than 6 languages: the smallest share "Other" */
+            if (langPartCount == 5) langParts[langPartCount++] = (LangPart){-1, 0, 0, LANG_OTHER};
+            langParts[5].lines += lines[l];
+            langParts[5].files += files[l];
+            continue;
+        }
+        int s = LANG_SLOT[l];
+        for (int k = 0; k < 8 && used[s]; k++) s = (s + 1) % 8;
+        used[s] = true;
+        langParts[langPartCount++] = (LangPart){l, lines[l], files[l], LANG_PALETTE[s]};
+    }
+
+    langSkipped[0] = 0;
+    for (int l = LANG_FIRST_NONCODE; l < LANG_COUNT; l++)
+        if (skipped[l]) snprintf(langSkipped + strlen(langSkipped), sizeof langSkipped - strlen(langSkipped), "%s%s", langSkipped[0] ? ", " : "", LANG_NAMES[l]);
+    if (binary) snprintf(langSkipped + strlen(langSkipped), sizeof langSkipped - strlen(langSkipped), "%s%s", langSkipped[0] ? ", " : "", "binary files");
+}
+
+/* The colour a language has in the breakdown just built (grey if it's in "Other" or not code). */
+static Color LangColor(int lang)
+{
+    for (int i = 0; i < langPartCount; i++) if (langParts[i].lang == lang) return langParts[i].color;
+    return LANG_OTHER;
+}
+static const char *PartName(LangPart *p) { return p->lang >= 0 ? LANG_NAMES[p->lang] : "Other"; }
+
+/* A thin bar split into each language's share, with a key underneath.
+   Hovering part of the bar shows its numbers. */
+static void DrawLanguageBar(Rectangle area)
+{
+    if (!langTotal) {
+        DrawFit(langSkipped[0] ? TextFormat("Languages: no code yet (%s isn't counted)", langSkipped) : "Languages: no code yet",
+                (int)area.x, (int)area.y + 6, FS, (int)area.width, UI_MUTED);
+        return;
+    }
+    Rectangle bar = {area.x, area.y + 2, area.width, 10};
+    float x = bar.x;
+    int hov = -1;
+    for (int i = 0; i < langPartCount; i++) {
+        LangPart *p = &langParts[i];
+        float w = bar.width * p->lines / langTotal;
+        if (i == langPartCount - 1) w = bar.x + bar.width - x;            /* no rounding gap at the end */
+        float dw = w - (i < langPartCount - 1 ? 2 : 0);                    /* a 2-pixel gap between parts */
+        if (dw < 2) dw = 2;
+        Rectangle seg = {x, bar.y, dw, bar.height};
+        DrawRectangleRounded(seg, 0.6f, 4, p->color);
+        if (CheckCollisionPointRec(GetMousePosition(), (Rectangle){x, bar.y - 6, w, bar.height + 12})) hov = i;
+        x += w;
+    }
+    /* the key: name and share for each, as many as fit */
+    float kx = area.x, ky = area.y + 18;
+    int shown = 0;
+    for (int i = 0; i < langPartCount; i++) {
+        LangPart *p = &langParts[i];
+        const char *pct = TextFormat(" %.1f%%", 100.0 * p->lines / langTotal);
+        int w = 14 + MeasureText(PartName(p), FS) + MeasureText(pct, FS) + 22;
+        int moreW = i < langPartCount - 1 ? MeasureText("+9 more", FS) : 0;     /* leave room to say what's left out */
+        if (kx + w + moreW > area.x + area.width) break;
+        shown++;
+        DrawCircle((int)kx + 5, (int)ky + 10, 5, p->color);
+        DrawText(PartName(p), (int)kx + 16, (int)ky, FS, UI_TEXT);
+        DrawText(pct, (int)kx + 16 + MeasureText(PartName(p), FS), (int)ky, FS, UI_MUTED);
+        kx += w;
+    }
+    if (shown < langPartCount) {
+        DrawText(TextFormat("+%d more", langPartCount - shown), (int)kx, (int)ky, FS, UI_MUTED);
+        kx += MeasureText("+9 more", FS) + 22;
+    } else if (langSkipped[0]) {
+        const char *note = TextFormat("|   not counted: %s", langSkipped);
+        if (kx + MeasureText(note, FS) <= area.x + area.width) DrawText(note, (int)kx, (int)ky, FS, UI_MUTED);
+    }
+    if (hov >= 0) {
+        LangPart *p = &langParts[hov];
+        SetTip(PartName(p), TextFormat("%d line%s  (%.1f%%)", p->lines, p->lines == 1 ? "" : "s", 100.0 * p->lines / langTotal),
+               TextFormat("in %d file%s", p->files, p->files == 1 ? "" : "s"));
+    }
+}
+
 /* ---------------- profile pages ----------------
    Everyone has one. Your own is also your home page: the first thing you
    see after signing in, with your repositories, everyone else's, a search
@@ -4043,6 +4668,13 @@ static void ScreenProfile(void)
         if (HasStarred(r, curUser)) DrawText("starred", tx, (int)card.y + 12, FS, UI_YELLOW);
 
         DrawFit(r->desc[0] ? r->desc : "No description", (int)card.x + 18, (int)card.y + 38, FS, (int)card.width - 36, UI_MUTED);
+        int sx = (int)card.x + 18;
+        BuildLanguages(r, -1);                       /* main language of the latest commit */
+        if (langPartCount && langParts[0].lang >= 0) {
+            DrawCircle(sx + 5, (int)card.y + 72, 5, langParts[0].color);
+            DrawText(LANG_NAMES[langParts[0].lang], sx + 16, (int)card.y + 62, FS, UI_TEXT);
+            sx += 16 + MeasureText(LANG_NAMES[langParts[0].lang], FS) + 24;
+        }
         int nf = ForkCount(r);
         DrawFit(TextFormat("%d commit%s   |   %d open issue%s   |   %d star%s   |   %d fork%s   |   updated %s",
                            r->commitCount, r->commitCount == 1 ? "" : "s",
@@ -4050,7 +4682,7 @@ static void ScreenProfile(void)
                            r->starCount, r->starCount == 1 ? "" : "s",
                            nf, nf == 1 ? "" : "s",
                            TimeAgo(LastActivity(r))),
-                (int)card.x + 18, (int)card.y + 62, FS, (int)card.width - 36, UI_MUTED);
+                sx, (int)card.y + 62, FS, (int)(card.x + card.width) - 18 - sx, UI_MUTED);
         if (Hover(la) && Clicked(card)) { EndScissorMode(); OpenRepo(order[k]); return; }
     }
     EndScissorMode();
@@ -4385,9 +5017,11 @@ static const Color PIE_COLORS[6] = {
 };
 static const Color PIE_OTHER = {0x6e, 0x76, 0x81, 255};
 
-typedef struct { int user; int commits; int adds; Color color; int people; } Share;   /* user -1 = "Others" */
+/* lines = lines added + lines removed: every changed line counts as work, so removing
+   14 lines counts the same as adding 14. A slice's size comes from lines. */
+typedef struct { int user; int commits; int adds, dels, lines; Color color; int people; } Share;   /* user -1 = "Others" */
 static Share shares[6];
-static int   shareCount, shareTotal;
+static int   shareCount, shareTotal;    /* shareTotal = all lines changed, by everyone */
 
 /* Owner, collaborators, then anyone else who has committed (former
    collaborators, or deleted accounts that show as "ghost"). */
@@ -4403,14 +5037,14 @@ static void BuildShares(Repo *r)
 
     shareCount = shareTotal = 0;
     for (int i = 0; i < n; i++) {
-        int c = 0, a = 0;
+        int c = 0, a = 0, d = 0;
         for (int k = 0; k < r->commitCount; k++)
-            if (r->commits[k].author == ids[i]) { c++; CommitStats(r, k); a += r->commits[k].sAdds; }
-        shareTotal += c;
-        if (n <= 6 || i < 5) shares[shareCount++] = (Share){ids[i], c, a, PIE_COLORS[i], 1};
+            if (r->commits[k].author == ids[i]) { c++; CommitStats(r, k); a += r->commits[k].sAdds; d += r->commits[k].sDels; }
+        shareTotal += a + d;
+        if (n <= 6 || i < 5) shares[shareCount++] = (Share){ids[i], c, a, d, a + d, PIE_COLORS[i], 1};
         else {
-            if (shareCount == 5) shares[shareCount++] = (Share){-1, 0, 0, PIE_OTHER, 0};
-            shares[5].commits += c; shares[5].adds += a; shares[5].people++;
+            if (shareCount == 5) shares[shareCount++] = (Share){-1, 0, 0, 0, 0, PIE_OTHER, 0};
+            shares[5].commits += c; shares[5].adds += a; shares[5].dels += d; shares[5].lines += a + d; shares[5].people++;
         }
     }
 }
@@ -4465,7 +5099,7 @@ static int Percent(int part, int total) { return total ? (part * 100 + total / 2
    under the mouse (it's drawn slightly bigger), or -1. */
 static int DrawPie(Vector2 c, float rad)
 {
-    if (shareTotal == 0) {                      /* nobody has committed yet: an empty ring */
+    if (shareTotal == 0) {                      /* no lines changed yet: an empty ring */
         DrawRing(c, rad - 3, rad, 0, 360, 48, UI_BORDER);
         return -1;
     }
@@ -4478,16 +5112,16 @@ static int DrawPie(Vector2 c, float rad)
     int hov = -1, slices = 0;
     float a = -90;
     for (int i = 0; i < shareCount; i++) {
-        if (!shares[i].commits) continue;
+        if (!shares[i].lines) continue;
         slices++;
-        float sweep = 360.0f * shares[i].commits / shareTotal;
+        float sweep = 360.0f * shares[i].lines / shareTotal;
         if (inside && mang >= a && mang < a + sweep) hov = i;
         a += sweep;
     }
     a = -90;
     for (int i = 0; i < shareCount; i++) {
-        if (!shares[i].commits) continue;
-        float sweep = 360.0f * shares[i].commits / shareTotal;
+        if (!shares[i].lines) continue;
+        float sweep = 360.0f * shares[i].lines / shareTotal;
         float rr = i == hov ? rad + 4 : rad;
         DrawCircleSector(c, rr, a, a + sweep, (int)(sweep / 3) + 4, shares[i].color);
         a += sweep;
@@ -4496,10 +5130,10 @@ static int DrawPie(Vector2 c, float rad)
         Color gap = {22, 27, 34, 255};
         a = -90;
         for (int i = 0; i < shareCount; i++) {
-            if (!shares[i].commits) continue;
+            if (!shares[i].lines) continue;
             Vector2 e = {c.x + cosf(a * DEG2RAD) * (rad + 6), c.y + sinf(a * DEG2RAD) * (rad + 6)};
             DrawLineEx(c, e, 2, gap);
-            a += 360.0f * shares[i].commits / shareTotal;
+            a += 360.0f * shares[i].lines / shareTotal;
         }
     }
     return hov;
@@ -4509,8 +5143,8 @@ static void ShareTip(int i)
 {
     Share *s = &shares[i];
     SetTip(ShareName(s),
-           TextFormat("%d commit%s  (%d%%)", s->commits, s->commits == 1 ? "" : "s", Percent(s->commits, shareTotal)),
-           TextFormat("+%d lines added", s->adds));
+           TextFormat("%d line%s changed  (%d%%)", s->lines, s->lines == 1 ? "" : "s", Percent(s->lines, shareTotal)),
+           TextFormat("+%d added, -%d removed, in %d commit%s", s->adds, s->dels, s->commits, s->commits == 1 ? "" : "s"));
 }
 
 /* The little pie in a repository's header. Returns true if it was clicked. */
@@ -4518,7 +5152,9 @@ static bool HeaderPie(Repo *r, float rightX, float cy)
 {
     if (!IsMultiUser(r)) return false;
     BuildShares(r);
-    int members = 1 + r->collabCount;
+    int members = 1 + r->collabCount, workers = 0;        /* people with access, or everyone who worked on it (forks) */
+    for (int i = 0; i < shareCount; i++) if (shares[i].commits) workers += shares[i].user >= 0 ? 1 : shares[i].people;
+    if (workers > members) members = workers;
     const char *label = TextFormat("%d %s", members, members == 1 ? "person" : "people");
     Vector2 c = {rightX - 18, cy};
     int lw = MeasureText(label, FS);
@@ -4659,7 +5295,7 @@ static void TabPeople(Repo *r)
         return;
     }
     BuildShares(r);
-    DrawText(TextFormat("by number of commits  |  %d in total", shareTotal), (int)rx + 18, (int)card.y + 42, FS, UI_MUTED);
+    DrawFit(TextFormat("by lines changed (added + removed)  |  %d in total", shareTotal), (int)rx + 18, (int)card.y + 42, FS, (int)rw - 36, UI_MUTED);
     float rad = fminf(rw * 0.3f, 100);
     Vector2 c = {rx + rw / 2, card.y + 84 + rad};
     int h = DrawPie(c, rad);
@@ -4671,7 +5307,7 @@ static void TabPeople(Repo *r)
         Share *s = &shares[i];
         DrawRectangleRounded((Rectangle){rx + 18, ky + 3, 14, 14}, 0.3f, 4, s->color);
         DrawFit(ShareName(s), (int)rx + 42, (int)ky, FS, (int)(rw * 0.42f), UI_TEXT);
-        const char *val = TextFormat("%d commit%s  %d%%", s->commits, s->commits == 1 ? "" : "s", Percent(s->commits, shareTotal));
+        const char *val = TextFormat("%d line%s  %d%%", s->lines, s->lines == 1 ? "" : "s", Percent(s->lines, shareTotal));
         DrawText(val, (int)(rx + rw - 18) - MeasureText(val, FS), (int)ky, FS, UI_MUTED);
         ky += 30;
     }
@@ -5039,8 +5675,11 @@ static void DrawFileList(Repo *r, Rectangle la)
         else if (hot)                       DrawRectangleRec(row, UI_HOVER);
         if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
         bool gone = ViewDeleted(v);
-        DrawFit(v->name, (int)row.x + 14, (int)row.y + 5, FS, (int)row.width - 54, gone ? UI_MUTED : UI_TEXT);
-        if (gone) DrawLine((int)row.x + 14, (int)row.y + 15, (int)row.x + 14 + MeasureText(v->name, FS), (int)row.y + 15, UI_MUTED);
+        int fl = gone ? LANG_TEXT : ViewLang(r, v, NULL);
+        if (fl >= 0 && fl < LANG_FIRST_NONCODE) DrawCircle((int)row.x + 17, (int)row.y + 15, 5, LangColor(fl));
+        else DrawCircleLines((int)row.x + 17, (int)row.y + 15, 4, UI_BORDER);         /* not code */
+        DrawFit(v->name, (int)row.x + 30, (int)row.y + 5, FS, (int)row.width - 70, gone ? UI_MUTED : UI_TEXT);
+        if (gone) DrawLine((int)row.x + 30, (int)row.y + 15, (int)row.x + 30 + MeasureText(v->name, FS), (int)row.y + 15, UI_MUTED);
         if (v->status) {
             const char *t = v->status == 'C' ? "!" : TextFormat("%c", v->status);
             Color c = v->status == 'A' ? UI_GREENT : v->status == 'M' ? UI_YELLOW : v->status == 'D' ? UI_REDT : UI_ORANGE;
@@ -5061,7 +5700,7 @@ static void DrawFileList(Repo *r, Rectangle la)
 /* of the latest commit. Anything else you were in the middle of      */
 /* editing stays as it was, still waiting for its own commit.         */
 /* ------------------------------------------------------------------ */
-typedef struct { char name[NAME_LEN]; char *data; int len; bool binary; } Staged;
+typedef struct { char name[NAME_LEN]; char *data; int len; bool binary; int lang; } Staged;
 static Staged staged[MAX_FILES];
 static int    stagedCount;
 static float  scUpload;
@@ -5177,6 +5816,9 @@ static const char *StageFile(const char *raw)
     staged[k].data = data;
     staged[k].len = len;
     staged[k].binary = bin;
+    LangCache lc;
+    FillLangCache(&lc, data, len, bin);
+    staged[k].lang = LangOf(&lc, nm);
     return NULL;
 }
 
@@ -5430,7 +6072,7 @@ static void ScreenUpload(Repo *r)
         DrawBold(s->name, tx, (int)row.y + 12, FS, UI_TEXT);
         tx += MeasureText(s->name, FS) + 18;
         const char *kind = s->binary ? (IsPictureBytes(s->data, s->len) ? "picture" : "binary file")
-                                     : TextFormat("text, %d line%s", CountLines(s->data, s->len), CountLines(s->data, s->len) == 1 ? "" : "s");
+                                     : TextFormat("%s, %d line%s", LangLabel(s->lang), CountLines(s->data, s->len), CountLines(s->data, s->len) == 1 ? "" : "s");
         const char *detail = TextFormat("%s, %s", kind, FormatSize(s->len));
         int room = (int)(row.x + row.width) - 120 - tx;
         DrawFit(detail, tx, (int)row.y + 12, FS, room, UI_MUTED);
@@ -5474,27 +6116,30 @@ static void ScreenUpload(Repo *r)
 
 /* The bar above a file: its name, a tag like "modified", and where the cursor is
    (or the size, for a non-text file). rightGap leaves room for a button. */
-static void DrawFileHeader(Rectangle fh, const char *name, const char *tag, Color tagColor, WorkFile *f, int rightGap)
+static void DrawFileHeader(Rectangle fh, const char *name, const char *tag, Color tagColor, WorkFile *f, int rightGap, const char *langName)
 {
     DrawRectangleRec(fh, UI_PANEL);
     DrawRectangleLinesEx(fh, 1, UI_BORDER);
     DrawBold(name, (int)fh.x + 14, (int)fh.y + 11, FS, UI_TEXT);
     if (tag) DrawText(tag, (int)fh.x + 30 + MeasureText(name, FS), (int)fh.y + 11, FS, tagColor);
-    /* the details on the right: the long version, a short one if space is tight, or none */
-    char full[96], brief[48];
+    /* the details on the right: the long version, a shorter one if space is tight, just the language, or none */
+    char full[128], brief[80], tiny[40];
     if (f->binary) {
         int s = Preview(f->text, f->len);
         if (s >= 0) snprintf(full, sizeof full, "%d x %d   |   %s", prevs[s].w, prevs[s].h, FormatSize(f->len));
         else        snprintf(full, sizeof full, "binary file   |   %s", FormatSize(f->len));
         snprintf(brief, sizeof brief, "%s", FormatSize(f->len));
+        tiny[0] = 0;
     } else {
-        int ls = LineStart(f->text, ed.cursor), lines = LineOf(f->text, f->len) + 1;
-        snprintf(full, sizeof full, "Ln %d, Col %d   |   %d lines", LineOf(f->text, ed.cursor) + 1, ed.cursor - ls + 1, lines);
-        snprintf(brief, sizeof brief, "%d lines", lines);
+        int ls = LineStart(f->text, ed.cursor), lines = CountLines(f->text, f->len);   /* same count as the language breakdown */
+        snprintf(full, sizeof full, "%s   |   Ln %d, Col %d   |   %d lines", langName, LineOf(f->text, ed.cursor) + 1, ed.cursor - ls + 1, lines);
+        snprintf(brief, sizeof brief, "%s   |   %d lines", langName, lines);
+        snprintf(tiny, sizeof tiny, "%s", langName);
     }
     int leftEnd = (int)fh.x + 14 + MeasureText(name, FS) + (tag ? 16 + MeasureText(tag, FS) : 0) + 20;
     int right = (int)(fh.x + fh.width) - 14 - rightGap;
-    const char *info = right - MeasureText(full, FS) >= leftEnd ? full : right - MeasureText(brief, FS) >= leftEnd ? brief : NULL;
+    const char *info = right - MeasureText(full, FS) >= leftEnd ? full : right - MeasureText(brief, FS) >= leftEnd ? brief
+                     : tiny[0] && right - MeasureText(tiny, FS) >= leftEnd ? tiny : NULL;
     if (info) DrawText(info, right - MeasureText(info, FS), (int)fh.y + 11, FS, UI_MUTED);
 }
 
@@ -5564,7 +6209,8 @@ static void TabCode(Repo *r)
         SelectFileName(view[first].name);
     }
 
-    /* ---- left: file list ---- */
+    /* ---- left: file list (with each file's language as a coloured dot) ---- */
+    BuildLanguages(r, edit ? curUser : -1);
     Rectangle lp = {20, top, 260, bottom - top};
     DrawRectangleRec(lp, UI_PANEL);
     DrawRectangleLinesEx(lp, 1, UI_BORDER);
@@ -5606,8 +6252,10 @@ static void TabCode(Repo *r)
         DrawFit(st, (int)lp.x + 14, (int)by + 100, FS, (int)lp.width - 28, ncf ? UI_ORANGE : nch ? UI_YELLOW : UI_MUTED);
     }
 
-    /* ---- right: editor (or a viewer) + bottom bar ---- */
-    Rectangle rp  = {300, top, (float)W - 320, bottom - top};
+    /* ---- right: the language breakdown, then the editor (or a viewer) + bottom bar ---- */
+    BuildLanguages(r, edit ? curUser : -1);
+    DrawLanguageBar((Rectangle){300, top, (float)W - 320, 40});
+    Rectangle rp  = {300, top + 48, (float)W - 320, bottom - top - 48};
     Rectangle fh  = {rp.x, rp.y, rp.width, 42};
     Rectangle edr = {rp.x, rp.y + 42, rp.width, rp.height - 42 - 62};
     Rectangle cb  = {rp.x, rp.y + rp.height - 48, rp.width, 48};
@@ -5663,7 +6311,7 @@ static void TabCode(Repo *r)
         else if (v->status == 'D')  { tag = "deleted";  tc = UI_REDT; }
         else if (v->status == 'C')  { tag = "conflict"; tc = UI_ORANGE; }
         bool canDelete = edit && !ViewDeleted(v), canDownload = !ViewDeleted(v);
-        DrawFileHeader(fh, v->name, tag, tc, &shown, (canDelete ? 104 : 0) + (canDownload ? 136 : 0));
+        DrawFileHeader(fh, v->name, tag, tc, &shown, (canDelete ? 104 : 0) + (canDownload ? 136 : 0), LangLabel(ViewLang(r, v, NULL)));
         if (canDownload && Button((Rectangle){fh.x + fh.width - (canDelete ? 106 : 0) - 136, fh.y + 6, 128, 30}, "Download", UI_BTN))
             DownloadFile(v->name, shown.text, shown.len);       /* exactly what's on screen */
         if (canDelete && ConfirmButton((Rectangle){fh.x + fh.width - 106, fh.y + 6, 98, 30}, "Delete", "Sure?", 3)) {
@@ -6144,7 +6792,9 @@ int main(void)
         if (armedId && (armedT -= dt) <= 0) armedId = 0;
 
         /* the signed-in user's theme: its colour, and see-through panels if it draws a background */
-        int bgTheme = curUser >= 0 ? UserTheme(curUser) : THEME_CLASSIC;
+        int bgTheme = curUser < 0 ? THEME_CLASSIC
+                    : screen == SCR_PROFILE && FindUserById(viewUser) ? UserTheme(viewUser)   /* their page, their theme */
+                    : UserTheme(curUser);
         uiAccent = THEMES[bgTheme].accent;
         unsigned char see = bgTheme == THEME_CLASSIC ? 255 : 215;
         UI_PANEL.a = see;
