@@ -694,7 +694,7 @@ static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
 static EditorState ed;
 static bool  optReadme = true, optExample = true;
 static int   homeView;                /* 0 = your repositories, 1 = everyone's */
-static float scFiles, scCommits, scIssues, scChanges, scDiff, scDay, scDayRepos;
+static float scGraph, scFiles, scCommits, scIssues, scChanges, scDiff, scDay, scDayRepos;
 static char  shownCode[24];           /* recovery code on screen right now (never saved) */
 static bool  codeAfterReset;          /* the code screen was reached by resetting a password */
 static float scProfile, scPeople, scSettings, scPeopleTab;
@@ -4196,7 +4196,7 @@ static void OpenRepo(int i)
     screen  = SCR_REPO;
     tab     = TAB_CODE;
     SelectFileName("");
-    scFiles = scCommits = scIssues = scPeopleTab = 0;
+    scFiles = scCommits = scIssues = scPeopleTab = scGraph = 0;
     ForgetScratch();
     TF_Clear(&tfInvite);
     TF_Clear(&tfCommit);
@@ -7632,10 +7632,332 @@ static void TabCode(Repo *r)
     }
 }
 
+/* ---------- the commit graph ----------
+   Like the graph in VS Code's source control view: the newest commit at the
+   top, each commit a dot, and lines joining every commit to the one(s) it
+   was built on. When two people work from the same commit the line splits
+   into two "lanes"; a merge commit joins them back together.
+
+   The lanes are worked out from the newest commit down. Each lane is
+   "waiting" for one commit (the next one further down that line). A commit
+   goes in the lane that's waiting for it; any other lanes waiting for it
+   too curve in and end there. Then its lane waits for its first parent,
+   and a merge's second parent gets a lane of its own, curving out. */
+typedef struct { int col, at, n; } GraphRow;      /* the dot's lane; the lanes below it: [at, at + n) */
+static struct {
+    const Repo *r; unsigned gen; int count;
+    GraphRow *rows; int rowCap;
+    int *wait, *from; int cap, used;              /* per lane below a row: the commit it waits for (-1 = none), and the lane its line starts from */
+    int maxLanes;
+    int *order, orderCap;                         /* which commit is on each row */
+} graph;
+
+/* The order of the rows: newest first, but a commit always comes after
+   (below) every commit built on it - the same order as git log --date-order.
+   Each step takes the newest commit whose children are all placed already. */
+static long long *orderTime;                     /* when each commit was committed (git's "committer" time) */
+static bool HeapLess(Repo *r, int a, int b)
+{
+    (void)r;
+    long long ta = orderTime[a], tb = orderTime[b];
+    return ta != tb ? ta < tb : a < b;
+}
+/* The committer time: when the commit was actually made (the author time is
+   when the change was first written - they differ for re-applied work). */
+static long long CommitterTime(Commit *c)
+{
+    const char *p = c->raw ? strstr(c->raw, "\ncommitter ") : NULL;
+    const char *gt = p ? strchr(p, '>') : NULL;
+    const char *nl = p ? strchr(p + 1, '\n') : NULL;
+    if (!gt || (nl && gt > nl)) return c->time;
+    return strtoll(gt + 1, NULL, 10);
+}
+static void GraphOrder(Repo *r)
+{
+    int n = r->commitCount;
+    graph.order = GrowArr(graph.order, &graph.orderCap, n + 1, sizeof(int));
+    int *kids = calloc((size_t)n + 1, sizeof(int)), *heap = malloc(((size_t)n + 1) * sizeof(int));
+    orderTime = malloc(((size_t)n + 1) * sizeof(long long));
+    if (!kids || !heap || !orderTime || graph.orderCap < n) {   /* out of memory: plain newest-first */
+        for (int i = 0; i < n && graph.orderCap >= n; i++) graph.order[i] = n - 1 - i;
+        free(kids); free(heap); free(orderTime); orderTime = NULL; return;
+    }
+    for (int k = 0; k < n; k++) orderTime[k] = CommitterTime(&r->commits[k]);
+    for (int k = 0; k < n; k++)
+        for (int q = 0; q < r->commits[k].parentCount; q++) kids[r->commits[k].parents[q]]++;
+    int hn = 0, out = 0;
+    #define HPUSH(v) do { int i_ = hn++; heap[i_] = (v); \
+        while (i_ > 0 && HeapLess(r, heap[(i_ - 1) / 2], heap[i_])) { int t_ = heap[i_]; heap[i_] = heap[(i_ - 1) / 2]; heap[(i_ - 1) / 2] = t_; i_ = (i_ - 1) / 2; } } while (0)
+    for (int k = 0; k < n; k++) if (!kids[k]) HPUSH(k);
+    while (hn) {
+        int top = heap[0];
+        heap[0] = heap[--hn];
+        for (int i = 0;;) {                                  /* sift down */
+            int a = 2 * i + 1, b = a + 1, m = i;
+            if (a < hn && HeapLess(r, heap[m], heap[a])) m = a;
+            if (b < hn && HeapLess(r, heap[m], heap[b])) m = b;
+            if (m == i) break;
+            int t = heap[i]; heap[i] = heap[m]; heap[m] = t; i = m;
+        }
+        graph.order[out++] = top;
+        Commit *c = &r->commits[top];
+        for (int q = 0; q < c->parentCount; q++) if (--kids[c->parents[q]] == 0) HPUSH(c->parents[q]);
+    }
+    #undef HPUSH
+    for (int k = 0; out < n && k < n; k++) if (kids[k] > 0) graph.order[out++] = k;   /* can't happen, but never leave a gap */
+    free(kids); free(heap); free(orderTime); orderTime = NULL;
+}
+static int commitsView = 1;                       /* 0 = list, 1 = graph */
+
+static void BuildGraph(Repo *r)
+{
+    if (graph.r == r && graph.gen == r->gen && graph.count == r->commitCount) return;
+    int n = r->commitCount;
+    graph.r = r; graph.gen = r->gen; graph.count = n; graph.used = 0; graph.maxLanes = 0;
+    graph.rows = GrowArr(graph.rows, &graph.rowCap, n + 1, sizeof(GraphRow));
+    GraphOrder(r);
+    if (graph.orderCap < n) { graph.count = -1; return; }
+    int *lanes = NULL, L = 0, lcap = 0, *from = NULL, fcap = 0;
+    for (int i = 0; i < n && graph.rowCap > n; i++) {
+        int c = graph.order[i];                    /* row 0 is the newest commit */
+        Commit *cm = &r->commits[c];
+        int col = -1;
+        for (int k = 0; k < L; k++)
+            if (lanes[k] == c) { if (col < 0) col = k; else lanes[k] = -1; }   /* lines joining here end here */
+        if (col < 0) {                             /* nothing above leads here: the newest commit of a line */
+            for (int k = 0; k < L && col < 0; k++) if (lanes[k] < 0) col = k;
+            if (col < 0) { lanes = GrowArr(lanes, &lcap, L + 1, sizeof(int)); col = L++; }
+        }
+        from = GrowArr(from, &fcap, L + 2, sizeof(int));
+        for (int k = 0; k < L; k++) from[k] = k;
+        lanes[col] = cm->parentCount > 0 ? cm->parents[0] : -1;
+        from[col] = col;
+        if (cm->parentCount > 1) {                 /* a merge: its other parent gets a lane, curving out of this dot */
+            int f = -1;
+            for (int k = 0; k < L && f < 0; k++) if (lanes[k] < 0) f = k;
+            if (f < 0) { lanes = GrowArr(lanes, &lcap, L + 1, sizeof(int)); from = GrowArr(from, &fcap, L + 2, sizeof(int)); f = L++; }
+            lanes[f] = cm->parents[1];
+            from[f] = col;
+        }
+        while (L > 0 && lanes[L - 1] < 0) L--;      /* drop empty lanes on the right */
+        graph.rows[i] = (GraphRow){col, graph.used, L};
+        if (col + 1 > graph.maxLanes) graph.maxLanes = col + 1;
+        if (L > graph.maxLanes) graph.maxLanes = L;
+        if (graph.used + L > graph.cap) {
+            int nc = graph.cap ? graph.cap : 1024;
+            while (nc < graph.used + L) nc *= 2;
+            int *w = realloc(graph.wait, (size_t)nc * sizeof(int)), *fr = w ? realloc(graph.from, (size_t)nc * sizeof(int)) : NULL;
+            if (w) graph.wait = w;
+            if (fr) graph.from = fr;
+            if (!w || !fr) { graph.rows[i].n = 0; continue; }
+            graph.cap = nc;
+        }
+        memcpy(graph.wait + graph.used, lanes, (size_t)L * sizeof(int));
+        memcpy(graph.from + graph.used, from, (size_t)L * sizeof(int));
+        graph.used += L;
+    }
+    free(lanes); free(from);
+}
+
+/* The same colour-blind-checked colours as the languages and the pie, one per lane. */
+static Color LaneColor(int k) { return LANG_PALETTE[(k + 0) % 8]; }
+
+static const char *LongTime(long long t)
+{
+    static char b[40];
+    time_t tt = (time_t)t;
+    strftime(b, sizeof b, "%d %b %Y, %H:%M", localtime(&tt));
+    return b;
+}
+
+/* The details of a commit, next to the mouse (like the contribution calendar's). */
+static void DrawCommitTip(Repo *r, int ci)
+{
+    Commit *c = &r->commits[ci];
+    CommitStats(r, ci);
+    static char        kinds[MAX_FILES * 2];
+    static const char *names[MAX_FILES * 2];
+    int nf = CommitFileList(r, ci, kinds, names, MAX_FILES * 2);
+
+    enum { MAXL = 16 };
+    char  text[MAXL][200];
+    Color col[MAXL];
+    bool  bold[MAXL] = {0}, rule[MAXL] = {0}, adds[MAXL] = {0};
+    char  kind[MAXL] = {0};
+    int   n = 0;
+    snprintf(text[n], 200, "%.70s", c->message); bold[n] = true; col[n++] = UI_TEXT;
+    snprintf(text[n], 200, "%s   |   %s", CommitAuthorName(c), LongTime(c->time)); col[n++] = UI_MUTED;
+    if (c->parentCount > 1)
+        snprintf(text[n], 200, "merge %s   |   joins %s and %s", c->id, r->commits[c->parents[0]].id, r->commits[c->parents[1]].id);
+    else if (c->parentCount)
+        snprintf(text[n], 200, "commit %s   |   built on %s", c->id, r->commits[c->parents[0]].id);
+    else
+        snprintf(text[n], 200, "commit %s   |   the first commit", c->id);
+    col[n++] = UI_MUTED;
+    rule[n] = true;
+    snprintf(text[n], 200, "%d file%s changed   ", c->sFiles, c->sFiles == 1 ? "" : "s"); adds[n] = true; col[n++] = UI_TEXT;
+    int shown = nf < 6 ? nf : 6;
+    for (int i = 0; i < shown; i++) {
+        snprintf(text[n], 200, "%.80s", names[i]);
+        kind[n] = kinds[i];
+        col[n++] = UI_TEXT;
+    }
+    if (nf > shown) { snprintf(text[n], 200, "...and %d more", nf - shown); col[n++] = UI_MUTED; }
+    if (c->copied) { snprintf(text[n], 200, "(brought in from the original repository)"); col[n++] = UI_MUTED; }
+    rule[n] = true;
+    snprintf(text[n], 200, "Click to see what changed"); col[n++] = UI_MUTED;
+
+    int w = 0, rules = 0;
+    for (int i = 0; i < n; i++) {
+        int lw = MeasureText(text[i], FS) + (kind[i] ? 30 : 0);
+        if (adds[i]) lw += MeasureText(TextFormat("+%d -%d", c->sAdds, c->sDels), FS) + 10;
+        if (lw > w) w = lw;
+        if (rule[i]) rules++;
+    }
+    int bw = w + 32, bh = n * 26 + rules * 10 + 22;
+    Vector2 m = GetMousePosition();
+    int x = (int)m.x + 18, y = (int)m.y + 22;
+    if (x + bw > W - 8) x = (int)m.x - 18 - bw;
+    if (x < 8) x = 8;
+    if (y + bh > H - 8) y = (int)m.y - 12 - bh;
+    if (y < 8) y = 8;
+    Rectangle box = {(float)x, (float)y, (float)bw, (float)bh};
+    DrawRectangleRounded((Rectangle){box.x + 3, box.y + 4, box.width, box.height}, 0.06f, 6, (Color){0, 0, 0, 120});
+    DrawRectangleRounded(box, 0.06f, 6, (Color){36, 41, 49, 255});
+    DrawRectangleRoundedLinesEx(box, 0.06f, 6, 1, UI_BORDER);
+    int ty = y + 12;
+    for (int i = 0; i < n; i++) {
+        if (rule[i]) { DrawLine(x + 12, ty + 3, x + bw - 12, ty + 3, UI_BORDER); ty += 10; }
+        int tx = x + 16;
+        if (kind[i]) {
+            Color kc = kind[i] == 'A' ? UI_GREENT : kind[i] == 'D' ? UI_REDT : UI_YELLOW;
+            char k[2] = {kind[i], 0};
+            DrawBold(k, tx, ty, FS, kc);
+            tx += 30;
+        }
+        if (bold[i]) DrawBold(text[i], tx, ty, FS, col[i]);
+        else         DrawText(text[i], tx, ty, FS, col[i]);
+        if (adds[i]) DrawAddsDels(c->sAdds, c->sDels, tx + MeasureText(text[i], FS), ty);
+        ty += 26;
+    }
+}
+
+static void CommitGraph(Repo *r, Rectangle la)
+{
+    BuildGraph(r);
+    int n = r->commitCount;
+    float rowH = 36, laneW = 18;
+    float gx = la.x + 22;                                    /* the middle of lane 0 */
+    float gw = graph.maxLanes * laneW;
+    float maxGw = la.width * 0.4f;
+    if (gw > maxGw) gw = maxGw;
+    float textX = la.x + 22 + gw + 8;
+    ScrollArea(la, &scGraph, n * rowH + 8);
+    DrawRectangleRec(la, UI_PANEL);
+    DrawRectangleLinesEx(la, 1, UI_BORDER);
+    int first = (int)(scGraph / rowH) - 1, last = (int)((scGraph + la.height) / rowH) + 1;
+    if (first < 0) first = 0;
+    if (last > n - 1) last = n - 1;
+    int hov = -1;
+    Vector2 mouse = GetMousePosition();
+
+    BeginScissorMode((int)la.x + 1, (int)la.y + 1, (int)la.width - 14, (int)la.height - 2);
+    /* row backgrounds first, so the lines go over them */
+    for (int i = first; i <= last; i++) {
+        Rectangle row = {la.x + 1, la.y + 4 + i * rowH - scGraph, la.width - 14, rowH};
+        if (Hover(la) && CheckCollisionPointRec(mouse, row)) { hov = i; DrawRectangleRec(row, UI_HOVER); }
+    }
+    /* the lines: from each row's dot level down to the next row's */
+    BeginScissorMode((int)la.x + 1, (int)la.y + 1, (int)(gw + 30), (int)la.height - 2);
+    for (int i = first - 1; i <= last; i++) {
+        if (i < 0 || i >= n - 1) continue;
+        GraphRow *g = &graph.rows[i], *g2 = &graph.rows[i + 1];
+        float y1 = la.y + 4 + i * rowH + rowH / 2 - scGraph, y2 = y1 + rowH;
+        int below = graph.order[i + 1];                      /* the commit on the next row */
+        for (int k = 0; k < g->n; k++) {
+            int w = graph.wait[g->at + k];
+            if (w < 0) continue;
+            int fromK = graph.from[g->at + k];
+            int toK = w == below ? g2->col : k;
+            Vector2 a = {gx + fromK * laneW, y1}, b = {gx + toK * laneW, y2};
+            Color lc = LaneColor(k);
+            if (a.x == b.x) DrawLineEx(a, b, 2.5f, lc);
+            else DrawLineBezier(a, b, 2.5f, lc);
+        }
+    }
+    /* the dots */
+    for (int i = first; i <= last; i++) {
+        int ci = graph.order[i];
+        Commit *c = &r->commits[ci];
+        float cy = la.y + 4 + i * rowH + rowH / 2 - scGraph, cx = gx + graph.rows[i].col * laneW;
+        Color lc = LaneColor(graph.rows[i].col);
+        if (c->parentCount > 1) { DrawCircle((int)cx, (int)cy, 7, lc); DrawCircle((int)cx, (int)cy, 4, (Color){22, 27, 34, 255}); }   /* merges: a ring */
+        else DrawCircle((int)cx, (int)cy, 6, lc);
+        if (ci == n - 1) DrawCircleLines((int)cx, (int)cy, 10, lc);                                          /* the latest */
+    }
+    EndScissorMode();
+    BeginScissorMode((int)la.x + 1, (int)la.y + 1, (int)la.width - 14, (int)la.height - 2);
+    /* the words */
+    for (int i = first; i <= last; i++) {
+        int ci = graph.order[i];
+        Commit *c = &r->commits[ci];
+        float y = la.y + 4 + i * rowH - scGraph;
+        float tx = textX;
+        if (ci == n - 1) {                                   /* the branch name on the latest commit */
+            int bw = MeasureText(r->branch, FS) + 16;
+            DrawRectangleRounded((Rectangle){tx, y + 6, (float)bw, 24}, 0.5f, 6, (Color){35, 134, 54, 90});
+            DrawText(r->branch, (int)tx + 8, (int)y + 8, FS, UI_GREENT);
+            tx += bw + 10;
+        }
+        float right = la.x + la.width - 24;
+        const char *when = TimeAgo(c->time);
+        const char *who = CommitAuthorName(c);
+        int idW = MeasureText(c->id, FS), whenW = MeasureText(when, FS);
+        float idX = right - idW, whenX = idX - 24 - whenW;
+        float whoW = (float)MeasureText(who, FS);
+        if (whoW > 220) whoW = 220;
+        float whoX = whenX - 24 - whoW;
+        bool roomy = whoX - 16 - tx > 160;                    /* narrow window: just the message and id */
+        DrawFit(c->message, (int)tx, (int)y + 8, FS, (int)((roomy ? whoX - 40 : idX - 20) - tx), c->copied ? UI_MUTED : UI_TEXT);
+        if (roomy) {
+            DrawAvatar(c->author, (int)whoX - 16, (int)y + 18, 10);
+            DrawFit(who, (int)whoX, (int)y + 8, FS, (int)whoW, UI_MUTED);
+            DrawText(when, (int)whenX, (int)y + 8, FS, UI_MUTED);
+        }
+        DrawText(c->id, (int)idX, (int)y + 8, FS, UI_LINK);
+    }
+    EndScissorMode();
+    DrawScrollbar(la, scGraph, n * rowH + 8);
+
+    if (hov >= 0) {
+        wantCursor = MOUSE_CURSOR_POINTING_HAND;
+        int ci = graph.order[hov];
+        if (Clicked((Rectangle){la.x, la.y, la.width - 14, la.height})) { OpenCommit(ci); return; }
+        DrawCommitTip(r, ci);
+    }
+}
+
 static void TabCommits(Repo *r)
 {
-    Rectangle la = {20, 186, (float)W - 40, (float)H - 206};
     int n = r->commitCount;
+    /* Graph or List */
+    if (n) {
+        const char *labels[2] = {"List", "Graph"};
+        float bx = 20;
+        for (int v = 0; v < 2; v++) {
+            Rectangle b = {bx, 184, 110, 34};
+            bool on = commitsView == v;
+            if (ButtonEx(b, labels[v], on ? UI_BLUE : UI_BTN, true) && !on) commitsView = v;
+            bx += 118;
+        }
+        int merges = 0;
+        for (int k = 0; k < n; k++) if (r->commits[k].parentCount > 1) merges++;
+        const char *info = TextFormat("%d commit%s on %s%s", n, n == 1 ? "" : "s", r->branch,
+                                      merges ? TextFormat(", %d merge%s", merges, merges == 1 ? "" : "s") : "");
+        DrawText(info, W - 20 - MeasureText(info, FS), 191, FS, UI_MUTED);
+        if (commitsView == 1) { CommitGraph(r, (Rectangle){20, 230, (float)W - 40, (float)H - 250}); return; }
+    }
+    Rectangle la = {20, n ? 230.0f : 186.0f, (float)W - 40, (float)H - (n ? 250 : 206)};
     float rowH = 74;
     ScrollArea(la, &scCommits, n * rowH);
     if (!n) {
