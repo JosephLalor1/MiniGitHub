@@ -218,7 +218,7 @@ static void Sha1Final(Sha1 *s, uint8_t out[20])
 static void ObjectSha(const char *kind, const void *data, size_t len, uint8_t out[20])
 {
     char head[48];
-    int hn = snprintf(head, sizeof head, "%s %zu", kind, len);
+    int hn = snprintf(head, sizeof head, "%s %llu", kind, (unsigned long long)len);
     Sha1 s;
     Sha1Init(&s);
     Sha1Update(&s, head, (size_t)hn + 1);      /* + the zero byte after it */
@@ -543,16 +543,95 @@ static uint8_t *InflateGzip(const uint8_t *in, size_t inLen, size_t *outLen, siz
     return InflateRaw(in + p, inLen - p, NULL, outLen, maxOut);
 }
 
-/* Squeezes data into zlib format. Uses raylib's DEFLATE when it helps,
-   otherwise just "stored" blocks (no squeezing, still valid). */
+/* ---------- squeezing (DEFLATE) ----------
+   Mini GitHub's own compressor (raylib's one can write past the end of its
+   buffer on big files that don't squeeze). It finds repeats with a hash of
+   every 3 bytes, and writes them with DEFLATE's fixed codes: simple, quick,
+   and it never writes more than "limit" bytes - if the result would be
+   bigger than that, it gives up (returns false) and the caller stores the
+   data unsqueezed instead. */
+typedef struct { Buf *o; uint64_t acc; int n; size_t limit, start; bool full; } BitOut;
+static void PutBits(BitOut *b, uint32_t v, int n)
+{
+    b->acc |= (uint64_t)v << b->n;
+    b->n += n;
+    while (b->n >= 8) { BufByte(b->o, (uint8_t)b->acc); b->acc >>= 8; b->n -= 8; }
+    if (b->o->n - b->start > b->limit || b->o->oom) b->full = true;
+}
+/* Huffman codes go in most-significant bit first, so they're reversed. */
+static void PutCode(BitOut *b, uint32_t code, int len)
+{
+    uint32_t r = 0;
+    for (int i = 0; i < len; i++) r |= ((code >> i) & 1) << (len - 1 - i);
+    PutBits(b, r, len);
+}
+static void PutSym(BitOut *b, int sym)                   /* DEFLATE's fixed literal / length codes */
+{
+    if (sym < 144)      PutCode(b, 0x30 + (uint32_t)sym, 8);
+    else if (sym < 256) PutCode(b, 0x190 + (uint32_t)(sym - 144), 9);
+    else if (sym < 280) PutCode(b, (uint32_t)(sym - 256), 7);
+    else                PutCode(b, 0xC0 + (uint32_t)(sym - 280), 8);
+}
+static bool RawDeflate(const uint8_t *d, size_t n, Buf *out, size_t limit)
+{
+    enum { HBITS = 15, WIN = 32768, CHAIN = 24 };
+    BitOut b = {out, 0, 0, limit, out->n, false};
+    int *head = malloc(sizeof(int) << HBITS), *prev = malloc(sizeof(int) * WIN);
+    if (!head || !prev) { free(head); free(prev); return false; }
+    for (int i = 0; i < (1 << HBITS); i++) head[i] = -1;
+    PutBits(&b, 1, 1); PutBits(&b, 1, 2);                /* the last block, fixed codes */
+    size_t i = 0;
+    size_t check = 262144;
+    while (i < n && !b.full) {
+        if (i >= check) {                                    /* not squeezing at all (e.g. a zip or a photo)? stop early */
+            if (out->n - b.start > i - i / 64) { b.full = true; break; }
+            check += 262144;
+        }
+        int bestLen = 0, bestDist = 0;
+        if (i + 3 <= n) {
+            uint32_t h = ((uint32_t)d[i] << 16 | (uint32_t)d[i + 1] << 8 | d[i + 2]) * 2654435761u >> (32 - HBITS);
+            int c = head[h], tries = 0;
+            size_t maxLen = n - i < 258 ? n - i : 258;
+            while (c >= 0 && i - (size_t)c <= WIN && tries++ < CHAIN) {
+                size_t l = 0;
+                while (l < maxLen && d[(size_t)c + l] == d[i + l]) l++;
+                if ((int)l > bestLen) { bestLen = (int)l; bestDist = (int)(i - (size_t)c); if (l == maxLen) break; }
+                int nx = prev[c % WIN];
+                if (nx >= c) break;
+                c = nx;
+            }
+            prev[i % WIN] = head[h]; head[h] = (int)i;
+        }
+        if (bestLen >= 3) {
+            int lc = 28;                                     /* length code */
+            while (lc > 0 && LBASE[lc] > bestLen) lc--;
+            PutSym(&b, 257 + lc);
+            if (LEXT[lc]) PutBits(&b, (uint32_t)(bestLen - LBASE[lc]), LEXT[lc]);
+            int dc = 29;                                     /* distance code */
+            while (dc > 0 && DBASE[dc] > bestDist) dc--;
+            PutCode(&b, (uint32_t)dc, 5);
+            if (DEXT[dc]) PutBits(&b, (uint32_t)(bestDist - DBASE[dc]), DEXT[dc]);
+            for (size_t k = 1; k < (size_t)bestLen && i + k + 3 <= n; k++) {   /* remember the bytes inside the match too */
+                size_t j = i + k;
+                uint32_t h = ((uint32_t)d[j] << 16 | (uint32_t)d[j + 1] << 8 | d[j + 2]) * 2654435761u >> (32 - HBITS);
+                prev[j % WIN] = head[h]; head[h] = (int)j;
+            }
+            i += (size_t)bestLen;
+        } else PutSym(&b, d[i++]);
+    }
+    PutSym(&b, 256);                                         /* end of block */
+    if (b.n) PutBits(&b, 0, 8 - b.n);
+    free(head); free(prev);
+    if (b.full) { out->n = b.start; return false; }
+    return true;
+}
+
+/* Squeezes data into zlib format: DEFLATE when that makes it smaller,
+   otherwise "stored" blocks (no squeezing, still valid). */
 static void ZlibCompress(Buf *out, const uint8_t *d, size_t n)
 {
     BufByte(out, 0x78); BufByte(out, 0x01);
-    unsigned char *packed = NULL;
-    int pl = 0;
-    if (n >= 64 && n < 0x7FFFFFFF) packed = CompressData(d, (int)n, &pl);
-    if (packed && pl > 0 && (size_t)pl < n) BufAdd(out, packed, (size_t)pl);
-    else {
+    if (n < 64 || !RawDeflate(d, n, out, n - 8)) {
         size_t at = 0;
         do {
             size_t k = n - at > 65535 ? 65535 : n - at;
@@ -563,7 +642,6 @@ static void ZlibCompress(Buf *out, const uint8_t *d, size_t n)
             at += k;
         } while (at < n);
     }
-    if (packed) MemFree(packed);
     uint32_t a = Adler32(d, n);
     BufByte(out, (uint8_t)(a >> 24)); BufByte(out, (uint8_t)(a >> 16)); BufByte(out, (uint8_t)(a >> 8)); BufByte(out, (uint8_t)a);
 }
@@ -637,7 +715,19 @@ typedef struct {
    they've changed and not committed yet. Everything else they see is the
    latest commit - so nobody sees anyone else's half-finished work, and a
    commit only ever contains the changes of the person who made it. */
-typedef struct { int user; int count; WorkFile *files; } Draft;
+typedef struct {
+    int  user; int count; WorkFile *files;
+    char branch[NAME_LEN];           /* the branch these changes are for                       */
+    bool merging;                    /* a merge is under way: committing makes a merge commit,  */
+    uint8_t mergeSha[20];            /* joining in this commit...                               */
+    char mergeName[NAME_LEN];        /* ...the tip of this branch                               */
+} Draft;
+#define MAX_DRAFTS 128               /* per repository: one per person per branch */
+
+/* A branch: a name for a line of work, pointing at its newest commit ("tip").
+   Committing on a branch moves its tip forward to the new commit. */
+#define MAX_BRANCHES 64
+typedef struct { char name[NAME_LEN]; int tip; } Branch;
 
 typedef struct { char title[TEXT_LEN]; bool open; long long time; int author; } Issue;
 
@@ -645,13 +735,17 @@ typedef struct {
     int       owner;                 /* user id, or -1 = not claimed yet */
     char      name[NAME_LEN];
     char      desc[TEXT_LEN];
-    char      branch[NAME_LEN];      /* git's name for the line of commits, usually "main" */
+    char      branch[NAME_LEN];      /* the name the first branch gets (while the repository is empty) */
+    int       branchCount;
+    Branch    branches[MAX_BRANCHES];
+    int       defBranch;             /* the default branch (what git clone checks out)   */
+    int       curBranch;             /* the branch being looked at / worked on right now */
     long long created;
     int       starCount;   int      starredBy[MAX_USERS];
     int       collabCount; int      collabs[MAX_USERS];       /* people invited who accepted   */
     int       inviteCount; int      invites[MAX_USERS];       /* invited, not answered yet     */
     long long inviteTime[MAX_USERS];
-    int       draftCount;  Draft    drafts[MAX_USERS];
+    int       draftCount;  Draft    drafts[MAX_DRAFTS];
     int       commitCount, commitCap; Commit *commits;        /* oldest first; the last is the latest */
     int       blobCount,   blobCap;   Blob   *blobs;
     ShaMap    commitMap, blobMap;    /* fingerprint -> index, for quick lookups */
@@ -676,7 +770,7 @@ static int  repoCount = 0;
 /* ------------------------------------------------------------------ */
 /* App state                                                          */
 /* ------------------------------------------------------------------ */
-typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_FORGOT, SCR_RECOVERY, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY, SCR_PROFILE, SCR_PEOPLE, SCR_UPLOAD } Screen;
+typedef enum { SCR_LOGIN, SCR_REGISTER, SCR_FORGOT, SCR_RECOVERY, SCR_NEW, SCR_REPO, SCR_COMMIT, SCR_ACCOUNT, SCR_DAY, SCR_PROFILE, SCR_PEOPLE, SCR_UPLOAD, SCR_LOADFAIL } Screen;
 typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES, TAB_PEOPLE } Tab;
 
 typedef struct { char buf[TEXT_LEN]; int len; bool active; bool secret; bool reveal; } TextField;
@@ -687,7 +781,7 @@ static Tab    tab    = TAB_CODE;
 static int    curRepo = -1, curCommit = -1, curChange = -1;
 static char   selName[PATH_LEN];      /* the file open in the Code tab ("" = pick the first) */
 
-static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode, tfUpPath, tfUpMsg, tfInvite, tfEmail;
+static TextField tfSearch, tfName, tfDesc, tfNewFile, tfCommit, tfIssue, tfUser, tfBio, tfAvatar, tfCode, tfUpPath, tfUpMsg, tfInvite, tfEmail, tfBranch;
 static TextField tfPass    = {.secret = true}, tfPass2    = {.secret = true};
 static TextField tfOldPass = {.secret = true}, tfNewPass  = {.secret = true};
 static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
@@ -726,7 +820,15 @@ static void MarkDirty(void) { dirty = true; }
 static void Toast(const char *s) { snprintf(toastMsg, sizeof toastMsg, "%s", s); toastT = 3.0f; }
 
 static bool KeyRep(int k) { return IsKeyPressed(k) || IsKeyPressedRepeat(k); }
-static bool Hover(Rectangle r) { return CheckCollisionPointRec(GetMousePosition(), r); }
+/* An open drop-down menu covers part of the page: things under it act as if the mouse weren't there. */
+static Rectangle hoverBlock;
+static bool      hoverBlocked;
+static bool Hover(Rectangle r)
+{
+    Vector2 m = GetMousePosition();
+    if (hoverBlocked && CheckCollisionPointRec(m, hoverBlock)) return false;
+    return CheckCollisionPointRec(m, r);
+}
 static bool Clicked(Rectangle r)
 {
     if (!clickUsed && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && Hover(r)) { clickUsed = true; return true; }
@@ -955,8 +1057,39 @@ static int InternBlob(Repo *r, const char *data, int len) { return InternBlobSha
 static const char *BlobText(Repo *r, int b)   { return b >= 0 ? r->blobs[b].data : ""; }
 static int         BlobLen(Repo *r, int b)    { return b >= 0 ? r->blobs[b].len : 0; }
 static bool        BlobBinary(Repo *r, int b) { return b >= 0 && r->blobs[b].binary; }
-static Commit *Head(Repo *r) { return r->commitCount ? &r->commits[r->commitCount - 1] : NULL; }
-static long long LastActivity(Repo *r) { return r->commitCount ? Head(r)->time : r->created; }
+/* The branch you're on, and its newest commit ("head"). An empty repository has no branches yet. */
+static int HeadIndex(Repo *r)
+{
+    if (!r->branchCount) return -1;
+    if (r->curBranch < 0 || r->curBranch >= r->branchCount) r->curBranch = r->defBranch;
+    return r->branches[r->curBranch].tip;
+}
+static Commit *Head(Repo *r) { int h = HeadIndex(r); return h >= 0 ? &r->commits[h] : NULL; }
+static const char *CurBranchName(Repo *r) { HeadIndex(r); return r->branchCount ? r->branches[r->curBranch].name : r->branch; }
+static const char *DefBranchName(Repo *r) { return r->branchCount ? r->branches[r->defBranch].name : r->branch; }
+static int DefaultTip(Repo *r) { return r->branchCount ? r->branches[r->defBranch].tip : -1; }
+static long long LastActivity(Repo *r)
+{
+    long long t = r->created;
+    for (int b = 0; b < r->branchCount; b++) if (r->commits[r->branches[b].tip].time > t) t = r->commits[r->branches[b].tip].time;
+    return t;
+}
+static void MarkAnc(Repo *r, int tip, uint8_t *mark, uint8_t bit);
+static int FindBranch(Repo *r, const char *name)
+{
+    for (int b = 0; b < r->branchCount; b++) if (strcmp(r->branches[b].name, name) == 0) return b;
+    return -1;
+}
+static int AddBranch(Repo *r, const char *name, int tip)
+{
+    if (r->branchCount >= MAX_BRANCHES) return -1;
+    char copy[NAME_LEN];                       /* name may be part of the same repository (r->branch) */
+    snprintf(copy, sizeof copy, "%s", name);
+    Branch *b = &r->branches[r->branchCount];
+    memcpy(b->name, copy, sizeof copy);
+    b->tip = tip;
+    return r->branchCount++;
+}
 /* The commit this one was built on (the first one, for a merge), or NULL. */
 static Commit *ParentOf(Repo *r, int ci)
 {
@@ -1256,13 +1389,17 @@ static bool FinishCommit(Repo *r, Snap *s, const char *msg, int also)
     snprintf(c.message, TEXT_LEN, "%s", msg);
     const uint8_t *par[2];
     int np = 0;
-    if (r->commitCount) { c.parents[np] = r->commitCount - 1; par[np++] = Head(r)->sha; }
+    int head = HeadIndex(r);
+    if (head >= 0)      { c.parents[np] = head;               par[np++] = r->commits[head].sha; }
     if (also >= 0)      { c.parents[np] = also;               par[np++] = r->commits[also].sha; }
     c.parentCount = np;
     uint8_t tree[20];
     if (c.names && CommitTree(r, &c, tree, NULL, NULL))
         c.raw = MakeRawCommit(tree, par, np, UserName(curUser), UserEmail(curUser), c.time, msg, &c.rawLen);
     if (!c.raw || !AppendCommit(r, &c)) { FreeCommit(&c); return false; }
+    /* the branch moves forward to the new commit (the very first commit makes the first branch) */
+    if (r->branchCount) r->branches[r->curBranch].tip = r->commitCount - 1;
+    else { AddBranch(r, r->branch, r->commitCount - 1); r->defBranch = r->curBranch = 0; }
     return true;
 }
 
@@ -1281,14 +1418,18 @@ static bool SameAsBlob(Repo *r, WorkFile *f, int b)
     return b >= 0 && r->blobs[b].len == f->len && memcmp(r->blobs[b].data, f->text, (size_t)f->len) == 0;
 }
 
+/* uid's changes on the branch being worked on. */
 static Draft *GetDraft(Repo *r, int uid, bool create)
 {
-    for (int i = 0; i < r->draftCount; i++) if (r->drafts[i].user == uid) return &r->drafts[i];
-    if (!create || r->draftCount >= MAX_USERS) return NULL;
+    const char *br = CurBranchName(r);
+    for (int i = 0; i < r->draftCount; i++) if (r->drafts[i].user == uid && strcmp(r->drafts[i].branch, br) == 0) return &r->drafts[i];
+    if (!create || r->draftCount >= MAX_DRAFTS) return NULL;
     WorkFile *f = calloc(MAX_DRAFT, sizeof(WorkFile));
     if (!f) return NULL;
     Draft *d = &r->drafts[r->draftCount++];
+    memset(d, 0, sizeof *d);
     d->user = uid; d->count = 0; d->files = f;
+    snprintf(d->branch, NAME_LEN, "%s", br);
     return d;
 }
 
@@ -1321,18 +1462,20 @@ static void DraftClear(Repo *r, int uid)
 {
     Draft *d = GetDraft(r, uid, false);
     while (d && d->count) DraftDrop(d, d->count - 1);
+    if (d) d->merging = false;
 }
-static void RemoveDraft(Repo *r, int uid)
+/* Throws away drafts: uid's (on every branch) if branch is NULL, or everyone's on that branch if uid is -1. */
+static void RemoveDrafts(Repo *r, int uid, const char *branch)
 {
-    for (int i = 0; i < r->draftCount; i++)
-        if (r->drafts[i].user == uid) {
+    for (int i = r->draftCount - 1; i >= 0; i--)
+        if ((uid < 0 || r->drafts[i].user == uid) && (!branch || strcmp(r->drafts[i].branch, branch) == 0)) {
             FreeDraft(&r->drafts[i]);
             memmove(&r->drafts[i], &r->drafts[i + 1], (size_t)(r->draftCount - i - 1) * sizeof(Draft));
             r->draftCount--;
             memset(&r->drafts[r->draftCount], 0, sizeof(Draft));
-            return;
         }
 }
+static void RemoveDraft(Repo *r, int uid) { RemoveDrafts(r, uid, NULL); }
 
 /* Your own editable copy of a file: made from the latest commit the first
    time you change it (or empty, for a new file). NULL if your draft is full. */
@@ -1398,7 +1541,7 @@ static void DraftCounts(Repo *r, int uid, int *changes, int *conflicts)
    latest commit back through the commits it was built on. */
 static int LastChangedBy(Repo *r, const char *name)
 {
-    int k = r->commitCount - 1;
+    int k = HeadIndex(r);
     while (k >= 0) {
         Commit *c = &r->commits[k], *p = ParentOf(r, k);
         int now = FindInCommit(c, name);
@@ -1472,6 +1615,8 @@ static int OpenIssues(Repo *r)
     return n;
 }
 
+static const char *MarkersLeft(Repo *r);
+
 /* Returns NULL on success, or a message explaining what went wrong. */
 static const char *DoCommit(Repo *r, const char *msg)
 {
@@ -1479,15 +1624,20 @@ static const char *DoCommit(Repo *r, const char *msg)
     DraftTidy(r, curUser);
     int changes, conflicts;
     DraftCounts(r, curUser, &changes, &conflicts);
+    Draft *md = GetDraft(r, curUser, false);
+    bool merging = md && md->merging;
+    int also = merging ? CommitBySha(r, md->mergeSha) : -1;
     if (conflicts)                     return "Sort out the conflicts first (files marked !)";
-    if (!changes)                      return "Nothing to commit - no changes since the last commit";
+    if (!changes && !merging)          return "Nothing to commit - no changes since the last commit";
     if (r->commitCount >= MAX_COMMITS) return "This repository has reached its commit limit";
+    if (merging && also < 0)           return "The branch being merged has gone - abort the merge";
+    if (merging && MarkersLeft(r))     return TextFormat("%s still has conflict markers (<<<<<<<) - fix those parts first", MarkersLeft(r));
 
     /* start from the latest commit, then apply your changes */
     Draft *d = GetDraft(r, curUser, false);
     Snap s;
     if (!SnapFrom(&s, Head(r))) return "Out of memory";
-    for (int i = 0; i < d->count; i++) {
+    for (int i = 0; d && i < d->count; i++) {
         WorkFile *e = &d->files[i];
         char st = DraftStatus(r, e);
         if (st == 'D') { SnapRemove(&s, e->name); continue; }
@@ -1497,8 +1647,8 @@ static const char *DoCommit(Repo *r, const char *msg)
     }
     const char *clash = PathClash(s.names, s.n);
     if (clash) { SnapFree(&s); return TextFormat("%s is both a file and a folder - rename one of them first", clash); }
-    if (!FinishCommit(r, &s, msg, -1)) return "Couldn't save the commit (out of memory?)";
-    DraftClear(r, curUser);                 /* everything is committed now */
+    if (!FinishCommit(r, &s, msg, also)) return "Couldn't save the commit (out of memory?)";
+    DraftClear(r, curUser);                 /* everything is committed now (and a merge is finished) */
     return NULL;
 }
 
@@ -2366,14 +2516,24 @@ static void WSN(FILE *f, const char *s, int n) { fprintf(f, "%d:", n); fwrite(s,
 static void WS(FILE *f, const char *s) { WSN(f, s, (int)strlen(s)); }
 static void WI(FILE *f, long long v)   { fprintf(f, "%lld\n", v); }
 
-static int loadErr;
+static int  loadErr;
+static bool loadFailed;                /* the save file couldn't be read: nothing is saved until you decide */
+static int  loadLine;                  /* which check failed (for the message) */
+static char loadWhy[TEXT_LEN];         /* what went wrong, in words            */
+static char loadWhere[TEXT_LEN];       /* e.g. "the repository jo/hello-world"  */
+#define LOADFAIL (loadErr = 1, loadLine = loadLine ? loadLine : __LINE__)
 /* Reads one piece of text (or binary data); *outLen gets its length. */
 static char *RSN(FILE *f, int *outLen)
 {
     int n;
-    if (fscanf(f, " %d:", &n) != 1 || n < 0 || n > 50000000) { loadErr = 1; return NULL; }
+    /* anything up to 1 GB: as big as anything Mini GitHub can store */
+    if (fscanf(f, " %d:", &n) != 1 || n < 0 || n > 1073741824) {
+        if (!loadErr) snprintf(loadWhy, sizeof loadWhy, "a piece of text or a file in it couldn't be read");
+        LOADFAIL; return NULL;
+    }
     char *s = malloc((size_t)n + 1);
-    if (!s || fread(s, 1, (size_t)n, f) != (size_t)n) { free(s); loadErr = 1; return NULL; }
+    if (!s) { if (!loadErr) snprintf(loadWhy, sizeof loadWhy, "not enough memory to load a %d MB file", n >> 20); LOADFAIL; return NULL; }
+    if (fread(s, 1, (size_t)n, f) != (size_t)n) { free(s); if (!loadErr) snprintf(loadWhy, sizeof loadWhy, "the file ends too early (cut short?)"); LOADFAIL; return NULL; }
     s[n] = 0;
     if (outLen) *outLen = n;
     fgetc(f);
@@ -2389,7 +2549,7 @@ static void RSInto(FILE *f, char *dst, int cap)
 static long long RI(FILE *f)
 {
     long long v = 0;
-    if (fscanf(f, " %lld", &v) != 1) loadErr = 1;
+    if (fscanf(f, " %lld", &v) != 1) { if (!loadErr) snprintf(loadWhy, sizeof loadWhy, "a number in it couldn't be read"); LOADFAIL; }
     return v;
 }
 
@@ -2423,11 +2583,70 @@ static void PtrPut(PtrMap *m, const char *k, int v)
 }
 static void PtrFree(PtrMap *m) { free(m->key); free(m->val); memset(m, 0, sizeof *m); }
 
+/* Earlier versions could store a pushed commit before a commit it was built on
+   (with merges that criss-cross), recording the link wrongly. Every commit's
+   real parents are in its git data, so they're read again from there, and the
+   list is put back in order: each commit after the ones it's built on.
+   Returns false only if the history can't be put in order at all. */
+static bool RepairHistory(Repo *r)
+{
+    int n = r->commitCount;
+    if (!n) return true;
+    for (int k = 0; k < n; k++) {
+        Commit *c = &r->commits[k];
+        CommitInfo ci;
+        if (!ParseCommit(c->raw, c->rawLen, &ci)) return false;
+        c->parentCount = 0;
+        for (int q = 0; q < ci.np && c->parentCount < 2; q++) {
+            int p = CommitBySha(r, ci.parents[q]);
+            if (p >= 0 && p != k) c->parents[c->parentCount++] = p;   /* a missing one is left out */
+        }
+        c->statsDone = false;
+    }
+    /* put in order: repeatedly take a commit whose parents are all placed */
+    int *left = calloc((size_t)n, sizeof(int)), *kidStart = calloc((size_t)n + 1, sizeof(int)), *kids = malloc((size_t)n * 2 * sizeof(int) + 1);
+    int *order = malloc((size_t)n * sizeof(int)), *to = malloc((size_t)n * sizeof(int)), *queue = malloc((size_t)n * sizeof(int));
+    Commit *moved = malloc((size_t)n * sizeof(Commit));
+    bool ok = left && kidStart && kids && order && to && queue && moved;
+    if (ok) {
+        for (int k = 0; k < n; k++) for (int q = 0; q < r->commits[k].parentCount; q++) kidStart[r->commits[k].parents[q] + 1]++;
+        for (int k = 0; k < n; k++) kidStart[k + 1] += kidStart[k];
+        int *fill = calloc((size_t)n, sizeof(int));
+        if (!fill) ok = false;
+        for (int k = 0; ok && k < n; k++)
+            for (int q = 0; q < r->commits[k].parentCount; q++) { int p = r->commits[k].parents[q]; kids[kidStart[p] + fill[p]++] = k; }
+        free(fill);
+        int qh = 0, qt = 0, on = 0;
+        for (int k = 0; ok && k < n; k++) { left[k] = r->commits[k].parentCount; if (!left[k]) queue[qt++] = k; }
+        while (ok && qh < qt) {
+            int k = queue[qh++];
+            order[on++] = k;
+            for (int j = kidStart[k]; j < kidStart[k + 1]; j++) if (--left[kids[j]] == 0) queue[qt++] = kids[j];
+        }
+        if (on != n) ok = false;                             /* a loop: can't happen with real commits */
+        if (ok) {
+            for (int i = 0; i < n; i++) to[order[i]] = i;
+            for (int i = 0; i < n; i++) moved[i] = r->commits[order[i]];
+            for (int i = 0; i < n; i++) {
+                for (int q = 0; q < moved[i].parentCount; q++) moved[i].parents[q] = to[moved[i].parents[q]];
+                r->commits[i] = moved[i];
+            }
+            for (int b = 0; b < r->branchCount; b++) r->branches[b].tip = to[r->branches[b].tip];
+            MapFree(&r->commitMap);
+            for (int i = 0; i < n; i++) MapPut(&r->commitMap, r->commits[i].sha, i);
+            r->gen++;
+        }
+    }
+    free(left); free(kidStart); free(kids); free(order); free(to); free(queue); free(moved);
+    return ok;
+}
+
 static void Save(void)
 {
+    if (loadFailed) return;                /* never write over a save file that couldn't be read */
     FILE *f = fopen(SAVE_FILE ".tmp", "wb");
     if (!f) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(f, "MINIGITHUB7\n");
+    fprintf(f, "MINIGITHUB8\n");
     WI(f, nextUserId);
     WS(f, lastUser);
     WI(f, userCount);
@@ -2473,6 +2692,8 @@ static void Save(void)
             for (int j = 0; j < c->fileCount; j++) fprintf(f, "%d %d %d\n", PtrGet(&pm, c->names[j]), c->blobs[j], c->modes[j]);
         }
         PtrFree(&pm);
+        WI(f, r->branchCount); WI(f, r->defBranch);
+        for (int b = 0; b < r->branchCount; b++) { WS(f, r->branches[b].name); WI(f, r->branches[b].tip); }
 
         WI(f, r->issueCount);
         for (int k = 0; k < r->issueCount; k++) {
@@ -2486,6 +2707,9 @@ static void Save(void)
             Draft *d = &r->drafts[k];
             if (!d->count) continue;
             WI(f, d->user); WI(f, d->count);
+            char mh[41];
+            ShaHex(d->mergeSha, mh);
+            WS(f, d->branch); WI(f, d->merging); WS(f, mh); WS(f, d->mergeName);
             for (int j = 0; j < d->count; j++) {
                 WorkFile *e = &d->files[j];
                 WS(f, e->name); WSN(f, e->text, e->len); WI(f, e->deleted); WI(f, e->base);
@@ -2562,20 +2786,26 @@ static bool UpgradeCommits(Repo *r)
    4 (profiles + recovery codes), 3 (either one), 2 (accounts), 1 (before accounts). */
 static bool Load(void)
 {
+    /* the program stopped in the middle of saving: the new copy was written, the old one already removed */
+    if (!FileExists(SAVE_FILE) && FileExists(SAVE_FILE ".tmp")) rename(SAVE_FILE ".tmp", SAVE_FILE);
     FILE *f = fopen(SAVE_FILE, "rb");
     if (!f) return false;
-    loadErr = 0;
+    loadErr = 0; loadLine = 0; loadWhy[0] = 0; loadWhere[0] = 0;
     char magic[32] = {0};
     int ver = 0;
-    if (fscanf(f, "%31s", magic) == 1 && strncmp(magic, "MINIGITHUB", 10) == 0 && magic[10] >= '1' && magic[10] <= '7' && !magic[11])
+    if (fscanf(f, "%31s", magic) == 1 && strncmp(magic, "MINIGITHUB", 10) == 0 && magic[10] >= '1' && magic[10] <= '8' && !magic[11])
         ver = magic[10] - '0';
-    if (!ver) loadErr = 1;
+    if (!ver) {
+        if (strncmp(magic, "MINIGITHUB", 10) == 0) snprintf(loadWhy, sizeof loadWhy, "it was made by a newer version of Mini GitHub");
+        else snprintf(loadWhy, sizeof loadWhy, "it isn't a Mini GitHub save file");
+        LOADFAIL;
+    }
 
     if (ver >= 2) {
         nextUserId = (int)RI(f);
         RSInto(f, lastUser, NAME_LEN);
         int uc = (int)RI(f);
-        if (uc < 0 || uc > MAX_USERS) loadErr = 1;
+        if (uc < 0 || uc > MAX_USERS) LOADFAIL;
         for (int i = 0; i < uc && !loadErr; i++) {
             User *u = &users[userCount++];
             memset(u, 0, sizeof *u);
@@ -2599,31 +2829,34 @@ static bool Load(void)
                 RSInto(f, u->rsalt, (int)sizeof u->rsalt);
                 RSInto(f, u->rhash, (int)sizeof u->rhash);
                 bool none = !u->rsalt[0] && !u->rhash[0];
-                if (!none && (strlen(u->rsalt) != 32 || strlen(u->rhash) != 64)) loadErr = 1;
+                if (!none && (strlen(u->rsalt) != 32 || strlen(u->rhash) != 64)) LOADFAIL;
             }
             if (ver >= 7) RSInto(f, u->email, TEXT_LEN);
-            if (u->id <= 0 || strlen(u->salt) != 32 || strlen(u->hash) != 64) loadErr = 1;
+            if (u->id <= 0 || strlen(u->salt) != 32 || strlen(u->hash) != 64) LOADFAIL;
             if (u->id >= nextUserId) nextUserId = u->id + 1;
         }
     }
 
     int n = loadErr ? 0 : (int)RI(f);
-    if (n < 0 || n > MAX_REPOS) loadErr = 1;
+    if (n < 0 || n > MAX_REPOS) LOADFAIL;
 
     static OldEntry oldEntries[64];
+    int repaired = 0;                                        /* histories put back in order */
     for (int i = 0; i < n && !loadErr; i++) {
+        bool needRepair = false;
         Repo *r = &repos[repoCount++];
         memset(r, 0, sizeof *r);
         snprintf(r->branch, NAME_LEN, "main");
         r->owner = ver >= 2 ? (int)RI(f) : -1;
         RSInto(f, r->name, NAME_LEN);
+        snprintf(loadWhere, sizeof loadWhere, "the repository %s", r->name);
         RSInto(f, r->desc, TEXT_LEN);
         if (ver == 1) RI(f);                    /* old single-user "starred" flag: dropped */
         r->created = RI(f);
         if (ver >= 7) { RSInto(f, r->branch, NAME_LEN); if (!r->branch[0]) snprintf(r->branch, NAME_LEN, "main"); }
         if (ver >= 2) {
             int sc = (int)RI(f);
-            if (sc < 0 || sc > MAX_USERS) { loadErr = 1; break; }
+            if (sc < 0 || sc > MAX_USERS) { LOADFAIL; break; }
             for (int k = 0; k < sc; k++) r->starredBy[r->starCount++] = (int)RI(f);
         }
 
@@ -2633,14 +2866,14 @@ static bool Load(void)
         int legacyCount = 0;
         if (ver >= 5) {
             int cc2 = (int)RI(f);
-            if (cc2 < 0 || cc2 > MAX_USERS) { loadErr = 1; break; }
+            if (cc2 < 0 || cc2 > MAX_USERS) { LOADFAIL; break; }
             for (int k = 0; k < cc2; k++) r->collabs[r->collabCount++] = (int)RI(f);
             int ic2 = (int)RI(f);
-            if (ic2 < 0 || ic2 > MAX_USERS) { loadErr = 1; break; }
+            if (ic2 < 0 || ic2 > MAX_USERS) { LOADFAIL; break; }
             for (int k = 0; k < ic2; k++) { r->invites[r->inviteCount] = (int)RI(f); r->inviteTime[r->inviteCount++] = RI(f); }
         } else {
             int fc = (int)RI(f);
-            if (fc < 0 || fc > 64) { loadErr = 1; break; }
+            if (fc < 0 || fc > 64) { LOADFAIL; break; }
             for (int k = 0; k < fc && !loadErr; k++) {
                 WorkFile *w = &legacy[legacyCount];
                 memset(w, 0, sizeof *w);
@@ -2652,28 +2885,28 @@ static bool Load(void)
         }
 
         int bc = (int)RI(f);
-        if (bc < 0 || bc > MAX_BLOBS) { loadErr = 1; break; }
+        if (bc < 0 || bc > MAX_BLOBS) { LOADFAIL; break; }
         for (int k = 0; k < bc && !loadErr; k++) {
             int dLen = 0;
             char *d = RSN(f, &dLen);
-            if (!d || !LoadBlob(r, d, dLen)) { loadErr = 1; break; }
+            if (!d || !LoadBlob(r, d, dLen)) { LOADFAIL; break; }
         }
         if (loadErr) break;
 
         int cc = (int)RI(f);
         if (ver >= 7) {
             int pc = cc;                                   /* first the table of paths */
-            if (pc < 0 || pc > 10000000) { loadErr = 1; break; }
+            if (pc < 0 || pc > 10000000) { LOADFAIL; break; }
             const char **paths = malloc((size_t)(pc ? pc : 1) * sizeof *paths);
-            if (!paths) { loadErr = 1; break; }
+            if (!paths) { LOADFAIL; break; }
             for (int k = 0; k < pc && !loadErr; k++) {
                 char *s = RS(f);
                 paths[k] = s ? Intern(s) : NULL;
-                if (!paths[k]) loadErr = 1;
+                if (!paths[k]) LOADFAIL;
                 free(s);
             }
             cc = loadErr ? 0 : (int)RI(f);
-            if (cc < 0 || cc > MAX_COMMITS) loadErr = 1;
+            if (cc < 0 || cc > MAX_COMMITS) LOADFAIL;
             for (int k = 0; k < cc && !loadErr; k++) {
                 Commit c;
                 memset(&c, 0, sizeof c);
@@ -2683,31 +2916,32 @@ static bool Load(void)
                 c.sFiles = (int)RI(f); c.sAdds = (int)RI(f); c.sDels = (int)RI(f);
                 bool stats = c.sFiles >= 0 && c.sAdds >= 0 && c.sDels >= 0;
                 int ff = (int)RI(f);
-                if (!c.raw || ff < 0 || ff > MAX_FILES || c.parentCount < 0 || c.parentCount > 2) { free(c.raw); loadErr = 1; break; }
-                for (int q = 0; q < c.parentCount; q++) if (c.parents[q] < 0 || c.parents[q] >= k) loadErr = 1;
+                if (!c.raw || ff < 0 || ff > MAX_FILES || c.parentCount < 0 || c.parentCount > 2) { free(c.raw); LOADFAIL; break; }
+                for (int q = 0; q < c.parentCount; q++)
+                    if (c.parents[q] < 0 || c.parents[q] >= k) { needRepair = true; c.parents[q] = 0; }   /* fixed below */
                 c.fileCount = ff;
                 c.names = malloc((size_t)(ff ? ff : 1) * sizeof *c.names);
                 c.blobs = malloc((size_t)(ff ? ff : 1) * sizeof *c.blobs);
                 c.modes = malloc((size_t)(ff ? ff : 1));
-                if (!c.names || !c.blobs || !c.modes) { FreeCommit(&c); loadErr = 1; break; }
+                if (!c.names || !c.blobs || !c.modes) { FreeCommit(&c); LOADFAIL; break; }
                 for (int j = 0; j < ff && !loadErr; j++) {
                     int pi = (int)RI(f), b = (int)RI(f), m = (int)RI(f);
-                    if (pi < 0 || pi >= pc || b < 0 || b >= r->blobCount || m < 0 || m > 2) { loadErr = 1; break; }
+                    if (pi < 0 || pi >= pc || b < 0 || b >= r->blobCount || m < 0 || m > 2) { LOADFAIL; break; }
                     c.names[j] = paths[pi]; c.blobs[j] = b; c.modes[j] = (uint8_t)m;
                 }
                 CommitInfo info;
-                if (!loadErr && !ParseCommit(c.raw, c.rawLen, &info)) loadErr = 1;
+                if (!loadErr && !ParseCommit(c.raw, c.rawLen, &info)) LOADFAIL;
                 if (loadErr) { FreeCommit(&c); break; }
                 snprintf(c.message, TEXT_LEN, "%s", info.summary);
-                if (!AppendCommit(r, &c)) { FreeCommit(&c); loadErr = 1; break; }
+                if (!AppendCommit(r, &c)) { FreeCommit(&c); LOADFAIL; break; }
                 r->commits[r->commitCount - 1].statsDone = stats;
             }
             free(paths);
             if (loadErr) break;
         } else {
-            if (cc < 0 || cc > MAX_COMMITS) { loadErr = 1; break; }
+            if (cc < 0 || cc > MAX_COMMITS) { LOADFAIL; break; }
             r->commits = GrowArr(r->commits, &r->commitCap, cc + 1, sizeof(Commit));
-            if (r->commitCap < cc) { loadErr = 1; break; }
+            if (r->commitCap < cc) { LOADFAIL; break; }
             for (int k = 0; k < cc && !loadErr; k++) {
                 Commit *c = &r->commits[k];
                 memset(c, 0, sizeof *c);
@@ -2716,16 +2950,16 @@ static bool Load(void)
                 c->time   = RI(f);
                 c->author = ver >= 2 ? (int)RI(f) : -1;
                 int ff = (int)RI(f);
-                if (ff < 0 || ff > 64) { loadErr = 1; break; }
+                if (ff < 0 || ff > 64) { LOADFAIL; break; }
                 c->fileCount = ff;
                 for (int j = 0; j < ff; j++) {
                     char nm[PATH_LEN];
                     RSInto(f, nm, PATH_LEN);
                     int b = (int)RI(f);
-                    if (b < 0 || b >= r->blobCount || !nm[0]) { loadErr = 1; break; }
+                    if (b < 0 || b >= r->blobCount || !nm[0]) { LOADFAIL; break; }
                     oldEntries[j].name = Intern(nm);
                     oldEntries[j].blob = b;
-                    if (!oldEntries[j].name) loadErr = 1;
+                    if (!oldEntries[j].name) LOADFAIL;
                 }
                 if (ver >= 6) c->copied = RI(f) != 0;
                 if (loadErr) break;
@@ -2734,14 +2968,34 @@ static bool Load(void)
                 c->blobs = malloc((size_t)(ff ? ff : 1) * sizeof *c->blobs);
                 c->modes = calloc((size_t)(ff ? ff : 1), 1);
                 r->commitCount++;
-                if (!c->names || !c->blobs || !c->modes) { loadErr = 1; break; }
+                if (!c->names || !c->blobs || !c->modes) { LOADFAIL; break; }
                 for (int j = 0; j < ff; j++) { c->names[j] = oldEntries[j].name; c->blobs[j] = oldEntries[j].blob; }
             }
             if (loadErr) break;
         }
 
+        /* branches (before version 8 there was just one, at the newest commit) */
+        if (ver >= 8) {
+            int bc2 = (int)RI(f), db = (int)RI(f);
+            if (bc2 < 0 || bc2 > MAX_BRANCHES || (bc2 && (db < 0 || db >= bc2))) { LOADFAIL; break; }
+            for (int b = 0; b < bc2 && !loadErr; b++) {
+                char bn[NAME_LEN];
+                RSInto(f, bn, NAME_LEN);
+                int tip = (int)RI(f);
+                if (tip < 0 || tip >= r->commitCount || !bn[0]) LOADFAIL;
+                else AddBranch(r, bn, tip);
+            }
+            r->defBranch = r->curBranch = bc2 ? db : 0;
+            if (loadErr) break;
+        } else if (r->commitCount) { AddBranch(r, r->branch, r->commitCount - 1); r->defBranch = r->curBranch = 0; }
+        if (needRepair) {                                    /* a history stored out of order: put it right */
+            if (!RepairHistory(r)) { snprintf(loadWhy, sizeof loadWhy, "its history couldn't be put back in order"); LOADFAIL; break; }
+            repaired++;
+            needRepair = false;
+        }
+
         int ic = (int)RI(f);
-        if (ic < 0 || ic > MAX_ISSUES) { loadErr = 1; break; }
+        if (ic < 0 || ic > MAX_ISSUES) { LOADFAIL; break; }
         for (int k = 0; k < ic && !loadErr; k++) {
             Issue *is = &r->issues[r->issueCount++];
             RSInto(f, is->title, TEXT_LEN);
@@ -2752,11 +3006,18 @@ static bool Load(void)
 
         if (ver >= 5) {
             int dc = (int)RI(f);
-            if (dc < 0 || dc > MAX_USERS) { loadErr = 1; break; }
+            if (dc < 0 || dc > MAX_DRAFTS) { LOADFAIL; break; }
             for (int k = 0; k < dc && !loadErr; k++) {
                 int uid = (int)RI(f), n2 = (int)RI(f);
-                if (n2 < 0 || n2 > MAX_DRAFT) { loadErr = 1; break; }
-                Draft *d = GetDraft(r, uid, true);
+                if (n2 < 0 || n2 > MAX_DRAFT) { LOADFAIL; break; }
+                char dbn[NAME_LEN] = "", mh[48] = "", mn[NAME_LEN] = "";
+                bool merging = false;
+                if (ver >= 8) { RSInto(f, dbn, NAME_LEN); merging = RI(f) != 0; RSInto(f, mh, sizeof mh); RSInto(f, mn, NAME_LEN); }
+                int keep = r->curBranch, bi = dbn[0] ? FindBranch(r, dbn) : -1;
+                if (bi >= 0) r->curBranch = bi;            /* GetDraft makes it for the branch you're on */
+                Draft *d = (bi >= 0 || !dbn[0]) ? GetDraft(r, uid, true) : NULL;   /* a draft for a branch that's gone is dropped */
+                r->curBranch = keep;
+                if (d && merging && ParseHex40(mh, d->mergeSha)) { d->merging = true; snprintf(d->mergeName, NAME_LEN, "%s", mn); }
                 for (int j = 0; j < n2 && !loadErr; j++) {
                     char nm[PATH_LEN];
                     RSInto(f, nm, PATH_LEN);
@@ -2765,7 +3026,7 @@ static bool Load(void)
                     bool del = RI(f) != 0;
                     int base = (int)RI(f);
                     if (!tx) break;
-                    if (base < -1 || base >= r->blobCount) loadErr = 1;
+                    if (base < -1 || base >= r->blobCount) LOADFAIL;
                     if (d && !loadErr && d->count < MAX_DRAFT) {
                         WorkFile *e = &d->files[d->count++];
                         memset(e, 0, sizeof *e);
@@ -2817,7 +3078,7 @@ static bool Load(void)
                     for (int k = 0; k < repos[j].commitCount; k++)
                         if (strcmp(repos[j].commits[k].id, r->forkBase) == 0) { baseAt[i] = j * 1000000 + k; break; }
         }
-        for (int i = 0; i < repoCount && !loadErr; i++) if (!UpgradeCommits(&repos[i])) loadErr = 1;
+        for (int i = 0; i < repoCount && !loadErr; i++) if (!UpgradeCommits(&repos[i])) LOADFAIL;
         for (int i = 0; i < repoCount && !loadErr; i++) {
             Repo *r = &repos[i];
             if (!r->isFork || !r->forkBase[0]) continue;
@@ -2838,6 +3099,8 @@ static bool Load(void)
     }
 
     if (loadErr) {
+        /* Don't touch the file: it stays exactly as it is, and nothing is saved
+           over it until you choose what to do (see ScreenLoadFail). */
         for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);
         for (int i = 0; i < userCount; i++) free(users[i].avatar);
         memset(repos, 0, sizeof repos);
@@ -2845,10 +3108,23 @@ static bool Load(void)
         repoCount = userCount = 0;
         nextUserId = 1;
         lastUser[0] = 0;
-        remove(SAVE_FILE ".bak");
-        rename(SAVE_FILE, SAVE_FILE ".bak");
-        Toast("Save file was damaged - kept a copy as minigithub.dat.bak");
+        if (!loadWhy[0]) snprintf(loadWhy, sizeof loadWhy, "part of it didn't make sense (check %d)", loadLine);
+        loadFailed = true;
         return false;
+    }
+    if (repaired) {                                          /* save the mended version (the old file is kept, below) */
+        char old[64];
+        snprintf(old, sizeof old, "%s.before-repair", SAVE_FILE);
+        if (!FileExists(old)) { int sz = 0; unsigned char *d = LoadFileData(SAVE_FILE, &sz); if (d) { SaveFileData(old, d, sz); UnloadFileData(d); } }
+        MarkDirty();
+        Toast(TextFormat("Mended the history of %d repositor%s stored out of order by an older version", repaired, repaired == 1 ? "y" : "ies"));
+        return true;
+    }
+    /* it loaded: keep a copy of this good file, in case anything goes wrong later */
+    if (ver >= 7) {
+        int sz = 0;
+        unsigned char *d = LoadFileData(SAVE_FILE, &sz);
+        if (d) { SaveFileData(SAVE_FILE ".last-good", d, sz); UnloadFileData(d); }
     }
     return true;
 }
@@ -3071,6 +3347,47 @@ static int  PrevChar(const char *t, int p)          { if (p > 0) p--; while (p >
 static int  NextChar(const char *t, int len, int p) { if (p < len) p++; while (p < len && IsCont(t[p])) p++; return p; }
 static int  SnapChar(const char *t, int len, int p) { while (p > 0 && p < len && IsCont(t[p])) p--; return p; }
 
+/* git's conflict marker lines: "<<<<<<< yours", "=======", ">>>>>>> theirs" */
+static bool LineStarts(const char *t, int p, int le, const char *what)
+{
+    int n = (int)strlen(what);
+    return le - p >= n && memcmp(t + p, what, (size_t)n) == 0;
+}
+static bool IsMidMarker(const char *t, int p, int le)
+{
+    int n = le - p;
+    if (n > 0 && t[le - 1] == '\r') n--;
+    return n == 7 && memcmp(t + p, "=======", 7) == 0;
+}
+/* Settles one clash (the one whose "<<<<<<<" line starts at start):
+   which = 0 keeps your lines, 1 theirs, 2 both (yours first). */
+static bool ResolveConflict(WorkFile *f, int start, int which)
+{
+    const char *t = f->text;
+    int len = f->len, firstEnd = LineEnd(t, len, start), mid = -1, end = -1;
+    for (int pos = firstEnd + 1; pos < len; ) {
+        int le = LineEnd(t, len, pos);
+        if (mid < 0 && IsMidMarker(t, pos, le)) mid = pos;
+        else if (mid >= 0 && LineStarts(t, pos, le, ">>>>>>>")) { end = pos; break; }
+        else if (LineStarts(t, pos, le, "<<<<<<<")) return false;            /* a broken block */
+        if (le >= len) break;
+        pos = le + 1;
+    }
+    if (mid < 0 || end < 0 || firstEnd >= len) return false;
+    int midEnd = LineEnd(t, len, mid), endEnd = LineEnd(t, len, end);
+    int cut = endEnd < len ? endEnd + 1 : endEnd;
+    int o0 = firstEnd + 1, o1 = mid, t0 = midEnd + 1, t1 = end;
+    Buf b = {0};
+    BufAdd(&b, t, (size_t)start);
+    if (which != 1) BufAdd(&b, t + o0, (size_t)(o1 - o0));
+    if (which != 0) BufAdd(&b, t + t0, (size_t)(t1 - t0));
+    BufAdd(&b, t + cut, (size_t)(len - cut));
+    if (b.oom) { BufFree(&b); return false; }
+    WF_SetN(f, b.d ? (const char *)b.d : "", (int)b.n);
+    BufFree(&b);
+    return true;
+}
+
 static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
 {
     bool changed = false, moved = false;
@@ -3164,11 +3481,23 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
     DrawRectangle((int)area.x, (int)area.y, (int)gutter, (int)area.height, (Color){22, 27, 34, 255});
     const char *t = f->text;
     int p = 0, line = 0, curLine = LineOf(t, ed.cursor);
+    int clash = 0;                      /* 0 normal, 1 inside "your" side of a clash, 2 inside "their" side */
+    int fixAt = -1, fixHow = 0;         /* a "Keep..." link clicked: done after drawing */
     for (;;) {
         int le = LineEnd(t, f->len, p);
         float y = top + line * LH - ed.scrollY;
         if (y > area.y + area.height) break;
+        /* conflict markers colour the lines between them (worked out for every line, even off screen) */
+        int marker = 0;                 /* 1 start, 2 middle, 3 end */
+        if (LineStarts(t, p, le, "<<<<<<<")) { marker = 1; }
+        else if (clash == 1 && IsMidMarker(t, p, le)) marker = 2;
+        else if (clash == 2 && LineStarts(t, p, le, ">>>>>>>")) marker = 3;
+        int side = marker ? 0 : clash;
+        if (marker == 1) clash = 1; else if (marker == 2) clash = 2; else if (marker == 3) clash = 0;
         if (y + LH >= area.y) {
+            if (marker)    DrawRectangle((int)(area.x + gutter), (int)y - 2, (int)(area.width - gutter), LH, (Color){247, 129, 102, 45});
+            else if (side) DrawRectangle((int)(area.x + gutter), (int)y - 2, (int)(area.width - gutter), LH,
+                                         side == 1 ? (Color){56, 139, 253, 32} : (Color){46, 160, 67, 32});
             if (line == curLine && ed.focused)
                 DrawRectangle((int)(area.x + gutter), (int)y - 2, (int)(area.width - gutter), LH, (Color){255, 255, 255, 10});
 
@@ -3176,9 +3505,25 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
             int s = p;
             while (s < le && t[s] == ' ') s++;
             Color c = UI_TEXT;
-            if (s < le && t[s] == '#') c = UI_ORANGE;
+            if (marker) c = UI_ORANGE;
+            else if (s < le && t[s] == '#') c = UI_ORANGE;
             else if (s + 1 < le && t[s] == '/' && t[s + 1] == '/') c = UI_MUTED;
             DrawText(Slice(t + p, le - p), (int)(textX - ed.scrollX), (int)y, FS, c);
+            if (marker == 1 && !readOnly) {                  /* one-click ways to settle this clash */
+                const char *opts[3] = {"Keep yours", "Keep theirs", "Keep both"};
+                int lx = (int)(area.x + area.width) - 16;
+                for (int o = 2; o >= 0; o--) {
+                    int ow = MeasureText(opts[o], FS);
+                    lx -= ow;
+                    Rectangle hit = {(float)lx - 6, y - 2, (float)ow + 12, LH};
+                    bool hh = Hover(hit) && Hover(area);
+                    DrawRectangleRec(hit, hh ? (Color){56, 139, 253, 90} : (Color){13, 17, 23, 230});
+                    DrawText(opts[o], lx, (int)y, FS, o == 0 ? (Color){120, 180, 255, 255} : o == 1 ? UI_GREENT : UI_TEXT);
+                    if (hh) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+                    if (hh && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) { fixAt = p; fixHow = o; clickUsed = true; }
+                    lx -= 20;
+                }
+            }
 
             if (line == curLine && ed.focused && ((int)(GetTime() * 2) % 2) == 0) {
                 int cx = (int)(textX - ed.scrollX) + MeasureN(t + p, ed.cursor - p, FS);
@@ -3195,6 +3540,10 @@ static bool EditorUI(WorkFile *f, Rectangle area, bool readOnly)
         line++;
     }
     EndScissorMode();
+    if (fixAt >= 0 && ResolveConflict(f, fixAt, fixHow)) {
+        changed = true;
+        ed.cursor = fixAt <= f->len ? fixAt : f->len;
+    }
     return changed;
 }
 
@@ -4052,7 +4401,7 @@ static void Unfocus(void)
     tfSearch.active = tfName.active = tfDesc.active = false;
     tfNewFile.active = tfCommit.active = tfIssue.active = false;
     tfUser.active = tfPass.active = tfPass2.active = tfCode.active = false;
-    tfUpPath.active = tfUpMsg.active = tfInvite.active = tfEmail.active = false;
+    tfUpPath.active = tfUpMsg.active = tfInvite.active = tfEmail.active = tfBranch.active = false;
     tfOldPass.active = tfNewPass.active = tfNewPass2.active = tfDelPass.active = false;
     ed.focused = false;
     armedId = 0;
@@ -5966,10 +6315,10 @@ static const char *WriteZip(const char *path, const char *folder, OutFile *files
             ent[e].crc = Crc32(data, len);
         }
         /* try to squeeze it */
-        unsigned char *packed = NULL;
-        int packedLen = 0;
-        if (len > 0) packed = CompressData(data, len, &packedLen);
-        bool usePacked = packed && packedLen > 0 && packedLen < len;
+        Buf pk = {0};
+        bool usePacked = len > 64 && RawDeflate(data, (size_t)len, &pk, (size_t)len - 8);
+        const unsigned char *packed = pk.d;
+        int packedLen = (int)pk.n;
         ent[e].method = usePacked ? 8 : 0;
         ent[e].csize = (uint32_t)(usePacked ? packedLen : len);
 
@@ -5982,7 +6331,7 @@ static const char *WriteZip(const char *path, const char *folder, OutFile *files
         Put16(f, (unsigned)nameLen); Put16(f, 0);
         fwrite(ent[e].name, 1, (size_t)nameLen, f);
         if (ent[e].csize) ok = fwrite(usePacked ? packed : data, 1, ent[e].csize, f) == ent[e].csize;
-        if (packed) MemFree(packed);
+        BufFree(&pk);
         if (!isFolder) count++;
     }
 
@@ -6440,12 +6789,24 @@ static ForkState GetForkState(Repo *r)
     int slot = (int)(r - repos) % 8;
     if (memo[slot].r == r && memo[slot].p == p && memo[slot].rg == r->gen && memo[slot].pg == p->gen &&
         memo[slot].rc == r->commitCount && memo[slot].pc == p->commitCount && memo[slot].s.up == s.up) return memo[slot].s;
-    for (int k = 0; k < p->commitCount; k++) {
-        if (CommitBySha(r, p->commits[k].sha) >= 0) s.base = k;
-        else s.behind++;
+    /* compares the two default branches: what's in one's history and not the other's */
+    uint8_t *mp = calloc((size_t)p->commitCount + 1, 1), *mr = calloc((size_t)r->commitCount + 1, 1);
+    if (mp && mr) {
+        MarkAnc(p, DefaultTip(p), mp, 1);
+        MarkAnc(r, DefaultTip(r), mr, 1);
+        for (int k = 0; k < p->commitCount; k++) {
+            if (!mp[k]) continue;
+            int there = CommitBySha(r, p->commits[k].sha);
+            if (there >= 0 && mr[there]) s.base = k;
+            else s.behind++;
+        }
+        for (int k = 0; k < r->commitCount; k++) {
+            if (!mr[k]) continue;
+            int there = CommitBySha(p, r->commits[k].sha);
+            if (there < 0 || !mp[there]) s.ahead++;
+        }
     }
-    for (int k = 0; k < r->commitCount; k++)
-        if (CommitBySha(p, r->commits[k].sha) < 0) s.ahead++;
+    free(mp); free(mr);
     s.related = s.base >= 0 || !r->forkBase[0] || !p->commitCount || !r->commitCount;
     memo[slot].r = r; memo[slot].p = p; memo[slot].rg = r->gen; memo[slot].pg = p->gen;
     memo[slot].rc = r->commitCount; memo[slot].pc = p->commitCount; memo[slot].s = s;
@@ -6484,19 +6845,24 @@ static bool CopyCommit(Repo *dst, Repo *src, int ci)
     return true;
 }
 
-/* Copies every commit of src that dst doesn't have, oldest first.
+/* Copies every commit of src that dst doesn't have, oldest first: all of
+   them, or only the history of commit "tip" (if it isn't -1).
    If it fails part way, dst goes back to how it was. */
-static bool CopyMissing(Repo *dst, Repo *src)
+static bool CopyMissing(Repo *dst, Repo *src, int tip)
 {
     int before = dst->commitCount;
+    uint8_t *m = NULL;
+    if (tip >= 0) { m = calloc((size_t)src->commitCount + 1, 1); if (!m) return false; MarkAnc(src, tip, m, 1); }
     for (int k = 0; k < src->commitCount; k++)
-        if (!CopyCommit(dst, src, k)) {
+        if ((!m || m[k]) && !CopyCommit(dst, src, k)) {
+            free(m);
             while (dst->commitCount > before) FreeCommit(&dst->commits[--dst->commitCount]);
             MapFree(&dst->commitMap);
             for (int j = 0; j < dst->commitCount; j++) MapPut(&dst->commitMap, dst->commits[j].sha, j);
             dst->gen++;
             return false;
         }
+    free(m);
     return true;
 }
 
@@ -6518,12 +6884,15 @@ static void TryForkRepo(int orig)
     r->forkOwner = p->owner;
     snprintf(r->forkName, NAME_LEN, "%s", p->name);
     snprintf(r->branch, NAME_LEN, "%s", p->branch);
-    if (p->commitCount) ShaHex(Head(p)->sha, r->forkBase); else r->forkBase[0] = 0;
-    if (!CopyMissing(r, p)) {
+    if (p->branchCount) ShaHex(p->commits[DefaultTip(p)].sha, r->forkBase); else r->forkBase[0] = 0;
+    if (!CopyMissing(r, p, -1)) {
         DeleteRepo(repoCount - 1);
         Toast("Couldn't copy that repository - it's too big");
         return;
     }
+    for (int b = 0; b < p->branchCount; b++)                 /* every branch comes too */
+        AddBranch(r, p->branches[b].name, CommitBySha(r, p->commits[p->branches[b].tip].sha));
+    r->defBranch = r->curBranch = p->defBranch;
     MarkDirty();
     OpenRepo(repoCount - 1);
     Toast(TextFormat("Forked %s / %s - this copy is yours to change", UserName(p->owner), p->name));
@@ -6558,10 +6927,15 @@ static const char *SyncFork(Repo *r, char *done, int doneCap)
     int behind = s.behind;
 
     /* 1) fast-forward: you haven't committed anything of your own, so just copy their new commits */
+    int ptip = DefaultTip(p);
     if (s.ahead == 0) {
         if (r->commitCount + behind > MAX_COMMITS) return "This fork has reached its commit limit";
-        if (!CopyMissing(r, p)) return "This fork is out of storage space";
-        ShaHex(Head(p)->sha, r->forkBase);
+        if (!CopyMissing(r, p, ptip)) return "This fork is out of storage space";
+        int nt = CommitBySha(r, p->commits[ptip].sha);
+        if (r->branchCount) r->branches[r->defBranch].tip = nt;
+        else { AddBranch(r, DefBranchName(p), nt); r->defBranch = r->curBranch = 0; }
+        r->gen++;
+        ShaHex(p->commits[ptip].sha, r->forkBase);
         snprintf(done, (size_t)doneCap, "Synced: copied %d commit%s from %s", behind, behind == 1 ? "" : "s", who);
         return NULL;
     }
@@ -6572,7 +6946,7 @@ static const char *SyncFork(Repo *r, char *done, int doneCap)
             ours   = this fork now
           If only one side changed the file, take that side. If both made the
           same change, fine. If both changed it differently, that's a conflict. */
-    Commit *cb = s.base >= 0 ? &p->commits[s.base] : NULL, *ct = Head(p), *co = Head(r);
+    Commit *cb = s.base >= 0 ? &p->commits[s.base] : NULL, *ct = &p->commits[ptip], *co = &r->commits[DefaultTip(r)];
     static const char *names[MAX_FILES * 3];
     static char pick[MAX_FILES * 3];      /* 'o' ours, 't' theirs */
     int nn = 0;
@@ -6603,8 +6977,8 @@ static const char *SyncFork(Repo *r, char *done, int doneCap)
     if (r->commitCount + behind + 1 > MAX_COMMITS) return "This fork has reached its commit limit";
 
     /* bring their commits in too (a merge commit points at both sides, so git needs both) */
-    int ourHead = r->commitCount - 1;
-    if (!CopyMissing(r, p)) return "This fork is out of storage space";
+    int ourHead = DefaultTip(r);
+    if (!CopyMissing(r, p, ptip)) return "This fork is out of storage space";
     int theirHead = CommitBySha(r, ct->sha);
     co = &r->commits[ourHead];                                         /* the list may have moved */
 
@@ -6633,9 +7007,358 @@ static const char *SyncFork(Repo *r, char *done, int doneCap)
     if (CommitTree(r, &c, tree, NULL, NULL))
         c.raw = MakeRawCommit(tree, par, 2, UserName(curUser), UserEmail(curUser), c.time, c.message, &c.rawLen);
     if (!c.raw || !AppendCommit(r, &c)) { FreeCommit(&c); return "Couldn't save the merge commit"; }
+    r->branches[r->defBranch].tip = r->commitCount - 1;
     ShaHex(ct->sha, r->forkBase);
     if (!changesOurs) snprintf(done, (size_t)doneCap, "Up to date: you already had everything from %s", who);
     else snprintf(done, (size_t)doneCap, "Merged %d commit%s from %s into a new commit", behind, behind == 1 ? "" : "s", who);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Branches and merging                                               */
+/*                                                                    */
+/* A branch is just a name pointing at a commit. Making a new branch  */
+/* costs nothing: it starts at the commit you're on, and moves on by  */
+/* itself as you commit to it. Merging brings one branch's work into  */
+/* another with a "merge commit" that has both tips as parents - so    */
+/* the history (and the graph) shows exactly where the two joined.    */
+/* ------------------------------------------------------------------ */
+
+/* Marks commit tip and every commit it was built on with bit. */
+static void MarkAnc(Repo *r, int tip, uint8_t *mark, uint8_t bit)
+{
+    if (tip < 0) return;
+    int *st = malloc(((size_t)r->commitCount + 1) * sizeof(int)), n = 0;
+    if (!st) return;
+    st[n++] = tip;
+    while (n) {
+        int k = st[--n];
+        if (mark[k] & bit) continue;
+        mark[k] |= bit;
+        for (int q = 0; q < r->commits[k].parentCount; q++) {
+            int p = r->commits[k].parents[q];
+            if (!(mark[p] & bit) && n < r->commitCount) st[n++] = p;
+        }
+    }
+    free(st);
+}
+/* Is commit a part of b's history (or b itself)? */
+static bool IsAncestor(Repo *r, int a, int b)
+{
+    if (a < 0 || b < 0) return false;
+    if (a == b) return true;
+    if (a > b) return false;                         /* parents always come earlier in the list */
+    uint8_t *m = calloc((size_t)r->commitCount, 1);
+    if (!m) return false;
+    MarkAnc(r, b, m, 1);
+    bool yes = m[a] != 0;
+    free(m);
+    return yes;
+}
+/* The newest commit both a and b are built on: where the two lines of work split. */
+static int MergeBase(Repo *r, int a, int b)
+{
+    uint8_t *m = calloc((size_t)r->commitCount + 1, 1);
+    if (!m) return -1;
+    MarkAnc(r, a, m, 1);
+    MarkAnc(r, b, m, 2);
+    int best = -1;
+    for (int k = r->commitCount - 1; k >= 0 && best < 0; k--) if (m[k] == 3) best = k;   /* later in the list = newer */
+    free(m);
+    return best;
+}
+/* How many commits a has that b doesn't (b may be -1). */
+static int CountAhead(Repo *r, int a, int b)
+{
+    uint8_t *m = calloc((size_t)r->commitCount + 1, 1);
+    if (!m) return 0;
+    MarkAnc(r, a, m, 1);
+    MarkAnc(r, b, m, 2);
+    int n = 0;
+    for (int k = 0; k < r->commitCount; k++) if (m[k] == 1) n++;
+    free(m);
+    return n;
+}
+
+/* After a branch is deleted, the commits no branch leads to any more are let go
+   (the list is closed up and every reference to a position is updated). */
+static void PruneUnreachable(Repo *r)
+{
+    int n = r->commitCount;
+    uint8_t *m = calloc((size_t)n + 1, 1);
+    int *to = malloc(((size_t)n + 1) * sizeof(int));
+    if (!m || !to) { free(m); free(to); return; }
+    for (int b = 0; b < r->branchCount; b++) MarkAnc(r, r->branches[b].tip, m, 1);
+    int k2 = 0;
+    for (int k = 0; k < n; k++) {
+        if (!m[k]) { FreeCommit(&r->commits[k]); to[k] = -1; continue; }
+        to[k] = k2;
+        r->commits[k2] = r->commits[k];
+        for (int q = 0; q < r->commits[k2].parentCount; q++) r->commits[k2].parents[q] = to[r->commits[k2].parents[q]];
+        k2++;
+    }
+    if (k2 != n) {
+        r->commitCount = k2;
+        for (int b = 0; b < r->branchCount; b++) r->branches[b].tip = to[r->branches[b].tip];
+        MapFree(&r->commitMap);
+        for (int k = 0; k < k2; k++) MapPut(&r->commitMap, r->commits[k].sha, k);
+        r->gen++;
+    }
+    free(m); free(to);
+}
+
+/* Git's rules for a branch name, kept simple: letters, digits and - _ . /
+   (so "feature/login" works), no "..", no "//", not starting or ending with / or . */
+static const char *BranchNameProblem(const char *n)
+{
+    size_t len = strlen(n);
+    if (!len) return "Type a name for the branch";
+    if (len >= NAME_LEN) return "That name is too long";
+    for (size_t i = 0; i < len; i++) {
+        char c = n[i];
+        if (!(isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '/')) return "Branch names can use letters, numbers and - _ . /";
+    }
+    if (n[0] == '/' || n[0] == '.' || n[0] == '-' || n[len - 1] == '/' || n[len - 1] == '.' ||
+        strstr(n, "..") || strstr(n, "//") || strstr(n, "/.") || (len >= 5 && strcmp(n + len - 5, ".lock") == 0) || strcmp(n, "HEAD") == 0)
+        return "That isn't a name git allows for a branch";
+    return NULL;
+}
+
+/* A new branch starting at the commit you're on; you move onto it. */
+static const char *CreateBranch(Repo *r, const char *name)
+{
+    const char *bad = BranchNameProblem(name);
+    if (bad) return bad;
+    if (!r->branchCount) return "Make the first commit before making branches";
+    if (FindBranch(r, name) >= 0) return TextFormat("There's already a branch called %s", name);
+    for (int b = 0; b < r->branchCount; b++) {             /* git can't have "a" and "a/b" both */
+        size_t l = strlen(r->branches[b].name), nl = strlen(name);
+        if ((l < nl && strncmp(name, r->branches[b].name, l) == 0 && name[l] == '/') ||
+            (nl < l && strncmp(r->branches[b].name, name, nl) == 0 && r->branches[b].name[nl] == '/'))
+            return TextFormat("That name clashes with the branch %s", r->branches[b].name);
+    }
+    int b = AddBranch(r, name, HeadIndex(r));
+    if (b < 0) return TextFormat("A repository can have up to %d branches", MAX_BRANCHES);
+    r->curBranch = b;
+    r->gen++;
+    return NULL;
+}
+
+/* Deletes a branch (never the default one). Its commits stay if another branch leads to them. */
+static const char *DeleteBranch(Repo *r, int b)
+{
+    if (b < 0 || b >= r->branchCount) return "No such branch";
+    if (b == r->defBranch) return "The default branch can't be deleted";
+    RemoveDrafts(r, -1, r->branches[b].name);
+    memmove(&r->branches[b], &r->branches[b + 1], (size_t)(r->branchCount - b - 1) * sizeof(Branch));
+    r->branchCount--;
+    if (r->defBranch > b) r->defBranch--;
+    if (r->curBranch == b) r->curBranch = r->defBranch;
+    else if (r->curBranch > b) r->curBranch--;
+    PruneUnreachable(r);
+    r->gen++;
+    return NULL;
+}
+
+/* ---------- merging two versions of a text file, line by line ----------
+   The classic "three-way merge": compare each side with the common starting
+   version (base). Lines that are the same in all three are fixed points;
+   between two fixed points, if only one side changed something, take that
+   side; if both made the very same change, fine; if they changed it in
+   different ways, that's a conflict - both are kept, between git's markers:
+       <<<<<<< main
+       (your lines)
+       =======
+       (their lines)
+       >>>>>>> feature */
+static void MapLines(const char *base, const char *other, int nb, int *map)
+{
+    for (int i = 0; i < nb; i++) map[i] = -1;
+    ComputeDiff(base, other, NULL, NULL);
+    for (int i = 0; i < dOpCount; i++) if (dOps[i].kind == ' ' && dOps[i].a < nb) map[dOps[i].a] = dOps[i].b;
+}
+static bool SameLines(LineRef *a, int a0, int a1, LineRef *b, int b0, int b1)
+{
+    if (a1 - a0 != b1 - b0) return false;
+    for (int i = 0; i < a1 - a0; i++) if (!SameLine(a[a0 + i], b[b0 + i])) return false;
+    return true;
+}
+static void AddLines(Buf *o, LineRef *l, int from, int to)
+{
+    for (int i = from; i < to; i++) { BufAdd(o, l[i].s, (size_t)l[i].n); BufByte(o, '\n'); }
+}
+static bool EndsNL(const char *t, int n) { return n > 0 && t[n - 1] == '\n'; }
+
+/* Returns the merged text (malloc'd, NUL-terminated); *conflicts gets how many clashing places. */
+static char *MergeText(const char *bt, int bn, const char *ot, int on, const char *tt, int tn,
+                       const char *ourName, const char *theirName, int *outLen, int *conflicts)
+{
+    LineRef *B = NULL, *O = NULL, *T = NULL;
+    int bc = 0, oc = 0, tcap = 0;
+    int nB = SplitLines(bt, &B, &bc), nO = SplitLines(ot, &O, &oc), nT = SplitLines(tt, &T, &tcap);
+    int *mO = malloc(((size_t)nB + 1) * sizeof(int)), *mT = malloc(((size_t)nB + 1) * sizeof(int));
+    Buf out = {0};
+    *conflicts = 0;
+    if (mO && mT) {
+        MapLines(bt, ot, nB, mO);
+        MapLines(bt, tt, nB, mT);
+        int pb = -1, po = -1, pt = -1;
+        for (int i = 0; i <= nB; i++) {
+            if (i < nB && (mO[i] < 0 || mT[i] < 0 || mO[i] <= po || mT[i] <= pt)) continue;   /* not a fixed point */
+            int oi = i < nB ? mO[i] : nO, ti = i < nB ? mT[i] : nT;
+            int b0 = pb + 1, o0 = po + 1, t0 = pt + 1;
+            bool oSame = SameLines(O, o0, oi, B, b0, i), tSame = SameLines(T, t0, ti, B, b0, i);
+            if (oSame)                                    AddLines(&out, T, t0, ti);    /* only they changed it  */
+            else if (tSame || SameLines(O, o0, oi, T, t0, ti)) AddLines(&out, O, o0, oi);    /* only you, or the same */
+            else {                                                                       /* both, differently     */
+                (*conflicts)++;
+                BufStr(&out, "<<<<<<< "); BufStr(&out, ourName); BufByte(&out, '\n');
+                AddLines(&out, O, o0, oi);
+                BufStr(&out, "=======\n");
+                AddLines(&out, T, t0, ti);
+                BufStr(&out, ">>>>>>> "); BufStr(&out, theirName); BufByte(&out, '\n');
+            }
+            if (i < nB) AddLines(&out, B, i, i + 1);
+            pb = i; po = oi; pt = ti;
+        }
+        /* does the file end with a newline? take whichever side changed that */
+        bool eb = EndsNL(bt, bn), eo = EndsNL(ot, on), et = EndsNL(tt, tn);
+        bool want = eo == eb ? et : eo;
+        if (!want && out.n > 0 && out.d[out.n - 1] == '\n' && !*conflicts) out.n--;
+    }
+    free(B); free(O); free(T); free(mO); free(mT);
+    BufByte(&out, 0);
+    if (out.oom) { BufFree(&out); return NULL; }
+    *outLen = (int)out.n - 1;
+    return (char *)out.d;
+}
+
+/* Does this text still have a conflict marker at the start of a line? */
+static bool HasMarkers(const char *t, int n)
+{
+    for (int i = 0; i + 8 <= n; i++)
+        if ((i == 0 || t[i - 1] == '\n') && memcmp(t + i, "<<<<<<< ", 8) == 0) return true;
+    return false;
+}
+
+/* What happened in the last merge, for the message shown afterwards. */
+static int mergeConflictFiles, mergeAutoFiles;
+static char mergeNote[TEXT_LEN];
+
+/* Merges branch "from" into the branch you're on.
+   No clashes: a merge commit is made straight away. Clashes: the merged
+   files go into your draft, the clashing places marked, and the merge is
+   finished when you commit. Returns NULL (and *done) or an error. */
+static const char *MergeBranch(Repo *r, int from, char *done, int doneCap)
+{
+    if (from < 0 || from >= r->branchCount || from == r->curBranch) return "Pick another branch to merge";
+    char ours[NAME_LEN], theirs[NAME_LEN];
+    snprintf(ours, sizeof ours, "%s", CurBranchName(r));
+    snprintf(theirs, sizeof theirs, "%s", r->branches[from].name);
+    int o = HeadIndex(r), t = r->branches[from].tip;
+    if (IsAncestor(r, t, o)) return TextFormat("Nothing to merge - %s already has everything from %s", ours, theirs);
+    Draft *d = GetDraft(r, curUser, false);
+    if (d && d->merging) return "Finish (or abort) the merge you've started first";
+    DraftTidy(r, curUser);
+    int ch, cf;
+    DraftCounts(r, curUser, &ch, &cf);
+    if (ch || cf) return TextFormat("Commit or undo your changes on %s first", ours);
+    if (r->commitCount >= MAX_COMMITS) return "This repository has reached its commit limit";
+
+    int base = MergeBase(r, o, t);
+    Commit *cb = base >= 0 ? &r->commits[base] : NULL, *co = &r->commits[o], *ct = &r->commits[t];
+    Snap all = {0}, res;
+    for (int sd = 0; sd < 3; sd++) {                       /* every path on any side */
+        Commit *c = sd == 0 ? co : sd == 1 ? ct : cb;
+        for (int j = 0; c && j < c->fileCount; j++)
+            if (SnapFind(&all, c->names[j]) < 0 && !SnapSet(&all, c->names[j], 0, 0)) { SnapFree(&all); return "Out of memory"; }
+    }
+    if (!SnapFrom(&res, co)) { SnapFree(&all); return "Out of memory"; }
+    /* conflicting texts wait here until we know whether there are any */
+    typedef struct { const char *name; char *text; int len; } Clash;
+    Clash *clash = NULL;
+    int ncl = 0, ccap = 0, auto_ = 0, kept = 0;
+    const char *err = NULL;
+    for (int q = 0; q < all.n && !err; q++) {
+        const char *nm = all.names[q];
+        Version b = VersionIn(r, cb, nm), vt = VersionIn(r, ct, nm), vo = VersionIn(r, co, nm);
+        if (SameVersion(vo, vt) || SameVersion(b, vt)) continue;                       /* nothing new from them */
+        if (SameVersion(b, vo)) {                                                       /* only they changed it  */
+            if (!vt.has) { SnapRemove(&res, nm); continue; }
+            int bl = InternBlob(r, vt.data, vt.len);
+            if (bl < 0 || !SnapSet(&res, nm, bl, vt.mode)) err = "This repository is out of storage space";
+            continue;
+        }
+        /* both changed it */
+        if (!vo.has || !vt.has) { kept++; if (!vo.has) { int bl = InternBlob(r, vt.data, vt.len); if (bl < 0 || !SnapSet(&res, nm, bl, vt.mode)) err = "Out of space"; } continue; }  /* deleted on one side: keep the changed one */
+        if (LooksBinary(vo.data, vo.len) || LooksBinary(vt.data, vt.len)) { kept++; continue; }   /* can't merge pictures: keep yours */
+        int ml = 0, nc = 0;
+        char *m = MergeText(b.has ? b.data : "", b.len, vo.data, vo.len, vt.data, vt.len, ours, theirs, &ml, &nc);
+        if (!m) { err = "Out of memory"; break; }
+        if (nc) {
+            clash = GrowArr(clash, &ccap, ncl + 1, sizeof(Clash));
+            if (ncl < ccap) clash[ncl++] = (Clash){nm, m, ml}; else free(m);
+            continue;
+        }
+        auto_++;
+        int bl = InternBlob(r, m, ml);
+        free(m);
+        if (bl < 0 || !SnapSet(&res, nm, bl, vo.mode)) err = "This repository is out of storage space";
+    }
+    SnapFree(&all);
+    const char *clashName = !err ? PathClash(res.names, res.n) : NULL;
+    if (clashName && !err) err = TextFormat("Can't merge: %s would be both a file and a folder", clashName);
+    if (err) { SnapFree(&res); for (int i = 0; i < ncl; i++) free(clash[i].text); free(clash); return err; }
+
+    mergeConflictFiles = ncl; mergeAutoFiles = auto_;
+    mergeNote[0] = 0;
+    if (kept) snprintf(mergeNote, sizeof mergeNote, " (%d file%s changed on both sides couldn't be combined - kept %s's version)", kept, kept == 1 ? "" : "s", ours);
+    char msg[TEXT_LEN];
+    snprintf(msg, sizeof msg, "Merge branch '%s' into %s", theirs, ours);
+    if (!ncl) {                                              /* clean: commit it now */
+        if (!FinishCommit(r, &res, msg, t)) return "Couldn't save the merge commit";
+        snprintf(done, (size_t)doneCap, "Merged %s into %s%s%s", theirs, ours,
+                 auto_ ? TextFormat(" - %d file%s changed on both sides were combined line by line", auto_, auto_ == 1 ? "" : "s") : "", mergeNote);
+        return NULL;
+    }
+    /* clashes: everything the merge changes goes into your draft, and you finish it by committing */
+    d = GetDraft(r, curUser, true);
+    if (!d) { SnapFree(&res); for (int i = 0; i < ncl; i++) free(clash[i].text); free(clash); return "Too many drafts in this repository"; }
+    int ri = 0, hi = 0;
+    while (ri < res.n || hi < co->fileCount) {               /* res vs your head, side by side (both sorted) */
+        int c = ri >= res.n ? 1 : hi >= co->fileCount ? -1 : strcmp(res.names[ri], co->names[hi]);
+        if (c == 0) {
+            if (res.blobs[ri] != co->blobs[hi]) { WorkFile *e = DraftEdit(r, curUser, res.names[ri]); if (e) WF_SetN(e, r->blobs[res.blobs[ri]].data, r->blobs[res.blobs[ri]].len); }
+            ri++; hi++;
+        } else if (c < 0) { WorkFile *e = DraftEdit(r, curUser, res.names[ri]); if (e) WF_SetN(e, r->blobs[res.blobs[ri]].data, r->blobs[res.blobs[ri]].len); ri++; }
+        else { WorkFile *e = DraftEdit(r, curUser, co->names[hi]); if (e) e->deleted = true; hi++; }
+    }
+    for (int i = 0; i < ncl; i++) {
+        WorkFile *e = DraftEdit(r, curUser, clash[i].name);
+        if (e) { e->deleted = false; WF_SetN(e, clash[i].text, clash[i].len); }
+        free(clash[i].text);
+    }
+    free(clash);
+    SnapFree(&res);
+    d = GetDraft(r, curUser, false);
+    d->merging = true;
+    memcpy(d->mergeSha, ct->sha, 20);
+    snprintf(d->mergeName, NAME_LEN, "%s", theirs);
+    snprintf(done, (size_t)doneCap, "%d file%s clashes - fix the marked parts, then commit to finish the merge", ncl, ncl == 1 ? " has" : "s have");
+    return NULL;
+}
+
+/* Gives up on a merge with clashes: back to how your branch was. */
+static void AbortMerge(Repo *r)
+{
+    DraftClear(r, curUser);
+}
+/* The first of your files that still has conflict markers, or NULL. */
+static const char *MarkersLeft(Repo *r)
+{
+    Draft *d = GetDraft(r, curUser, false);
+    for (int i = 0; d && i < d->count; i++)
+        if (!d->files[i].deleted && !d->files[i].binary && HasMarkers(d->files[i].text, d->files[i].len)) return d->files[i].name;
     return NULL;
 }
 
@@ -6692,6 +7415,7 @@ static void CodeMenu(Repo *r, bool draw)
     Vector2 mouse = GetMousePosition();
 
     if (!draw) {
+        hoverBlock = m; hoverBlocked = true;
         if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
         if (CheckCollisionPointRec(mouse, codeBtn)) return;            /* the button itself toggles it */
         if (!CheckCollisionPointRec(mouse, m)) { codeMenu = false; return; }
@@ -6705,6 +7429,7 @@ static void CodeMenu(Repo *r, bool draw)
         }
         return;
     }
+    hoverBlocked = false;
     DrawRectangleRounded((Rectangle){m.x + 3, m.y + 5, m.width, m.height}, 0.04f, 6, (Color){0, 0, 0, 110});
     DrawRectangleRounded(m, 0.04f, 6, (Color){22, 27, 34, 255});
     DrawRectangleRoundedLinesEx(m, 0.04f, 6, 1, UI_BORDER);
@@ -6730,9 +7455,261 @@ static void CodeMenu(Repo *r, bool draw)
     DrawText("Download ZIP", (int)(zip.x + (zip.width - MeasureText("Download ZIP", FS)) / 2), (int)zip.y + 10, FS, UI_TEXT);
 }
 
+/* ---------- the branch menu ---------- */
+static bool      branchMenu;            /* open?                                   */
+static Rectangle branchBtn;             /* the button it hangs from                */
+static bool      branchMenuClick;       /* this frame's click landed in the menu   */
+static float     scBranchMenu;
+
+/* How far ahead / behind the default branch each branch is (worked out again only when commits change). */
+static struct { const Repo *r; unsigned gen; int n; int ahead[MAX_BRANCHES], behind[MAX_BRANCHES]; } bstat;
+static void BranchStats(Repo *r)
+{
+    if (bstat.r == r && bstat.gen == r->gen && bstat.n == r->branchCount) return;
+    bstat.r = r; bstat.gen = r->gen; bstat.n = r->branchCount;
+    int d = DefaultTip(r);
+    for (int b = 0; b < r->branchCount; b++) {
+        bstat.ahead[b]  = CountAhead(r, r->branches[b].tip, d);
+        bstat.behind[b] = CountAhead(r, d, r->branches[b].tip);
+    }
+}
+
+static void SwitchBranch(Repo *r, int b)
+{
+    if (b < 0 || b >= r->branchCount || b == r->curBranch) return;
+    r->curBranch = b;
+    ForgetScratch();
+    scFiles = 0;
+    Unfocus();
+    Toast(TextFormat("Switched to branch %s", r->branches[b].name));
+}
+
+/* A little "branch" picture: two dots joined by a line that forks. */
+static void DrawBranchIcon(float x, float y, Color c)
+{
+    DrawLineEx((Vector2){x, y - 7}, (Vector2){x, y + 7}, 2, c);
+    DrawLineBezier((Vector2){x, y + 3}, (Vector2){x + 8, y - 5}, 2, c);
+    DrawCircle((int)x, (int)y + 7, 3, c);
+    DrawCircle((int)x + 8, (int)y - 6, 3, c);
+    DrawCircle((int)x, (int)y - 7, 3, c);
+}
+
+/* The button showing the branch you're on; clicking opens the menu. */
+static void BranchButton(Repo *r, Rectangle b)
+{
+    branchBtn = b;
+    bool hot = Hover(b);
+    if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+    DrawRectangleRounded(b, 0.25f, 6, hot || branchMenu ? ColorBrightness(UI_BTN, 0.15f) : UI_BTN);
+    DrawRectangleRoundedLinesEx(b, 0.25f, 6, 1, UI_BORDER);
+    DrawBranchIcon(b.x + 14, b.y + b.height / 2, UI_MUTED);
+    const char *name = r->branchCount ? CurBranchName(r) : TextFormat("%s (no commits yet)", r->branch);
+    DrawFit(name, (int)b.x + 34, (int)(b.y + (b.height - FS) / 2), FS, (int)b.width - 60, UI_TEXT);
+    float cx = b.x + b.width - 16, cy = b.y + b.height / 2;
+    DrawTriangle((Vector2){cx - 5, cy - 2}, (Vector2){cx, cy + 4}, (Vector2){cx + 5, cy - 2}, UI_MUTED);
+    if (Clicked(b)) { branchMenu = !branchMenu; codeMenu = false; scBranchMenu = 0; TF_Clear(&tfBranch); }
+}
+
+/* Like the Code menu: called with draw = false early in the frame (it takes
+   its clicks before the page under it), and with draw = true at the end. */
+static void BranchMenu(Repo *r, bool draw)
+{
+    if (!branchMenu) { branchMenuClick = false; return; }
+    bool edit = CanEdit(r) && r->branchCount;
+    float w = 560, rowH = 40, top = branchBtn.y + branchBtn.height + 6;
+    float footer = edit ? 98 : 0;
+    float listH = r->branchCount * rowH, maxList = (float)H - top - 60 - footer - 50;
+    if (maxList < rowH * 3) maxList = rowH * 3;
+    if (listH > maxList) listH = maxList;
+    if (!r->branchCount) listH = 64;
+    Rectangle m = {branchBtn.x, top, w, 50 + listH + footer + 8};
+    if (m.x + m.width > W - 20) m.x = W - 20 - m.width;
+    Vector2 mouse = GetMousePosition();
+
+    if (!draw) {
+        branchMenuClick = false;
+        hoverBlock = m; hoverBlocked = true;
+        if (!IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) return;
+        if (CheckCollisionPointRec(mouse, branchBtn)) return;
+        if (!CheckCollisionPointRec(mouse, m)) { branchMenu = false; return; }
+        branchMenuClick = true;
+        clickUsed = true;                                    /* the page under the menu doesn't get it */
+        return;
+    }
+    clickUsed = !branchMenuClick;                            /* the menu's own buttons can use this click */
+    hoverBlocked = false;
+    DrawRectangleRounded((Rectangle){m.x + 3, m.y + 5, m.width, m.height}, 0.03f, 6, (Color){0, 0, 0, 110});
+    DrawRectangleRounded(m, 0.03f, 6, (Color){22, 27, 34, 255});
+    DrawRectangleRoundedLinesEx(m, 0.03f, 6, 1, UI_BORDER);
+    DrawBold("Branches", (int)m.x + 16, (int)m.y + 14, FS, UI_TEXT);
+    if (r->branchCount > 1) {
+        const char *cmp = TextFormat("ahead / behind %s", DefBranchName(r));
+        DrawText(cmp, (int)(m.x + m.width - 16 - MeasureText(cmp, FS)), (int)m.y + 14, FS, UI_MUTED);
+    }
+    Rectangle la = {m.x + 1, m.y + 46, m.width - 2, listH};
+    if (!r->branchCount) {
+        DrawText("No branches yet - the first commit makes one.", (int)la.x + 15, (int)la.y + 12, FS, UI_MUTED);
+    } else {
+        BranchStats(r);
+        ScrollArea(la, &scBranchMenu, r->branchCount * rowH);
+        /* default first, then the most recently changed */
+        int order[MAX_BRANCHES], n = r->branchCount;
+        for (int i = 0; i < n; i++) order[i] = i;
+        for (int i = 0; i < n; i++)
+            for (int j = i + 1; j < n; j++) {
+                int a = order[i], b = order[j];
+                bool swap = b == r->defBranch || (a != r->defBranch && r->commits[r->branches[b].tip].time > r->commits[r->branches[a].tip].time);
+                if (swap) { order[i] = b; order[j] = a; }
+            }
+        BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
+        int act = -1, actKind = 0;                           /* what got clicked: 1 switch, 2 merge, 3 default, 4 delete */
+        for (int i = 0; i < n; i++) {
+            int b = order[i];
+            Rectangle row = {la.x, la.y + i * rowH - scBranchMenu, la.width - 12, rowH};
+            if (row.y + rowH < la.y || row.y > la.y + la.height) continue;
+            bool hot = CheckCollisionPointRec(mouse, row) && CheckCollisionPointRec(mouse, la);
+            bool cur = b == r->curBranch;
+            if (hot) DrawRectangleRec(row, UI_HOVER);
+            if (cur) DrawRectangle((int)row.x, (int)row.y + 6, 3, (int)rowH - 12, uiAccent);
+            DrawBranchIcon(row.x + 18, row.y + rowH / 2, cur ? UI_TEXT : UI_MUTED);
+            int nx = (int)row.x + 38;
+            const char *name = r->branches[b].name;
+            float right = row.x + row.width - 12;
+            /* buttons when hovering a row you can act on */
+            float bx = right;
+            if (hot && edit) {
+                if (b != r->defBranch) {
+                    Rectangle del = {bx - 76, row.y + 6, 76, 28};
+                    if (ConfirmButton(del, "Delete", "Sure?", 40 + b)) { act = b; actKind = 4; }
+                    bx -= 84;
+                }
+                if (IsMine(r) && b != r->defBranch) {
+                    Rectangle df = {bx - 92, row.y + 6, 92, 28};
+                    if (ButtonEx(df, "Default", UI_BTN, true)) { act = b; actKind = 3; }
+                    bx -= 100;
+                }
+                if (!cur) {
+                    const char *ml = TextFormat("Merge into %s", CurBranchName(r));
+                    float mw = (float)MeasureText(ml, FS) + 24;
+                    if (mw > 230) { ml = "Merge in here"; mw = (float)MeasureText(ml, FS) + 24; }
+                    Rectangle mb = {bx - mw, row.y + 6, mw, 28};
+                    if (ButtonEx(mb, ml, UI_GREEN, true)) { act = b; actKind = 2; }
+                    bx -= mw + 8;
+                }
+            } else if (b != r->defBranch) {
+                const char *ab = !bstat.ahead[b] && !bstat.behind[b] ? "same as default"
+                               : TextFormat("%d ahead  |  %d behind", bstat.ahead[b], bstat.behind[b]);
+                DrawText(ab, (int)(right - MeasureText(ab, FS)), (int)row.y + 10, FS, UI_MUTED);
+                bx = right - MeasureText(ab, FS) - 12;
+            }
+            int maxW = (int)(bx - nx - (b == r->defBranch ? 90 : 10));
+            if (cur) DrawBold(TextFormat("%s", name), nx, (int)row.y + 10, FS, UI_TEXT);
+            DrawFit(name, nx, (int)row.y + 10, FS, maxW, cur ? UI_TEXT : UI_LINK);
+            if (b == r->defBranch) {
+                int lw = MeasureText(name, FS); if (lw > maxW) lw = maxW;
+                Rectangle pill = {(float)(nx + lw + 10), row.y + 9, (float)MeasureText("default", FS) + 16, 23};
+                DrawRectangleRounded(pill, 0.5f, 6, UI_BTN);
+                DrawText("default", (int)pill.x + 8, (int)pill.y + 2, FS, UI_MUTED);
+            }
+            if (hot) wantCursor = MOUSE_CURSOR_POINTING_HAND;
+            if (hot && act < 0 && Clicked(row)) { act = b; actKind = 1; }
+        }
+        EndScissorMode();
+        DrawScrollbar(la, scBranchMenu, r->branchCount * rowH);
+        if (actKind == 1) { SwitchBranch(r, act); branchMenu = false; }
+        else if (actKind == 3) { r->defBranch = act; r->gen++; MarkDirty(); Toast(TextFormat("%s is now the default branch", r->branches[act].name)); }
+        else if (actKind == 4) {
+            char nm[NAME_LEN];
+            snprintf(nm, sizeof nm, "%s", r->branches[act].name);
+            const char *err = DeleteBranch(r, act);
+            Toast(err ? err : TextFormat("Deleted branch %s", nm));
+            if (!err) { ForgetScratch(); MarkDirty(); }
+        } else if (actKind == 2) {
+            char done[TEXT_LEN * 2] = "";
+            const char *err = MergeBranch(r, act, done, sizeof done);
+            branchMenu = false;
+            if (err) Toast(err);
+            else {
+                Toast(done);
+                ForgetScratch();
+                MarkDirty();
+                Draft *d = GetDraft(r, curUser, false);
+                if (d && d->merging) {                        /* clashes: off to the Code tab to fix them */
+                    snprintf(tfCommit.buf, TEXT_LEN, "Merge branch '%s' into %s", d->mergeName, CurBranchName(r));
+                    tfCommit.len = (int)strlen(tfCommit.buf);
+                    tab = TAB_CODE; screen = SCR_REPO;
+                    const char *first = MarkersLeft(r);
+                    if (first) SelectFileName(first);
+                }
+            }
+        }
+    }
+    /* make a new branch from the one you're on */
+    if (edit && branchMenu) {
+        float fy = m.y + 46 + listH + 10;
+        DrawLine((int)m.x + 1, (int)fy - 4, (int)(m.x + m.width - 1), (int)fy - 4, UI_BORDER);
+        DrawText(TextFormat("New branch, starting from %s:", CurBranchName(r)), (int)m.x + 16, (int)fy + 6, FS, UI_MUTED);
+        bool enter = TextFieldUI(&tfBranch, (Rectangle){m.x + 16, fy + 36, w - 32 - 170, 40}, "e.g. feature/dark-mode");
+        if (Button((Rectangle){m.x + w - 16 - 160, fy + 36, 160, 40}, "Create branch", UI_GREEN) || enter) {
+            char nm[NAME_LEN];
+            snprintf(nm, sizeof nm, "%.*s", NAME_LEN - 1, tfBranch.buf);
+            for (char *c = nm; *c; c++) if (*c == ' ') *c = '-';
+            const char *err = CreateBranch(r, nm);
+            if (err) Toast(err);
+            else { Toast(TextFormat("Made branch %s - you're on it now", nm)); TF_Clear(&tfBranch); branchMenu = false; ForgetScratch(); MarkDirty(); }
+        }
+    }
+    if (branchMenuClick) {                                   /* only the menu's own box keeps focus */
+        bool keep = tfBranch.active;
+        Unfocus();
+        tfBranch.active = keep;
+    }
+    clickUsed = true;
+}
+
+/* While a merge with clashes is being finished: what's left to do, and a way out. */
+static float DrawMergeBanner(Repo *r, Rectangle bar)
+{
+    Draft *d = GetDraft(r, curUser, false);
+    if (!d || !d->merging) return 0;
+    const char *left = MarkersLeft(r);
+    int nLeft = 0;
+    for (int i = 0; i < d->count; i++)
+        if (!d->files[i].deleted && !d->files[i].binary && HasMarkers(d->files[i].text, d->files[i].len)) nLeft++;
+    Color edge = nLeft ? UI_ORANGE : UI_GREENT;
+    DrawRectangleRec(bar, nLeft ? (Color){74, 40, 18, 255} : (Color){18, 52, 30, 255});
+    DrawRectangleLinesEx(bar, 1, edge);
+    const char *msg = nLeft ? TextFormat("Merging %s into %s: %d file%s to fix, then commit", d->mergeName, CurBranchName(r),
+                                         nLeft, nLeft == 1 ? "" : "s")
+                            : TextFormat("Merging %s into %s: all fixed - commit to finish", d->mergeName, CurBranchName(r));
+    float bw = 150, nw = nLeft ? 130 : 0;
+    DrawFit(msg, (int)bar.x + 14, (int)bar.y + 10, FS, (int)(bar.width - 28 - bw - nw - 16), UI_TEXT);
+    if (nLeft && Button((Rectangle){bar.x + bar.width - 8 - bw - 8 - nw, bar.y + 4, nw, bar.height - 8}, "Next clash", UI_BTN)) {
+        /* the next clashing file after the open one (round to the start) */
+        const char *pick = left;
+        bool after = false;
+        for (int i = 0; i < d->count; i++) {
+            WorkFile *e = &d->files[i];
+            if (e->deleted || e->binary || !HasMarkers(e->text, e->len)) continue;
+            if (after) { pick = e->name; break; }
+            if (strcmp(e->name, selName) == 0) after = true;
+        }
+        SelectFileName(pick);
+    }
+    if (ConfirmButton((Rectangle){bar.x + bar.width - 8 - bw, bar.y + 4, bw, bar.height - 8}, "Abort merge", "Sure? Undo it", 60)) {
+        AbortMerge(r);
+        TF_Clear(&tfCommit);
+        ForgetScratch();
+        MarkDirty();
+        Toast("Merge aborted - your branch is as it was");
+    }
+    return bar.height;
+}
+
 static bool DrawRepoHeader(Repo *r, int activeTab)
 {
-    CodeMenu(r, false);                    /* the open menu takes its clicks first */
+    CodeMenu(r, false);                    /* the open menus take their clicks first */
+    BranchMenu(r, false);
     int x = 20, y = 72;
     const char *owner = UserName(r->owner);
     int w1 = MeasureText(owner, 30), w2 = MeasureText(" / ", 30), w3 = MeasureText(r->name, 30);
@@ -6750,7 +7727,9 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
 
     /* next to the badge: how many people have forked this */
     int forks = ForkCount(r), ix = (int)(pill.x + pill.width + 16);
-    if (forks && W - 570 - ix > 80) DrawText(TextFormat("%d fork%s", forks, forks == 1 ? "" : "s"), ix, y + 5, FS, UI_MUTED);
+    const char *extra = TextFormat("%d branch%s%s", r->branchCount, r->branchCount == 1 ? "" : "es",
+                                   forks ? TextFormat("   %d fork%s", forks, forks == 1 ? "" : "s") : "");
+    if (r->branchCount && W - 570 - ix > MeasureText(extra, FS)) DrawText(extra, ix, y + 5, FS, UI_MUTED);
 
     /* under the name: "forked from owner / name" (click to open the original), then the description */
     int dx = x, dmax = W - 400;
@@ -6779,7 +7758,7 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
         MarkDirty();
     }
     codeBtn = (Rectangle){(float)W - (mine ? 550 : 360), (float)y, 180, 38};
-    if (Button(codeBtn, codeMenu ? "Code  ^" : "Code  v", UI_GREEN)) codeMenu = !codeMenu;
+    if (Button(codeBtn, codeMenu ? "Code  ^" : "Code  v", UI_GREEN)) { codeMenu = !codeMenu; branchMenu = false; }
     if (!mine) {                       /* you can't fork your own repository - you already own it */
         int myFork = FindForkOf(curUser, curRepo);
         if (Button((Rectangle){(float)W - 550, (float)y, 180, 38},
@@ -7477,7 +8456,7 @@ static void TabCode(Repo *r)
     Rectangle lp = {20, top, 260, bottom - top};
     DrawRectangleRec(lp, UI_PANEL);
     DrawRectangleLinesEx(lp, 1, UI_BORDER);
-    DrawBold("Files", (int)lp.x + 14, (int)top + 12, FS, UI_TEXT);
+    BranchButton(r, (Rectangle){lp.x + 8, top + 6, lp.width - 16, 32});      /* which branch the files are from */
     DrawFileList(r, (Rectangle){lp.x + 1, top + 44, lp.width - 2, lp.height - 44 - (edit ? 156 : 4)});
 
     if (edit) {
@@ -7519,7 +8498,8 @@ static void TabCode(Repo *r)
 
     /* ---- right: the language breakdown, then the editor (or a viewer) + bottom bar ---- */
     BuildLanguages(r, edit ? curUser : -1);
-    DrawLanguageBar((Rectangle){300, top, (float)W - 320, 40});
+    if (!(edit && DrawMergeBanner(r, (Rectangle){300, top, (float)W - 320, 40})))
+        DrawLanguageBar((Rectangle){300, top, (float)W - 320, 40});
     Rectangle rp  = {300, top + 48, (float)W - 320, bottom - top - 48};
     Rectangle fh  = {rp.x, rp.y, rp.width, 42};
     Rectangle edr = {rp.x, rp.y + 42, rp.width, rp.height - 42 - 62};
@@ -7859,6 +8839,7 @@ static void CommitGraph(Repo *r, Rectangle la)
     if (first < 0) first = 0;
     if (last > n - 1) last = n - 1;
     int hov = -1;
+    bool pillHover = false;
     Vector2 mouse = GetMousePosition();
 
     BeginScissorMode((int)la.x + 1, (int)la.y + 1, (int)la.width - 14, (int)la.height - 2);
@@ -7893,7 +8874,11 @@ static void CommitGraph(Repo *r, Rectangle la)
         Color lc = LaneColor(graph.rows[i].col);
         if (c->parentCount > 1) { DrawCircle((int)cx, (int)cy, 7, lc); DrawCircle((int)cx, (int)cy, 4, (Color){22, 27, 34, 255}); }   /* merges: a ring */
         else DrawCircle((int)cx, (int)cy, 6, lc);
-        if (ci == n - 1) DrawCircleLines((int)cx, (int)cy, 10, lc);                                          /* the latest */
+        for (int b = 0; b < r->branchCount; b++)                                                             /* a branch's newest commit */
+            if (r->branches[b].tip == ci) {
+                DrawCircleLines((int)cx, (int)cy, 10, lc);
+                if (b == r->curBranch) DrawCircleLines((int)cx, (int)cy, 11, lc);
+            }
     }
     EndScissorMode();
     BeginScissorMode((int)la.x + 1, (int)la.y + 1, (int)la.width - 14, (int)la.height - 2);
@@ -7903,11 +8888,31 @@ static void CommitGraph(Repo *r, Rectangle la)
         Commit *c = &r->commits[ci];
         float y = la.y + 4 + i * rowH - scGraph;
         float tx = textX;
-        if (ci == n - 1) {                                   /* the branch name on the latest commit */
-            int bw = MeasureText(r->branch, FS) + 16;
-            DrawRectangleRounded((Rectangle){tx, y + 6, (float)bw, 24}, 0.5f, 6, (Color){35, 134, 54, 90});
-            DrawText(r->branch, (int)tx + 8, (int)y + 8, FS, UI_GREENT);
-            tx += bw + 10;
+        /* a name tag for each branch whose newest commit this is: the one you're on is filled in */
+        for (int b = 0; b < r->branchCount; b++) {
+            if (r->branches[b].tip != ci) continue;
+            const char *nm = r->branches[b].name;
+            bool cur = b == r->curBranch, def = b == r->defBranch;
+            int bw = MeasureText(nm, FS) + 16 + (cur ? 18 : 0);
+            if (tx + bw > la.x + la.width * 0.75f) break;
+            Rectangle pill = {tx, y + 6, (float)bw, 24};
+            Color base = def ? UI_GREENT : UI_LINK;
+            bool ph = CheckCollisionPointRec(mouse, pill) && Hover(la);
+            DrawRectangleRounded(pill, 0.5f, 6, cur ? Alpha(base, ph ? 0.55f : 0.40f) : Alpha(base, ph ? 0.30f : 0.16f));
+            DrawRectangleRoundedLinesEx(pill, 0.5f, 6, 1, Alpha(base, 0.8f));
+            if (cur) DrawCircle((int)tx + 12, (int)y + 18, 4, UI_TEXT);              /* you are here */
+            DrawText(nm, (int)tx + 8 + (cur ? 18 : 0), (int)y + 8, FS, cur ? UI_TEXT : base);
+            if (ph) {
+                pillHover = true;
+                wantCursor = MOUSE_CURSOR_POINTING_HAND;
+                BranchStats(r);
+                SetTip(TextFormat("%s%s", nm, def ? "  (default branch)" : ""),
+                       def ? TextFormat("%s", cur ? "You're on this branch" : "The branch git clone gives you")
+                           : TextFormat("%d commit%s ahead of %s, %d behind", bstat.ahead[b], bstat.ahead[b] == 1 ? "" : "s", DefBranchName(r), bstat.behind[b]),
+                       cur ? "You're working on this branch" : "Click to switch to this branch");
+                if (Clicked(pill)) SwitchBranch(r, b);
+            }
+            tx += bw + 8;
         }
         float right = la.x + la.width - 24;
         const char *when = TimeAgo(c->time);
@@ -7929,7 +8934,7 @@ static void CommitGraph(Repo *r, Rectangle la)
     EndScissorMode();
     DrawScrollbar(la, scGraph, n * rowH + 8);
 
-    if (hov >= 0) {
+    if (hov >= 0 && !pillHover) {
         wantCursor = MOUSE_CURSOR_POINTING_HAND;
         int ci = graph.order[hov];
         if (Clicked((Rectangle){la.x, la.y, la.width - 14, la.height})) { OpenCommit(ci); return; }
@@ -7937,11 +8942,28 @@ static void CommitGraph(Repo *r, Rectangle la)
     }
 }
 
+/* The commits in the current branch's history, newest first (kept until the commits or the branch change). */
+static struct { const Repo *r; unsigned gen; int tip, count, n, cap; int *idx; } hist;
+static void BuildHistory(Repo *r)
+{
+    int tip = HeadIndex(r);
+    if (hist.r == r && hist.gen == r->gen && hist.tip == tip && hist.count == r->commitCount) return;
+    hist.r = r; hist.gen = r->gen; hist.tip = tip; hist.count = r->commitCount; hist.n = 0;
+    uint8_t *m = calloc((size_t)r->commitCount + 1, 1);
+    hist.idx = GrowArr(hist.idx, &hist.cap, r->commitCount + 1, sizeof(int));
+    if (!m || hist.cap <= r->commitCount) { free(m); return; }
+    MarkAnc(r, tip, m, 1);
+    for (int k = r->commitCount - 1; k >= 0; k--) if (m[k]) hist.idx[hist.n++] = k;
+    free(m);
+}
+
 static void TabCommits(Repo *r)
 {
-    int n = r->commitCount;
-    /* Graph or List */
-    if (n) {
+    int total = r->commitCount;
+    BuildHistory(r);
+    int n = hist.n;
+    /* Graph or List, and which branch */
+    if (total) {
         const char *labels[2] = {"List", "Graph"};
         float bx = 20;
         for (int v = 0; v < 2; v++) {
@@ -7950,14 +8972,17 @@ static void TabCommits(Repo *r)
             if (ButtonEx(b, labels[v], on ? UI_BLUE : UI_BTN, true) && !on) commitsView = v;
             bx += 118;
         }
+        BranchButton(r, (Rectangle){bx + 8, 184, 260, 34});
         int merges = 0;
-        for (int k = 0; k < n; k++) if (r->commits[k].parentCount > 1) merges++;
-        const char *info = TextFormat("%d commit%s on %s%s", n, n == 1 ? "" : "s", r->branch,
-                                      merges ? TextFormat(", %d merge%s", merges, merges == 1 ? "" : "s") : "");
-        DrawText(info, W - 20 - MeasureText(info, FS), 191, FS, UI_MUTED);
+        for (int k = 0; k < total; k++) if (r->commits[k].parentCount > 1) merges++;
+        const char *info = commitsView == 1
+            ? TextFormat("%d commit%s on %d branch%s%s", total, total == 1 ? "" : "s", r->branchCount, r->branchCount == 1 ? "" : "es",
+                         merges ? TextFormat(", %d merge%s", merges, merges == 1 ? "" : "s") : "")
+            : TextFormat("%d commit%s in %s's history", n, n == 1 ? "" : "s", CurBranchName(r));
+        if (W - 20 - MeasureText(info, FS) > bx + 290) DrawText(info, W - 20 - MeasureText(info, FS), 191, FS, UI_MUTED);
         if (commitsView == 1) { CommitGraph(r, (Rectangle){20, 230, (float)W - 40, (float)H - 250}); return; }
     }
-    Rectangle la = {20, n ? 230.0f : 186.0f, (float)W - 40, (float)H - (n ? 250 : 206)};
+    Rectangle la = {20, total ? 230.0f : 186.0f, (float)W - 40, (float)H - (total ? 250 : 206)};
     float rowH = 74;
     ScrollArea(la, &scCommits, n * rowH);
     if (!n) {
@@ -7967,7 +8992,7 @@ static void TabCommits(Repo *r)
     }
     BeginScissorMode((int)la.x, (int)la.y, (int)la.width, (int)la.height);
     for (int k = 0; k < n; k++) {
-        int ci = n - 1 - k;
+        int ci = hist.idx[k];
         Commit *c = &r->commits[ci];
         Rectangle row = {la.x, la.y + k * rowH - scCommits, la.width - 12, rowH};
         if (row.y > la.y + la.height || row.y + row.height < la.y) continue;
@@ -7982,7 +9007,7 @@ static void TabCommits(Repo *r)
         Rectangle idPill = {row.x + row.width - 120, row.y + 20, 102, 34};
         DrawRectangleRounded(idPill, 0.3f, 6, UI_BTN);
         DrawText(c->id, (int)idPill.x + 12, (int)idPill.y + 7, FS, UI_LINK);
-        if (ci == n - 1) {
+        if (k == 0) {
             Rectangle latest = {row.x + row.width - 220, row.y + 22, 88, 30};
             DrawRectangleRounded(latest, 0.5f, 6, (Color){35, 134, 54, 90});
             DrawText("latest", (int)latest.x + 14, (int)latest.y + 5, FS, UI_GREENT);
@@ -8685,16 +9710,43 @@ typedef struct { int obj; CommitInfo info; PList files; int state; } PCommit;
 static const char *ApplyPush(Repo *r, int pusher, const uint8_t old[20], const uint8_t nw[20], const char *ref, PackSet *ps, int *added)
 {
     *added = 0;
-    Commit *h = Head(r);
     if (strncmp(ref, "refs/tags/", 10) == 0) return "Mini GitHub doesn't keep tags";
     if (strncmp(ref, "refs/heads/", 11) != 0) return "only branches can be pushed";
     const char *br = ref + 11;
-    if (h && strcmp(br, r->branch) != 0)
-        return TextFormat("Mini GitHub keeps one branch, \"%s\" - push with: git push origin HEAD:%s", r->branch, r->branch);
-    if (memcmp(nw, ZERO_SHA, 20) == 0) return "the branch can't be deleted";
+    const char *bad = BranchNameProblem(br);
+    if (bad) return "Mini GitHub can't use that branch name (letters, numbers and - _ . / only)";
+    int bi = FindBranch(r, br);
+    Commit *h = bi >= 0 ? &r->commits[r->branches[bi].tip] : NULL;    /* the branch's tip now (NULL = a new branch) */
     if (memcmp(old, h ? h->sha : ZERO_SHA, 20) != 0) return "fetch first - someone else pushed or committed in the meantime";
+    if (memcmp(nw, ZERO_SHA, 20) == 0) {                     /* git push --delete */
+        if (bi < 0) return NULL;
+        if (bi == r->defBranch) return "the default branch can't be deleted (choose another default in Mini GitHub first)";
+        const char *e = DeleteBranch(r, bi);
+        if (!e) *added = -1;                                 /* "something changed" */
+        return e;
+    }
     if (h && memcmp(nw, h->sha, 20) == 0) return NULL;          /* nothing new */
-    if (!h && (!br[0] || strlen(br) >= NAME_LEN || strchr(br, '/'))) return "please push to a simple branch name such as main";
+    if (bi < 0) {
+        if (r->branchCount >= MAX_BRANCHES) return "this repository has as many branches as it can hold";
+        for (int b = 0; b < r->branchCount; b++) {           /* git can't have "a" and "a/b" both */
+            size_t l = strlen(r->branches[b].name), nl = strlen(br);
+            if ((l < nl && strncmp(br, r->branches[b].name, l) == 0 && br[l] == '/') ||
+                (nl < l && strncmp(r->branches[b].name, br, nl) == 0 && r->branches[b].name[nl] == '/'))
+                return "that name clashes with an existing branch";
+        }
+    }
+    {   /* pushing a commit Mini GitHub already has (e.g. a new branch at an existing commit) */
+        int known = CommitBySha(r, nw);
+        if (known >= 0) {
+            if (h && !IsAncestor(r, (int)(h - r->commits), known))
+                return "the push doesn't build on this branch's latest commit - pull first (git pull), then push again";
+            if (bi >= 0) r->branches[bi].tip = known;
+            else { bi = AddBranch(r, br, known); if (r->branchCount == 1) r->defBranch = r->curBranch = 0; }
+            r->gen++;
+            *added = -1;
+            return NULL;
+        }
+    }
 
     /* 1) find every new commit, oldest first (each one after the commits it's built on) */
     PCommit *pc = NULL;
@@ -8726,7 +9778,15 @@ static const char *ApplyPush(Repo *r, int pusher, const uint8_t old[20], const u
                 uint8_t ps1[20];                              /* a copy: pc[] may move as it grows */
                 memcpy(ps1, pc[i].info.parents[q], 20);
                 if (h && memcmp(ps1, h->sha, 20) == 0) reachedHead = true;
-                if (CommitBySha(r, ps1) >= 0 || MapGet(&seen, ps1) >= 0) continue;
+                int kn = CommitBySha(r, ps1);
+                if (kn >= 0) { if (h && !reachedHead && IsAncestor(r, (int)(h - r->commits), kn)) reachedHead = true; continue; }
+                int sp = MapGet(&seen, ps1);
+                if (sp >= 0) {
+                    /* already found, but not placed yet: it must be placed before this one, so
+                       it goes on top of the pile again (the copy further down is skipped later) */
+                    if (pc[sp].state == 0) PUSH_STACK(sp);
+                    continue;
+                }
                 int o = MapGet(&ps->map, ps1);
                 if (o < 0 || ps->o[o].type != OBJ_COMMIT) {
                     err = h ? "the push doesn't build on Mini GitHub's latest commit - pull first (git pull), then push again"
@@ -8759,6 +9819,20 @@ static const char *ApplyPush(Repo *r, int pusher, const uint8_t old[20], const u
         goto done;
     }
     if (r->commitCount + on > MAX_COMMITS) { err = "the repository would have too many commits"; goto done; }
+
+    /* every commit must come after the ones it's built on - check before storing anything */
+    {
+        int *pos = malloc(((size_t)pcn + 1) * sizeof(int));
+        if (!pos) { err = "out of memory"; goto done; }
+        for (int k = 0; k < on; k++) pos[order[k]] = k;
+        for (int k = 0; k < on && !err; k++)
+            for (int q = 0; q < pc[order[k]].info.np; q++) {
+                int sp = MapGet(&seen, pc[order[k]].info.parents[q]);
+                if (sp >= 0 && pos[sp] >= k) { err = "Mini GitHub put the commits in the wrong order (a bug) - nothing was stored"; break; }
+            }
+        free(pos);
+        if (err) goto done;
+    }
 
     /* 2) unfold each commit's folders, and check every file is there */
     for (int k = 0; k < on; k++) {
@@ -8814,7 +9888,11 @@ static const char *ApplyPush(Repo *r, int pusher, const uint8_t old[20], const u
                 c.names[j] = e->path; c.blobs[j] = b; c.modes[j] = e->mode;
             }
             if (err) { FreeCommit(&c); break; }
-            for (int q = 0; q < pcm->info.np && q < 2; q++) c.parents[q] = CommitBySha(r, pcm->info.parents[q]);
+            for (int q = 0; q < pcm->info.np && q < 2; q++) {
+                c.parents[q] = CommitBySha(r, pcm->info.parents[q]);
+                if (c.parents[q] < 0) err = "Mini GitHub put the commits in the wrong order (a bug) - nothing was stored";
+            }
+            if (err) { FreeCommit(&c); break; }
             c.parentCount = pcm->info.np < 2 ? pcm->info.np : 2;
             c.time = pcm->info.atime;
             snprintf(c.message, TEXT_LEN, "%s", pcm->info.summary);
@@ -8824,7 +9902,15 @@ static const char *ApplyPush(Repo *r, int pusher, const uint8_t old[20], const u
             if (!AppendCommit(r, &c)) { FreeCommit(&c); err = "the repository has too many commits"; break; }
             (*added)++;
         }
-        if (!h && *added) snprintf(r->branch, NAME_LEN, "%s", br);
+        if (!err && *added) {                                  /* the branch moves to the pushed commit */
+            int tip = CommitBySha(r, nw);
+            if (bi >= 0) r->branches[bi].tip = tip;
+            else {
+                bi = AddBranch(r, br, tip);
+                if (r->branchCount == 1) { r->defBranch = r->curBranch = 0; snprintf(r->branch, NAME_LEN, "%s", br); }
+            }
+            r->gen++;
+        }
     }
 
 done:
@@ -9278,9 +10364,9 @@ static void Reply(Conn *c, int code, const char *type, const uint8_t *body, size
 {
     char head[640];
     int hn = snprintf(head, sizeof head,
-                      "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nCache-Control: no-cache\r\n"
+                      "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %llu\r\nCache-Control: no-cache\r\n"
                       "Connection: close\r\nServer: Mini-GitHub\r\n%s\r\n",
-                      code, Status(code), type, n, extra ? extra : "");
+                      code, Status(code), type, (unsigned long long)n, extra ? extra : "");
     BufAdd(&c->out, head, (size_t)hn);
     BufAdd(&c->out, body, n);
     c->replied = true;
@@ -9465,23 +10551,33 @@ static void InfoRefs(Conn *c, Req *q, Repo *r, bool push)
     char hx[41], line[512];
     PktStr(&b, push ? "# service=git-receive-pack\n" : "# service=git-upload-pack\n");
     PktFlush(&b);
-    Commit *h = Head(r);
     char caps[256];
-    if (push) snprintf(caps, sizeof caps, "report-status no-thin ofs-delta %s", GIT_AGENT);
-    else      snprintf(caps, sizeof caps, "multi_ack_detailed symref=HEAD:refs/heads/%s %s", r->branch, GIT_AGENT);
-    if (!h) {
+    if (push) snprintf(caps, sizeof caps, "report-status delete-refs no-thin ofs-delta %s", GIT_AGENT);
+    else      snprintf(caps, sizeof caps, "multi_ack_detailed symref=HEAD:refs/heads/%s %s", DefBranchName(r), GIT_AGENT);
+    if (!r->branchCount) {
         int n = snprintf(line, sizeof line, "%040d capabilities^{}%c%s\n", 0, 0, caps);
         Pkt(&b, line, (size_t)n);
     } else {
-        ShaHex(h->sha, hx);
+        /* the default branch as HEAD (for clone), then every branch, in name order */
+        int order[MAX_BRANCHES];
+        for (int i = 0; i < r->branchCount; i++) order[i] = i;
+        for (int i = 0; i < r->branchCount; i++)
+            for (int j = i + 1; j < r->branchCount; j++)
+                if (strcmp(r->branches[order[j]].name, r->branches[order[i]].name) < 0) { int t = order[i]; order[i] = order[j]; order[j] = t; }
+        bool first = true;
         if (!push) {
+            ShaHex(r->commits[DefaultTip(r)].sha, hx);
             int n = snprintf(line, sizeof line, "%s HEAD%c%s\n", hx, 0, caps);
             Pkt(&b, line, (size_t)n);
-            n = snprintf(line, sizeof line, "%s refs/heads/%s\n", hx, r->branch);
+            first = false;
+        }
+        for (int i = 0; i < r->branchCount; i++) {
+            Branch *br = &r->branches[order[i]];
+            ShaHex(r->commits[br->tip].sha, hx);
+            int n = first ? snprintf(line, sizeof line, "%s refs/heads/%s%c%s\n", hx, br->name, 0, caps)
+                          : snprintf(line, sizeof line, "%s refs/heads/%s\n", hx, br->name);
             Pkt(&b, line, (size_t)n);
-        } else {
-            int n = snprintf(line, sizeof line, "%s refs/heads/%s%c%s\n", hx, r->branch, 0, caps);
-            Pkt(&b, line, (size_t)n);
+            first = false;
         }
     }
     PktFlush(&b);
@@ -9582,6 +10678,7 @@ static void ReceivePack(Conn *c, Req *q, Repo *r, int uid)
     } else {
         PktStr(&b, "unpack ok\n");
         int total = 0;
+        bool changed = false;
         for (int i = 0; i < nc; i++) {
             const char *why = NULL;
             int added = 0;
@@ -9590,13 +10687,15 @@ static void ReceivePack(Conn *c, Req *q, Repo *r, int uid)
             if (!why) why = ApplyPush(r, uid, cmds[i].old, cmds[i].nw, cmds[i].ref, &ps, &added);
             if (why) PktStr(&b, TextFormat("ng %s %s\n", cmds[i].ref, why));
             else     PktStr(&b, TextFormat("ok %s\n", cmds[i].ref));
-            total += added;
+            if (added) changed = true;
+            if (added > 0) total += added;
         }
-        if (total) {
+        if (changed) {
             MarkDirty();
             ForgetScratch();
             gitPushes++;
-            Toast(TextFormat("%s pushed %d commit%s to %s", UserName(uid), total, total == 1 ? "" : "s", r->name));
+            if (total) Toast(TextFormat("%s pushed %d commit%s to %s", UserName(uid), total, total == 1 ? "" : "s", r->name));
+            else       Toast(TextFormat("%s updated the branches of %s", UserName(uid), r->name));
         }
     }
     PktFlush(&b);
@@ -9752,6 +10851,78 @@ static void GitServerPoll(void)
     }
 }
 
+/* ---------- when the save file can't be read ----------
+   Nothing is deleted or saved over: the file stays exactly as it is until
+   you choose. Starting empty first moves it aside under a new name (never
+   replacing another file), so it can always be brought back. */
+static bool quitNow;
+
+/* "minigithub.dat.unreadable-2026-10-21-1103", or "...-2" etc. if that's taken */
+static const char *SetAsideName(void)
+{
+    static char nm[128];
+    time_t t = time(NULL);
+    char stamp[32];
+    strftime(stamp, sizeof stamp, "%Y-%m-%d-%H%M%S", localtime(&t));
+    snprintf(nm, sizeof nm, "%s.unreadable-%s", SAVE_FILE, stamp);
+    for (int i = 2; FileExists(nm) && i < 1000; i++) snprintf(nm, sizeof nm, "%s.unreadable-%s-%d", SAVE_FILE, stamp, i);
+    return nm;
+}
+
+static void AfterLoad(void)
+{
+    loadFailed = false;
+    GitServerStart();
+    if (userCount == 0) {
+        GoRegister();
+        if (OrphanCount() > 0) Toast("Create an account to take over your existing repositories");
+    } else GoLogin();
+}
+
+static void ScreenLoadFail(void)
+{
+    float w = W - 120 > 900 ? 900 : (float)W - 120;
+    Rectangle p = {((float)W - w) / 2, 100, w, (float)H - 160};
+    DrawRectangleRec(p, UI_PANEL);
+    DrawRectangleLinesEx(p, 1, UI_ORANGE);
+    int x = (int)p.x + 32, y = (int)p.y + 28, tw = (int)w - 64;
+    DrawBold("Mini GitHub couldn't read its save file", x, y, 30, UI_ORANGE);
+    y += 56;
+    y += WrapText("Nothing has been deleted, and nothing will be saved over it. The file is still there, exactly as it was:", x, y, tw, FS, UI_TEXT, true) + 8;
+    y += WrapText(TextFormat("%s   (in %s)", SAVE_FILE, GetWorkingDirectory()), x + 20, y, tw - 20, FS, UI_LINK, true) + 16;
+    y += WrapText(TextFormat("What went wrong: %s%s%s.", loadWhy, loadWhere[0] ? ", in " : "", loadWhere), x, y, tw, FS, UI_MUTED, true) + 16;
+    bool lastGood = FileExists(SAVE_FILE ".last-good");
+    if (lastGood)
+        y += WrapText("There's also a copy of your data from the last time Mini GitHub opened without problems (minigithub.dat.last-good).",
+                      x, y, tw, FS, UI_MUTED, true) + 16;
+    y += WrapText("If this file came from a newer version of Mini GitHub, quit and open it with that version instead.", x, y, tw, FS, UI_MUTED, true);
+
+    float by = p.y + p.height - 70, bx = p.x + 32;
+    if (Button((Rectangle){bx, by, 140, 44}, "Quit", UI_BTN)) quitNow = true;
+    bx += 156;
+    if (lastGood) {
+        if (ConfirmButton((Rectangle){bx, by, 330, 44}, "Use the last good copy", "Click again to use it", 70)) {
+            const char *aside = SetAsideName();
+            if (rename(SAVE_FILE, aside) != 0) { Toast("Couldn't move the unreadable file aside"); return; }
+            int sz = 0;
+            unsigned char *d = LoadFileData(SAVE_FILE ".last-good", &sz);
+            bool ok = d && SaveFileData(SAVE_FILE, d, sz);
+            if (d) UnloadFileData(d);
+            loadFailed = false;
+            if (ok && Load()) { AfterLoad(); Toast(TextFormat("Restored the last good copy - the unreadable file is kept as %s", GetFileName(aside))); }
+            else { rename(aside, SAVE_FILE); loadFailed = true; Toast("That copy couldn't be read either - nothing was changed"); }
+            return;
+        }
+        bx += 346;
+    }
+    if (ConfirmButton((Rectangle){bx, by, 300, 44}, "Start empty", "Click again to start empty", 71)) {
+        const char *aside = SetAsideName();
+        if (rename(SAVE_FILE, aside) != 0) { Toast("Couldn't move the unreadable file aside - nothing was changed"); return; }
+        AfterLoad();
+        Toast(TextFormat("Started empty - your old file is kept as %s", GetFileName(aside)));
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
@@ -9764,19 +10935,17 @@ int main(void)
     SetTargetFPS(60);
 
     Load();
-    GitServerStart();
-    if (userCount == 0) {
-        GoRegister();
-        if (OrphanCount() > 0) Toast("Create an account to take over your existing repositories");
-    } else GoLogin();
+    if (loadFailed) screen = SCR_LOADFAIL;     /* say so, and wait: nothing is saved until you choose */
+    else AfterLoad();
 
     float saveTimer = 0;
     int   lastCursor = -1;
 
-    while (!WindowShouldClose()) {
+    while (!WindowShouldClose() && !quitNow) {
         W = GetScreenWidth();
         H = GetScreenHeight();
         clickUsed  = false;
+        hoverBlocked = false;
         wantCursor = MOUSE_CURSOR_DEFAULT;
         float dt = GetFrameTime();
         GitServerPoll();
@@ -9815,7 +10984,7 @@ int main(void)
         }
 
         /* every screen except sign-in / sign-up needs someone signed in */
-        if (curUser < 0 && screen != SCR_LOGIN && screen != SCR_REGISTER && screen != SCR_FORGOT) GoLogin();
+        if (curUser < 0 && screen != SCR_LOGIN && screen != SCR_REGISTER && screen != SCR_FORGOT && screen != SCR_LOADFAIL) GoLogin();
         /* files waiting to be uploaded are let go once you leave the upload page */
         if (screen != SCR_UPLOAD && stagedCount) ClearStaged();
         /* the recovery code only stays in memory while its screen is open */
@@ -9826,8 +10995,8 @@ int main(void)
                             tfNewFile.active || tfCommit.active || tfIssue.active || tfUser.active ||
                             tfPass.active || tfPass2.active || tfOldPass.active || tfNewPass.active ||
                             tfNewPass2.active || tfDelPass.active || tfBio.active || tfAvatar.active || tfCode.active ||
-                            tfUpPath.active || tfUpMsg.active || tfInvite.active || tfEmail.active;
-            if (codeMenu) codeMenu = false;
+                            tfUpPath.active || tfUpMsg.active || tfInvite.active || tfEmail.active || tfBranch.active;
+            if (codeMenu || branchMenu) codeMenu = branchMenu = false;
             else if (anyFocus) Unfocus();
             else if (screen == SCR_FORGOT) GoLogin();
             else if (screen == SCR_RECOVERY) GoHome();
@@ -9845,6 +11014,7 @@ int main(void)
         DrawHeader();
 
         switch (screen) {
+        case SCR_LOADFAIL: ScreenLoadFail(); break;
         case SCR_LOGIN:    ScreenLogin();    break;
         case SCR_REGISTER: ScreenRegister(); break;
         case SCR_FORGOT:   ScreenForgot();   break;
@@ -9874,8 +11044,8 @@ int main(void)
         } break;
         }
 
-        if (screen == SCR_REPO || screen == SCR_COMMIT || screen == SCR_UPLOAD) CodeMenu(&repos[curRepo], true);
-        else codeMenu = false;
+        if (screen == SCR_REPO || screen == SCR_COMMIT || screen == SCR_UPLOAD) { CodeMenu(&repos[curRepo], true); BranchMenu(&repos[curRepo], true); }
+        else codeMenu = branchMenu = false;
         DrawTip();
         DrawToast();
         EndDrawing();
