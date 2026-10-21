@@ -1,0 +1,11 @@
+# Mini GitHub save files (account data - never commit)
+minigithub.dat*
+
+# Built program
+*.exe
+*.o
+*.obj
+minigithub
+
+# Fallback downloads folder
+downloads/
