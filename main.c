@@ -662,6 +662,8 @@ typedef struct {
     long long created;
     char      bio[TEXT_LEN];
     char      email[TEXT_LEN];       /* put on commits made here, so git shows it ("" = none set) */
+    int       claimCount;            /* other emails you've said are you ("That's me"): */
+    char      claims[8][TEXT_LEN];   /* commits made with them count as yours            */
     int       theme;                 /* one of THEME_...                  */
     int       avatarColor;           /* 0 = automatic, 1..8 = chosen      */
     char     *avatar;                /* profile picture: PNG as base64 text, or NULL */
@@ -979,6 +981,8 @@ static void WF_Free(WorkFile *f) { free(f->text); f->text = NULL; f->len = f->ca
 /* ------------------------------------------------------------------ */
 static const char *UserName(int id);
 static const char *UserEmail(int id);
+static bool IsOutsider(int id);
+static const char *AuthorLabel(int id);
 
 static Repo *NewRepo(int owner, const char *name, const char *desc)
 {
@@ -1329,6 +1333,7 @@ static bool SameTextCI(const char *a, const char *b, int n)
    git has if that's different (e.g. "Jo Lalor (jo)" for a pushed commit). */
 static const char *CommitAuthorName(Commit *c)
 {
+    if (IsOutsider(c->author)) return AuthorLabel(c->author);
     const char *u = UserName(c->author);
     const char *p = c->raw ? strstr(c->raw, "\nauthor ") : NULL;
     if (!p) return u;
@@ -1691,8 +1696,91 @@ static User *FindUserByName(const char *name)
     for (int i = 0; i < userCount; i++) if (EqualsCI(users[i].name, name)) return &users[i];
     return NULL;
 }
-/* Deleted accounts show up as "ghost", like on GitHub. */
-static const char *UserName(int id) { User *u = FindUserById(id); return u ? u->name : "ghost"; }
+/* ---------- people who aren't Mini GitHub users ----------
+   Commits pushed from elsewhere (a project from GitHub, say) were often made
+   by people with no account here. Each of them - told apart by their email -
+   gets a number of their own, below -10 so it can't be mixed up with an
+   account: author -10 is the first outsider, -11 the next, and so on.
+   They're worked out afresh from the commits each time Mini GitHub starts. */
+#define OUTSIDER_BASE 10
+typedef struct { char name[NAME_LEN]; char email[TEXT_LEN]; } Outsider;
+static Outsider *outsiders;
+static int       outsiderCount, outsiderCap;
+
+static bool IsOutsider(int id) { return id <= -OUTSIDER_BASE && -id - OUTSIDER_BASE < outsiderCount; }
+static Outsider *OutsiderOf(int id) { return IsOutsider(id) ? &outsiders[-id - OUTSIDER_BASE] : NULL; }
+static int OutsiderFor(const char *name, const char *email)
+{
+    for (int i = 0; i < outsiderCount; i++)
+        if (email[0] ? EqualsCI(outsiders[i].email, email) : (!outsiders[i].email[0] && strcmp(outsiders[i].name, name) == 0))
+            return -(OUTSIDER_BASE + i);
+    outsiders = GrowArr(outsiders, &outsiderCap, outsiderCount + 1, sizeof(Outsider));
+    if (outsiderCount >= outsiderCap) return -1;
+    snprintf(outsiders[outsiderCount].name, NAME_LEN, "%.*s", NAME_LEN - 1, name[0] ? name : "someone");
+    snprintf(outsiders[outsiderCount].email, TEXT_LEN, "%s", email);
+    return -(OUTSIDER_BASE + outsiderCount++);
+}
+
+/* Deleted accounts show up as "ghost", like on GitHub; outsiders by the name git has for them. */
+static const char *UserName(int id)
+{
+    Outsider *o = OutsiderOf(id);
+    if (o) return o->name;
+    User *u = FindUserById(id);
+    return u ? u->name : "ghost";
+}
+/* The same, saying when it isn't a Mini GitHub account: "Linus Torvalds (not a Mini GitHub user)". */
+static const char *AuthorLabel(int id)
+{
+    Outsider *o = OutsiderOf(id);
+    return o ? TextFormat("%s (not a Mini GitHub user)", o->name) : UserName(id);
+}
+
+/* Whose work is a commit by this git name + email? An account if:
+   - the email is the one in its profile, or one it has claimed ("That's me"),
+   - the email is the made-up one commits made here get (name@minigithub.local),
+   - the email is GitHub's private one for that username (12345+name@users.noreply.github.com),
+   - or the name is the account's username.
+   Otherwise -1: someone who isn't a Mini GitHub user. */
+static int UserForAuthor(const char *name, const char *email)
+{
+    for (int i = 0; i < userCount; i++) {
+        User *u = &users[i];
+        if (u->email[0] && EqualsCI(u->email, email)) return u->id;
+        for (int k = 0; k < u->claimCount; k++)
+            if (EqualsCI(u->claims[k], email) || (!strchr(u->claims[k], '@') && EqualsCI(u->claims[k], name))) return u->id;
+    }
+    for (int i = 0; i < userCount; i++) if (EqualsCI(email, TextFormat("%s@minigithub.local", users[i].name))) return users[i].id;
+    const char *at = strchr(email, '@');
+    if (at && EqualsCI(at, "@users.noreply.github.com")) {
+        const char *plus = memchr(email, '+', (size_t)(at - email));
+        const char *login = plus ? plus + 1 : email;
+        char lg[NAME_LEN];
+        snprintf(lg, sizeof lg, "%.*s", (int)(at - login), login);
+        for (int i = 0; i < userCount; i++) if (EqualsCI(users[i].name, lg)) return users[i].id;
+    }
+    for (int i = 0; i < userCount; i++) if (EqualsCI(users[i].name, name)) return users[i].id;
+    return -1;
+}
+
+/* Who made a commit, from the author git recorded in it: an account, or an outsider. */
+static int AuthorOfCommit(Commit *c)
+{
+    CommitInfo ci;
+    if (!c->raw || !ParseCommit(c->raw, c->rawLen, &ci)) return c->author;
+    if (EqualsCI(ci.aemail, "ghost@minigithub.local") && c->author >= 0) return c->author;   /* very old commits, claimed since */
+    int u = UserForAuthor(ci.aname, ci.aemail);
+    return u >= 0 ? u : OutsiderFor(ci.aname, ci.aemail);
+}
+
+/* Works out every commit's author again - after an account is made or deleted,
+   or someone says "That's me" or changes their email. */
+static void RecomputeAuthors(void)
+{
+    outsiderCount = 0;
+    for (int i = 0; i < repoCount; i++)
+        for (int k = 0; k < repos[i].commitCount; k++) repos[i].commits[k].author = AuthorOfCommit(&repos[i].commits[k]);
+}
 /* The email git puts on commits made here: the one set in your profile, or a made-up one. */
 static const char *UserEmail(int id)
 {
@@ -1815,7 +1903,7 @@ static int ClaimOrphans(int uid)
         n++;
         Draft *d = GetDraft(r, -1, false);
         if (d) d->user = uid;
-        for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author < 0) r->commits[k].author = uid;
+        for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author == -1) r->commits[k].author = uid;
         for (int k = 0; k < r->issueCount;  k++) if (r->issues[k].author  < 0) r->issues[k].author  = uid;
     }
     return n;
@@ -2646,7 +2734,7 @@ static void Save(void)
     if (loadFailed) return;                /* never write over a save file that couldn't be read */
     FILE *f = fopen(SAVE_FILE ".tmp", "wb");
     if (!f) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(f, "MINIGITHUB8\n");
+    fprintf(f, "MINIGITHUB9\n");
     WI(f, nextUserId);
     WS(f, lastUser);
     WI(f, userCount);
@@ -2656,6 +2744,8 @@ static void Save(void)
         WS(f, u->bio); WI(f, u->theme); WI(f, u->avatarColor); WS(f, u->avatar ? u->avatar : "");
         WS(f, u->rsalt); WS(f, u->rhash);
         WS(f, u->email);
+        WI(f, u->claimCount);
+        for (int k = 0; k < u->claimCount; k++) WS(f, u->claims[k]);
     }
     WI(f, repoCount);
     for (int i = 0; i < repoCount; i++) {
@@ -2793,7 +2883,7 @@ static bool Load(void)
     loadErr = 0; loadLine = 0; loadWhy[0] = 0; loadWhere[0] = 0;
     char magic[32] = {0};
     int ver = 0;
-    if (fscanf(f, "%31s", magic) == 1 && strncmp(magic, "MINIGITHUB", 10) == 0 && magic[10] >= '1' && magic[10] <= '8' && !magic[11])
+    if (fscanf(f, "%31s", magic) == 1 && strncmp(magic, "MINIGITHUB", 10) == 0 && magic[10] >= '1' && magic[10] <= '9' && !magic[11])
         ver = magic[10] - '0';
     if (!ver) {
         if (strncmp(magic, "MINIGITHUB", 10) == 0) snprintf(loadWhy, sizeof loadWhy, "it was made by a newer version of Mini GitHub");
@@ -2832,6 +2922,11 @@ static bool Load(void)
                 if (!none && (strlen(u->rsalt) != 32 || strlen(u->rhash) != 64)) LOADFAIL;
             }
             if (ver >= 7) RSInto(f, u->email, TEXT_LEN);
+            if (ver >= 9) {
+                int cc3 = (int)RI(f);
+                if (cc3 < 0 || cc3 > 8) LOADFAIL;
+                for (int k = 0; k < cc3 && !loadErr; k++) RSInto(f, u->claims[u->claimCount++], TEXT_LEN);
+            }
             if (u->id <= 0 || strlen(u->salt) != 32 || strlen(u->hash) != 64) LOADFAIL;
             if (u->id >= nextUserId) nextUserId = u->id + 1;
         }
@@ -4336,12 +4431,22 @@ static Color AvatarColor(int id)
 {
     User *u = FindUserById(id);
     if (u && u->avatarColor >= 1 && u->avatarColor <= 8) return AVATAR_COLORS[u->avatarColor - 1];
-    return AVATAR_COLORS[(id < 0 ? 0 : id) % 6];
+    return AVATAR_COLORS[(id < 0 ? -id : id) % 6];
 }
 
 /* The user's picture, or a coloured circle with the first letter of their name. */
 static void DrawAvatar(int id, int cx, int cy, int radius)
 {
+    if (IsOutsider(id)) {                  /* not a Mini GitHub user: a grey circle with a dotted edge */
+        const char *n = UserName(id);
+        char letter[2] = {(char)toupper((unsigned char)n[0]), 0};
+        int fs = radius >= 40 ? 60 : radius >= 24 ? 30 : 20;
+        DrawCircle(cx, cy, (float)radius, (Color){60, 66, 74, 255});
+        for (int a = 0; a < 360; a += 30) DrawCircleSector((Vector2){(float)cx, (float)cy}, (float)radius, (float)a, (float)a + 12, 4, (Color){110, 118, 129, 255});
+        DrawCircle(cx, cy, (float)radius - 2, (Color){60, 66, 74, 255});
+        if (radius >= 9) DrawText(letter, cx - MeasureText(letter, fs) / 2, cy - fs / 2 + 1, fs, (Color){200, 205, 212, 255});
+        return;
+    }
     User *u = FindUserById(id);
     if (u && AvatarTex(u)) {
         DrawTexturePro(u->tex, (Rectangle){0, 0, (float)u->tex.width, (float)u->tex.height},
@@ -4635,6 +4740,7 @@ static void DoRegister(void)
     SignIn(uid);
     int claimed = ClaimOrphans(uid);
     if (optExample && !claimed) SeedExample(uid);
+    RecomputeAuthors();                    /* commits made under this name now count as theirs */
     MarkDirty();
     ShowRecoveryCode(FindUserById(uid), false);
     Toast(claimed ? TextFormat("Welcome, %s - your existing repositories are now yours", nm)
@@ -4709,6 +4815,7 @@ static void DoDeleteAccount(void)
     int id = curUser;
     curUser = -1;
     DeleteAccount(id);
+    RecomputeAuthors();                    /* their commits now show as by someone outside Mini GitHub */
     if (EqualsCI(lastUser, nm)) lastUser[0] = 0;
     MarkDirty();
     if (userCount) GoLogin(); else GoRegister();
@@ -5199,6 +5306,7 @@ static void SettingsAccountTab(User *u, float top)
     if (make) ShowRecoveryCode(u, false);
 }
 
+static void SetTip(const char *a, const char *b, const char *c);
 /* ---------- Settings > Git ---------- */
 /* An email git can use: one @, no spaces or < > (they'd break git's author line). "" is fine (= none). */
 static bool UsableEmail(const char *e)
@@ -5234,7 +5342,7 @@ static void SettingsGitTab(User *u, float top)
             (int)x, (int)y + 176, FS, (int)fw, UI_MUTED);
 
     /* the email */
-    Rectangle b = {20, top + 238, (float)W - 40, 148};
+    Rectangle b = {20, top + 238, (float)W - 40, 186};
     DrawRectangleRec(b, UI_PANEL);
     DrawRectangleLinesEx(b, 1, UI_BORDER);
     x = b.x + 24; y = b.y;
@@ -5247,7 +5355,35 @@ static void SettingsGitTab(User *u, float top)
     bool changed = strcmp(tfEmail.buf, u->email) != 0;
     if (ButtonEx((Rectangle){x + fw - 140, y + 84, 140, 40}, "Save email", changed ? UI_GREEN : UI_BTN, changed) || (enter && changed)) {
         if (!UsableEmail(tfEmail.buf)) Toast("That doesn't look like an email address");
-        else { snprintf(u->email, sizeof u->email, "%s", tfEmail.buf); MarkDirty(); Toast(u->email[0] ? "Email saved" : "Email removed"); }
+        else { snprintf(u->email, sizeof u->email, "%s", tfEmail.buf); RecomputeAuthors(); MarkDirty(); Toast(u->email[0] ? "Email saved" : "Email removed"); }
+    }
+    /* other emails you've said are you ("That's me" on a repository's People tab) */
+    int cx = (int)x, cy = (int)y + 142;
+    if (!u->claimCount) DrawFit("Other emails of yours: none yet. Use \"That's me\" on a repository's People tab to add one.", cx, cy, FS, (int)fw, UI_MUTED);
+    else {
+        DrawText("Also you:", cx, cy, FS, UI_MUTED);
+        cx += MeasureText("Also you:", FS) + 12;
+        int drop = -1;
+        for (int k = 0; k < u->claimCount; k++) {
+            int tw = MeasureText(u->claims[k], FS);
+            Rectangle chip = {(float)cx, (float)cy - 3, (float)tw + 44, 28};
+            if (chip.x + chip.width > x + fw) { DrawText(TextFormat("+%d more", u->claimCount - k), cx, cy, FS, UI_MUTED); break; }
+            DrawRectangleRounded(chip, 0.5f, 6, UI_BTN);
+            DrawText(u->claims[k], cx + 10, cy, FS, UI_TEXT);
+            Rectangle xr = {chip.x + chip.width - 28, chip.y + 2, 24, 24};
+            bool hx = Hover(xr);
+            if (hx) { wantCursor = MOUSE_CURSOR_POINTING_HAND; SetTip("Not me", "Their commits stop counting as yours", NULL); }
+            DrawText("x", (int)xr.x + 7, cy, FS, hx ? UI_REDT : UI_MUTED);
+            if (Clicked(xr)) drop = k;
+            cx += (int)chip.width + 8;
+        }
+        if (drop >= 0) {
+            for (int k = drop; k + 1 < u->claimCount; k++) memcpy(u->claims[k], u->claims[k + 1], TEXT_LEN);
+            u->claimCount--;
+            RecomputeAuthors();
+            MarkDirty();
+            Toast("Removed - those commits no longer count as yours");
+        }
     }
 }
 
@@ -6425,34 +6561,47 @@ static const Color PIE_OTHER = {0x6e, 0x76, 0x81, 255};
 
 /* lines = lines added + lines removed: every changed line counts as work, so removing
    14 lines counts the same as adding 14. A slice's size comes from lines. */
-typedef struct { int user; int commits; int adds, dels, lines; Color color; int people; } Share;   /* user -1 = "Others" */
+typedef struct { int user; int commits; int adds, dels, lines; Color color; int people; } Share;   /* user -2 = "Others" */
 static Share shares[6];
 static int   shareCount, shareTotal;    /* shareTotal = all lines changed, by everyone */
 
-/* Owner, collaborators, then anyone else who has committed (former
-   collaborators, or deleted accounts that show as "ghost"). */
+/* Owner, collaborators, then everyone else who has committed - former
+   collaborators, deleted accounts ("ghost") and people who aren't Mini GitHub
+   users - biggest share first. More than 6: the smallest go in "Others". */
 static void BuildShares(Repo *r)
 {
-    int ids[MAX_USERS * 2] = {0}, n = 0;
-    #define ADD_ID(u) do { bool seen_ = false; for (int q_ = 0; q_ < n; q_++) if (ids[q_] == (u)) seen_ = true; \
-                           if (!seen_ && n < MAX_USERS * 2) ids[n++] = (u); } while (0)
-    ADD_ID(r->owner);
-    for (int i = 0; i < r->collabCount; i++) ADD_ID(r->collabs[i]);
-    for (int k = 0; k < r->commitCount; k++) ADD_ID(r->commits[k].author);
-    #undef ADD_ID
-
+    int nu = nextUserId + 1, slots = nu + 1 + outsiderCount;   /* accounts, ghost, outsiders */
+    int *tc = calloc((size_t)slots * 3, sizeof(int)), *order = malloc((size_t)slots * sizeof(int));
+    bool *pick = calloc((size_t)slots, 1);
     shareCount = shareTotal = 0;
+    if (!tc || !order || !pick) { free(tc); free(order); free(pick); return; }
+    #define SLOT(id) ((id) >= 0 ? ((id) < nu ? (id) : nu) : IsOutsider(id) ? nu + 1 + (-(id) - OUTSIDER_BASE) : nu)
+    #define IDOF(s)  ((s) < nu ? (s) : (s) == nu ? -1 : -(OUTSIDER_BASE + (s) - nu - 1))
+    for (int k = 0; k < r->commitCount; k++) {
+        int s = SLOT(r->commits[k].author);
+        CommitStats(r, k);
+        tc[s * 3]++; tc[s * 3 + 1] += r->commits[k].sAdds; tc[s * 3 + 2] += r->commits[k].sDels;
+    }
+    int n = 0;
+    order[n++] = SLOT(r->owner); pick[order[0]] = true;              /* the people with access first */
+    for (int i = 0; i < r->collabCount; i++) { int s = SLOT(r->collabs[i]); if (!pick[s]) { pick[s] = true; order[n++] = s; } }
+    int fixed = n;
+    for (int s = 0; s < slots; s++) if (!pick[s] && tc[s * 3]) order[n++] = s;
+    for (int i = fixed; i < n; i++)                                  /* everyone else: most lines first */
+        for (int j = i + 1; j < n; j++)
+            if (tc[order[j] * 3 + 1] + tc[order[j] * 3 + 2] > tc[order[i] * 3 + 1] + tc[order[i] * 3 + 2]) { int t = order[i]; order[i] = order[j]; order[j] = t; }
     for (int i = 0; i < n; i++) {
-        int c = 0, a = 0, d = 0;
-        for (int k = 0; k < r->commitCount; k++)
-            if (r->commits[k].author == ids[i]) { c++; CommitStats(r, k); a += r->commits[k].sAdds; d += r->commits[k].sDels; }
+        int s = order[i], c = tc[s * 3], a = tc[s * 3 + 1], d = tc[s * 3 + 2];
         shareTotal += a + d;
-        if (n <= 6 || i < 5) shares[shareCount++] = (Share){ids[i], c, a, d, a + d, PIE_COLORS[i], 1};
+        if (n <= 6 || i < 5) shares[shareCount++] = (Share){IDOF(s), c, a, d, a + d, PIE_COLORS[i], 1};
         else {
-            if (shareCount == 5) shares[shareCount++] = (Share){-1, 0, 0, 0, 0, PIE_OTHER, 0};
+            if (shareCount == 5) shares[shareCount++] = (Share){-2, 0, 0, 0, 0, PIE_OTHER, 0};
             shares[5].commits += c; shares[5].adds += a; shares[5].dels += d; shares[5].lines += a + d; shares[5].people++;
         }
     }
+    #undef SLOT
+    #undef IDOF
+    free(tc); free(order); free(pick);
 }
 
 /* A repository counts as "multi-user" once it has a collaborator, or commits by more than one person. */
@@ -6465,7 +6614,7 @@ static bool IsMultiUser(Repo *r)
 
 static const char *ShareName(Share *s)
 {
-    return s->user >= 0 ? UserName(s->user) : TextFormat("Others (%d people)", s->people);
+    return s->user != -2 ? AuthorLabel(s->user) : TextFormat("Others (%d people)", s->people);
 }
 
 /* A tooltip that's drawn last, on top of everything else on screen. */
@@ -6559,7 +6708,7 @@ static bool HeaderPie(Repo *r, float rightX, float cy)
     if (!IsMultiUser(r)) return false;
     BuildShares(r);
     int members = 1 + r->collabCount, workers = 0;        /* people with access, or everyone who worked on it (forks) */
-    for (int i = 0; i < shareCount; i++) if (shares[i].commits) workers += shares[i].user >= 0 ? 1 : shares[i].people;
+    for (int i = 0; i < shareCount; i++) if (shares[i].commits) workers += shares[i].user != -2 ? 1 : shares[i].people;
     if (workers > members) members = workers;
     const char *label = TextFormat("%d %s", members, members == 1 ? "person" : "people");
     Vector2 c = {rightX - 18, cy};
@@ -6574,6 +6723,23 @@ static bool HeaderPie(Repo *r, float rightX, float cy)
         else SetTip("Contributions", "Click to see who did what", NULL);
     }
     return Clicked(hit);
+}
+
+/* "That's me": an outsider's email (or name, if their commits had none) becomes
+   one of yours, so their commits count as yours - everywhere, from now on. */
+static bool ClaimIdentity(int uid, int outsider)
+{
+    User *u = FindUserById(uid);
+    Outsider *o = OutsiderOf(outsider);
+    if (!u || !o) return false;
+    if (u->claimCount >= 8) { Toast("You can add up to 8 other emails - remove one in Settings > Git first"); return false; }
+    char who[NAME_LEN];
+    snprintf(who, sizeof who, "%s", o->name);
+    snprintf(u->claims[u->claimCount++], TEXT_LEN, "%s", o->email[0] ? o->email : o->name);
+    RecomputeAuthors();
+    MarkDirty();
+    Toast(TextFormat("Commits by %s now count as yours (undo it in Settings > Git)", who));
+    return true;
 }
 
 /* ---------------- the People tab ---------------- */
@@ -6709,14 +6875,36 @@ static void TabPeople(Repo *r)
 
     /* the key: every person with their colour, commits, share and lines */
     float ky = c.y + rad + 26;
+    int claim = -1;
     for (int i = 0; i < shareCount && ky + 24 < card.y + card.height; i++) {
         Share *s = &shares[i];
+        bool out = IsOutsider(s->user);
+        Rectangle row = {rx + 10, ky - 4, rw - 20, 28};
+        bool hot = Hover(row);
+        if (hot && out) DrawRectangleRec(row, UI_HOVER);
         DrawRectangleRounded((Rectangle){rx + 18, ky + 3, 14, 14}, 0.3f, 4, s->color);
-        DrawFit(ShareName(s), (int)rx + 42, (int)ky, FS, (int)(rw * 0.42f), UI_TEXT);
         const char *val = TextFormat("%d line%s  %d%%", s->lines, s->lines == 1 ? "" : "s", Percent(s->lines, shareTotal));
-        DrawText(val, (int)(rx + rw - 18) - MeasureText(val, FS), (int)ky, FS, UI_MUTED);
+        int valW = MeasureText(val, FS);
+        if (out && hot && curUser >= 0) {                  /* one of your other email addresses? */
+            Rectangle btn = {rx + rw - 18 - 130, ky - 3, 130, 26};
+            if (ConfirmButton(btn, "That's me", "Sure? Click", 200 + i)) claim = s->user;
+            valW = 130;
+        } else DrawText(val, (int)(rx + rw - 18) - valW, (int)ky, FS, UI_MUTED);
+        int nameW = (int)(rw - 18 - valW - 16 - 42);
+        if (out) {                                         /* the name, then the tag in grey */
+            const char *nm = UserName(s->user);
+            DrawFit(nm, (int)rx + 42, (int)ky, FS, nameW, UI_TEXT);
+            int used = MeasureText(nm, FS);
+            if (used + 40 < nameW) DrawFit("(not a Mini GitHub user)", (int)rx + 42 + used + 8, (int)ky, FS, nameW - used - 8, UI_MUTED);
+            if (hot) {
+                Outsider *o = OutsiderOf(s->user);
+                SetTip(o->name, o->email[0] ? o->email : "(no email in their commits)",
+                       curUser >= 0 ? "Not a Mini GitHub user. If this is you (another email of yours), press That's me" : "Not a Mini GitHub user");
+            }
+        } else DrawFit(ShareName(s), (int)rx + 42, (int)ky, FS, nameW, UI_TEXT);
         ky += 30;
     }
+    if (claim != -1 && ClaimIdentity(curUser, claim)) return;
 }
 
 /* Returns true if the repository was deleted or we left it (so stop drawing it). */
@@ -9634,17 +9822,6 @@ static bool RepoObject(Repo *r, const uint8_t *sha, const uint8_t **data, size_t
 
 /* ---------- taking in a push ---------- */
 
-/* Whose commit is this? Matched by the email (yours from your profile, or
-   the made-up name@minigithub.local), then by name; otherwise it counts
-   as the work of the person pushing. */
-static int UserForAuthor(const char *name, const char *email, int pusher)
-{
-    for (int i = 0; i < userCount; i++) if (users[i].email[0] && EqualsCI(users[i].email, email)) return users[i].id;
-    for (int i = 0; i < userCount; i++) if (EqualsCI(email, TextFormat("%s@minigithub.local", users[i].name))) return users[i].id;
-    for (int i = 0; i < userCount; i++) if (EqualsCI(users[i].name, name)) return users[i].id;
-    return pusher;
-}
-
 /* One file of a pushed commit, before it's stored. */
 typedef struct { const char *path; uint8_t sha[20]; uint8_t mode; } PEntry;
 typedef struct { PEntry *e; int n, cap; } PList;
@@ -9707,9 +9884,10 @@ typedef struct { int obj; CommitInfo info; PList files; int state; } PCommit;
 
 /* Updates repository r's branch from old to new using the objects in ps.
    Returns NULL if it worked, or the reason to give git. *added gets how many commits came in. */
-static const char *ApplyPush(Repo *r, int pusher, const uint8_t old[20], const uint8_t nw[20], const char *ref, PackSet *ps, int *added)
+static const char *ApplyPush(Repo *r, int pusher_, const uint8_t old[20], const uint8_t nw[20], const char *ref, PackSet *ps, int *added)
 {
     *added = 0;
+    (void)pusher_;                         /* who pushed doesn't decide whose commits they are */
     if (strncmp(ref, "refs/tags/", 10) == 0) return "Mini GitHub doesn't keep tags";
     if (strncmp(ref, "refs/heads/", 11) != 0) return "only branches can be pushed";
     const char *br = ref + 11;
@@ -9897,8 +10075,8 @@ static const char *ApplyPush(Repo *r, int pusher, const uint8_t old[20], const u
             c.time = pcm->info.atime;
             snprintf(c.message, TEXT_LEN, "%s", pcm->info.summary);
             int inUp = up >= 0 ? CommitBySha(&repos[up], o->sha) : -1;
-            if (inUp >= 0) { c.copied = true; c.author = repos[up].commits[inUp].author; }   /* the original's work, not new work */
-            else c.author = UserForAuthor(pcm->info.aname, pcm->info.aemail, pusher);
+            if (inUp >= 0) c.copied = true;                  /* the original's work, not new work */
+            c.author = AuthorOfCommit(&c);                   /* a Mini GitHub user, or someone from outside */
             if (!AppendCommit(r, &c)) { FreeCommit(&c); err = "the repository has too many commits"; break; }
             (*added)++;
         }
@@ -10872,6 +11050,7 @@ static const char *SetAsideName(void)
 static void AfterLoad(void)
 {
     loadFailed = false;
+    RecomputeAuthors();
     GitServerStart();
     if (userCount == 0) {
         GoRegister();
