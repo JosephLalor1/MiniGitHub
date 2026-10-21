@@ -700,6 +700,7 @@ typedef struct {
                                      /* it isn't counted again as someone's contribution */
     bool      statsDone;             /* the three below are worked out when first needed, */
     int       sFiles, sAdds, sDels;  /* not saved: files changed, lines added / removed     */
+    int      *tech;                  /* lines changed in each language (worked out when needed, not saved) */
 } Commit;
 
 /* A file someone is editing. In a draft (below) it also remembers which
@@ -1007,8 +1008,8 @@ static void FreeDraft(Draft *d)
 
 static void FreeCommit(Commit *c)
 {
-    free(c->names); free(c->blobs); free(c->modes); free(c->raw);
-    c->names = NULL; c->blobs = NULL; c->modes = NULL; c->raw = NULL;
+    free(c->names); free(c->blobs); free(c->modes); free(c->raw); free(c->tech);
+    c->names = NULL; c->blobs = NULL; c->modes = NULL; c->raw = NULL; c->tech = NULL;
 }
 
 static void FreeRepo(Repo *r)
@@ -2281,6 +2282,36 @@ static void ComputeDiff(const char *oldT, const char *newT, int *adds, int *dels
 typedef struct { const char *name; int oldB, newB; char kind; int adds, dels; bool binary; } Change;
 static Change changes[MAX_FILES * 2];
 static int    changeCount, totalAdds, totalDels;
+
+/* How many lines were added and removed, without listing them - for counting.
+   Uses the Myers method (what git uses): it tries 0 changes, then 1, 2, ...
+   following the matching lines diagonally, so a small change in a big file
+   is found almost at once. Very different files fall back to ComputeDiff. */
+static LineRef *cA, *cB;
+static int      cACap, cBCap, *cV, cVCap;
+static void DiffCounts(const char *oldT, const char *newT, int *adds, int *dels)
+{
+    int n = SplitLines(oldT, &cA, &cACap), m = SplitLines(newT, &cB, &cBCap);
+    int pre = 0, suf = 0;
+    while (pre < n && pre < m && SameLine(cA[pre], cB[pre])) pre++;
+    while (suf < n - pre && suf < m - pre && SameLine(cA[n - 1 - suf], cB[m - 1 - suf])) suf++;
+    LineRef *A = cA + pre, *B = cB + pre;
+    int N = n - pre - suf, M = m - pre - suf;
+    if (!N || !M) { *adds = M; *dels = N; return; }
+    int maxD = N + M < 4000 ? N + M : 4000;
+    cV = Grow(cV, &cVCap, 2 * maxD + 3, sizeof(int));
+    if (cVCap < 2 * maxD + 3) { ComputeDiff(oldT, newT, adds, dels); return; }
+    int *V = cV + maxD + 1;
+    V[1] = 0;
+    for (int d = 0; d <= maxD; d++)
+        for (int k = -d; k <= d; k += 2) {
+            int x = (k == -d || (k != d && V[k - 1] < V[k + 1])) ? V[k + 1] : V[k - 1] + 1, y = x - k;
+            while (x < N && y < M && SameLine(A[x], B[y])) { x++; y++; }
+            V[k] = x;
+            if (x >= N && y >= M) { *dels = (d + N - M) / 2; *adds = (d - N + M) / 2; return; }
+        }
+    ComputeDiff(oldT, newT, adds, dels);                  /* hugely different: the slow, careful way */
+}
 
 /* Walks two commits' file lists side by side (both are sorted by path) and
    calls back for each file that differs: old or new blob is -1 if it isn't there. */
@@ -3719,7 +3750,7 @@ static void StatEach(void *ctx, const char *name, int ob, int nb)
     s->files++;
     if (ob == nb || BlobBinary(s->r, ob) || BlobBinary(s->r, nb)) return;   /* binary: no lines to count */
     int a, d;
-    ComputeDiff(BlobText(s->r, ob), BlobText(s->r, nb), &a, &d);
+    DiffCounts(BlobText(s->r, ob), BlobText(s->r, nb), &a, &d);
     s->adds += a; s->dels += d;
 }
 static void CommitStats(Repo *r, int ci)
@@ -4874,7 +4905,7 @@ static Color Heat(int c)
 
 /* Squares for the last 26 weeks, coloured by how many contributions uid made that day.
    Hovering a square sets *hoverDay; clicking one opens that day's page. */
-static void DrawContributions(Rectangle area, int uid, long long *hoverDay)
+static void DrawContributions(Rectangle area, int uid, long long *hoverDay, bool narrow)
 {
     enum { WEEKS = 26 };
     int counts[WEEKS * 7] = {0}, total = 0;
@@ -4901,7 +4932,7 @@ static void DrawContributions(Rectangle area, int uid, long long *hoverDay)
              (int)area.x + 16, (int)area.y + 12, FS, UI_TEXT);
     const char *hint = "Hover a day for details, click it for the full list";
     int titleW = MeasureText(TextFormat("%d contribution%s in the last 6 months", total, total == 1 ? "" : "s"), FS);
-    if (area.width > titleW + MeasureText(hint, FS) + 60)
+    if (!narrow && area.width > titleW + MeasureText(hint, FS) + 60)
         DrawText(hint, (int)(area.x + area.width) - 16 - MeasureText(hint, FS), (int)area.y + 12, FS, UI_MUTED);
 
     int hovered = -1;
@@ -4923,6 +4954,7 @@ static void DrawContributions(Rectangle area, int uid, long long *hoverDay)
     }
 
     int lx = (int)(area.x + area.width) - 200, ly = (int)(area.y + area.height) - 30;
+    if (narrow) { lx = (int)area.x + 16 + 26 * 15 - 190; ly = (int)area.y + 44 + 7 * 15 + 6; }   /* under the grid */
     DrawText("Less", lx, ly, FS, UI_MUTED);
     for (int i = 0; i < 5; i++)
         DrawRectangleRounded((Rectangle){(float)lx + 52 + i * 16, (float)ly + 4, 12, 12}, 0.3f, 4, Heat(i == 4 ? 5 : i));
@@ -5936,6 +5968,7 @@ static char     langSkipped[TEXT_LEN];       /* the kinds of file that aren't co
 /* Counts the lines of code in each language: the latest commit, plus your
    own changes if uid can edit. Text that isn't code (Markdown, JSON, YAML,
    plain text) and binary files aren't counted - the same as GitHub. */
+static void LangPartsFrom(const int *lines, const int *files, const bool *skipped, bool binary, bool commits);
 static void BuildLanguages(Repo *r, int uid)
 {
     int lines[LANG_COUNT] = {0}, files[LANG_COUNT] = {0};
@@ -5949,6 +5982,16 @@ static void BuildLanguages(Repo *r, int uid)
         lines[l] += n;
         files[l]++;
     }
+    LangPartsFrom(lines, files, skipped, binary, false);
+}
+
+/* Turns lines and files per language into the parts drawn by DrawLanguageBar (and the
+   profile's tech stack): biggest first, at most 6 (the rest are "Other"), each with its colour.
+   counts = "files" are really commits (for the tech stack). */
+static bool langPartsAreCommits;
+static void LangPartsFrom(const int *lines, const int *files, const bool *skipped, bool binary, bool commits)
+{
+    langPartsAreCommits = commits;
     /* biggest first */
     int order[LANG_FIRST_NONCODE], n = 0;
     for (int l = 0; l < LANG_FIRST_NONCODE; l++) if (files[l]) order[n++] = l;
@@ -6035,7 +6078,7 @@ static void DrawLanguageBar(Rectangle area)
     if (hov >= 0) {
         LangPart *p = &langParts[hov];
         SetTip(PartName(p), TextFormat("%d line%s  (%.1f%%)", p->lines, p->lines == 1 ? "" : "s", 100.0 * p->lines / langTotal),
-               TextFormat("in %d file%s", p->files, p->files == 1 ? "" : "s"));
+               TextFormat("in %d %s%s", p->files, langPartsAreCommits ? "commit" : "file", p->files == 1 ? "" : "s"));
     }
 }
 
@@ -6043,6 +6086,173 @@ static void DrawLanguageBar(Rectangle area)
    Everyone has one. Your own is also your home page: the first thing you
    see after signing in, with your repositories, everyone else's, a search
    box and the New button. Other people's profiles list their repositories. */
+/* ---------- a person's tech stack ----------
+   Every commit they made (in any repository; not ones merely copied into a
+   fork) is compared with the commit before it, and the lines changed - added
+   plus removed - are counted under each file's language. Each commit's
+   counts are worked out once and kept, so only new commits cost anything. */
+typedef struct { Repo *r; int *out; } TechCtx;
+static void TechEach(void *ctx, const char *name, int ob, int nb)
+{
+    TechCtx *t = ctx;
+    if (ob == nb) return;                                /* only the mode changed */
+    int b = nb >= 0 ? nb : ob;                           /* a deleted file counts in the language it was */
+    /* a file's language hardly ever changes from one version to the next, so it's
+       worked out once per path (from the first version seen) and remembered */
+    static PtrMap pathLang;
+    int lang = PtrGet(&pathLang, name) - 100;
+    if (lang < -50) {
+        LangCache *lc = BlobLangCache(t->r, b);
+        lang = lc ? LangOf(lc, name) : LANG_BINARY;
+        PtrPut(&pathLang, name, lang + 100);
+    }
+    if (lang < 0 || lang >= LANG_FIRST_NONCODE) return;  /* not code (Markdown, text...) or binary */
+    int a = 0, d = 0;
+    DiffCounts(BlobText(t->r, ob), BlobText(t->r, nb), &a, &d);
+    t->out[lang] += a + d;
+}
+static const int *CommitTech(Repo *r, int ci)
+{
+    Commit *c = &r->commits[ci];
+    if (!c->tech) {
+        int *t = calloc(LANG_COUNT, sizeof(int));
+        if (!t) return NULL;
+        TechCtx ctx = {r, t};
+        WalkChanges(ParentOf(r, ci), c, TechEach, &ctx);
+        c->tech = t;
+    }
+    return c->tech;
+}
+
+/* The totals for one person, kept until any repository changes. Counting a
+   big history takes a while the first time, so it's done a little each frame
+   (never more than ~25 ms) - the window keeps working, and the card says
+   how far it's got. */
+static struct {
+    int uid; unsigned stamp; bool done; int repo, commit, todo, did;
+    int lines[LANG_COUNT], commits[LANG_COUNT]; int total;
+} tech = {-999, 0, false, 0, 0, 0, 0, {0}, {0}, 0};
+static unsigned WorldStamp(void)
+{
+    unsigned s = (unsigned)repoCount * 2654435761u + (unsigned)outsiderCount * 40503u + (unsigned)userCount;
+    for (int i = 0; i < repoCount; i++) s = s * 31u + repos[i].gen * 7u + (unsigned)repos[i].commitCount;
+    for (int i = 0; i < userCount; i++) s = s * 31u + (unsigned)users[i].claimCount;
+    return s;
+}
+static void BuildTech(int uid)
+{
+    unsigned stamp = WorldStamp();
+    if (tech.uid != uid || tech.stamp != stamp) {           /* start again */
+        memset(&tech, 0, sizeof tech);
+        tech.uid = uid; tech.stamp = stamp;
+        for (int i = 0; i < repoCount; i++)
+            for (int k = 0; k < repos[i].commitCount; k++)
+                if (repos[i].commits[k].author == uid && !repos[i].commits[k].copied && !repos[i].commits[k].tech) tech.todo++;
+    }
+    if (tech.done) return;
+    double until = GetTime() + 0.025;
+    for (; tech.repo < repoCount; tech.repo++, tech.commit = 0) {
+        Repo *r = &repos[tech.repo];
+        for (; tech.commit < r->commitCount; tech.commit++) {
+            Commit *c = &r->commits[tech.commit];
+            if (c->author != uid || c->copied) continue;
+            if (!c->tech) {
+                if (GetTime() > until) return;                /* carry on next frame */
+                tech.did++;
+            }
+            const int *t = CommitTech(r, tech.commit);
+            for (int l = 0; t && l < LANG_FIRST_NONCODE; l++)
+                if (t[l]) { tech.lines[l] += t[l]; tech.commits[l]++; tech.total += t[l]; }
+        }
+    }
+    tech.done = true;
+}
+
+/* A pie of the parts LangPartsFrom made. Returns the slice under the mouse, or -1. */
+static int DrawLangPie(Vector2 c, float rad)
+{
+    if (!langTotal) { DrawRing(c, rad - 3, rad, 0, 360, 48, UI_BORDER); return -1; }
+    Vector2 m = GetMousePosition();
+    float dx = m.x - c.x, dy = m.y - c.y;
+    bool inside = dx * dx + dy * dy <= (rad + 4) * (rad + 4) && Hover((Rectangle){c.x - rad - 4, c.y - rad - 4, rad * 2 + 8, rad * 2 + 8});
+    float mang = atan2f(dy, dx) * RAD2DEG;
+    if (mang < -90) mang += 360;
+    int hov = -1;
+    float a = -90;
+    for (int i = 0; i < langPartCount; i++) {
+        float sweep = 360.0f * langParts[i].lines / langTotal;
+        if (inside && mang >= a && mang < a + sweep) hov = i;
+        a += sweep;
+    }
+    a = -90;
+    for (int i = 0; i < langPartCount; i++) {
+        float sweep = 360.0f * langParts[i].lines / langTotal;
+        DrawCircleSector(c, i == hov ? rad + 4 : rad, a, a + sweep, (int)(sweep / 3) + 4, langParts[i].color);
+        a += sweep;
+    }
+    if (langPartCount > 1) {
+        a = -90;
+        for (int i = 0; i < langPartCount; i++) {
+            Vector2 e = {c.x + cosf(a * DEG2RAD) * (rad + 6), c.y + sinf(a * DEG2RAD) * (rad + 6)};
+            DrawLineEx(c, e, 2, (Color){22, 27, 34, 255});
+            a += 360.0f * langParts[i].lines / langTotal;
+        }
+    }
+    return hov;
+}
+
+/* The "Tech stack" card on a profile: a pie and its key (or, in a narrow window, a bar). */
+static void DrawTechStack(Rectangle area, int uid, bool asBar)
+{
+    BuildTech(uid);
+    bool none[LANG_COUNT] = {0};
+    LangPartsFrom(tech.lines, tech.commits, none, false, true);
+    DrawRectangleRec(area, UI_PANEL);
+    DrawRectangleLinesEx(area, 1, UI_BORDER);
+    DrawText("Tech stack", (int)area.x + 16, (int)area.y + 12, FS, UI_TEXT);
+    if (!tech.done) {                                    /* still counting (a big history, the first time) */
+        int pct = tech.todo ? tech.did * 100 / tech.todo : 0;
+        DrawFit(TextFormat("Counting the languages in %d commits...  %d%%", tech.todo, pct), (int)area.x + 16, (int)area.y + 46, FS, (int)area.width - 32, UI_MUTED);
+        DrawRectangle((int)area.x + 16, (int)area.y + 78, (int)((area.width - 32) * pct / 100), 6, uiAccent);
+        return;
+    }
+    const char *sub = "lines changed, all repositories";
+    if (area.width - 32 - MeasureText("Tech stack", FS) - 16 > MeasureText(sub, FS))
+        DrawText(sub, (int)(area.x + area.width) - 16 - MeasureText(sub, FS), (int)area.y + 12, FS, UI_MUTED);
+    if (!tech.total) {
+        DrawFit(uid == curUser ? "No code committed yet - your languages will show up here." : "No code committed yet.",
+                (int)area.x + 16, (int)area.y + 46, FS, (int)area.width - 32, UI_MUTED);
+        return;
+    }
+    if (asBar) {                                         /* narrow window: the same bar the repositories have */
+        langSkipped[0] = 0;
+        DrawLanguageBar((Rectangle){area.x + 16, area.y + 42, area.width - 32, 40});
+        return;
+    }
+    float rad = (area.height - 56) / 2;
+    if (rad > 62) rad = 62;
+    Vector2 c = {area.x + 20 + rad, area.y + 44 + rad};
+    int hov = DrawLangPie(c, rad);
+    float kx = c.x + rad + 24, ky = area.y + 44, kw = area.x + area.width - 16 - kx;
+    int rows = (int)((area.height - 52) / 22);
+    for (int i = 0; i < langPartCount && i < rows; i++) {
+        LangPart *p = &langParts[i];
+        bool hot = i == hov || Hover((Rectangle){kx - 4, ky - 2, kw + 8, 22});
+        DrawCircle((int)kx + 5, (int)ky + 10, 5, p->color);
+        const char *pct = TextFormat("%.1f%%", 100.0 * p->lines / langTotal);
+        int pw = MeasureText(pct, FS);
+        DrawFit(PartName(p), (int)kx + 16, (int)ky, FS, (int)kw - 16 - pw - 10, hot ? UI_TEXT : UI_TEXT);
+        DrawText(pct, (int)(kx + kw) - pw, (int)ky, FS, hot ? UI_TEXT : UI_MUTED);
+        if (hot && hov < 0) hov = i;
+        ky += 22;
+    }
+    if (hov >= 0) {
+        LangPart *p = &langParts[hov];
+        SetTip(PartName(p), TextFormat("%d line%s changed  (%.1f%%)", p->lines, p->lines == 1 ? "" : "s", 100.0 * p->lines / langTotal),
+               TextFormat("in %d commit%s", p->files, p->files == 1 ? "" : "s"));
+    }
+}
+
 static void ScreenProfile(void)
 {
     User *u = FindUserById(viewUser);
@@ -6134,8 +6344,14 @@ static void ScreenProfile(void)
 
     /* ---- right column: contributions ---- */
     long long hoverDay = 0;
-    DrawContributions((Rectangle){mx, 191 + oy, mw, 160}, u->id, &hoverDay);
+    /* wide enough: the calendar and the tech stack side by side; otherwise the stack is a bar below */
+    bool side = mw >= 800;
+    float calW = side ? 440 : mw, calH = side ? 184 : 160;
+    DrawContributions((Rectangle){mx, 191 + oy, calW, calH}, u->id, &hoverDay, side);
     if (screen != SCR_PROFILE) return;                       /* a day was clicked */
+    if (side) DrawTechStack((Rectangle){mx + calW + 12, 191 + oy, mw - calW - 12, calH}, u->id, false);
+    else { DrawTechStack((Rectangle){mx, 191 + oy + calH + 10, mw, 96}, u->id, true); oy += 106; }
+    if (side) oy += calH - 160;
 
     /* ---- right column: repositories ---- */
     float ty = 367 + oy;
@@ -7010,6 +7226,7 @@ static bool CopyCommit(Repo *dst, Repo *src, int ci)
     Commit *s = &src->commits[ci];
     if (CommitBySha(dst, s->sha) >= 0) return true;               /* already there */
     Commit c = *s;
+    c.tech = NULL;                                   /* worked out again in the new repository */
     int n = s->fileCount;
     c.names = malloc((size_t)(n ? n : 1) * sizeof *c.names);
     c.blobs = malloc((size_t)(n ? n : 1) * sizeof *c.blobs);
