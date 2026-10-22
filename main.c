@@ -739,6 +739,7 @@ typedef struct {
     char      name[NAME_LEN];
     char      desc[TEXT_LEN];
     char      branch[NAME_LEN];      /* the name the first branch gets (while the repository is empty) */
+    bool      isPrivate;             /* only the owner, collaborators and people invited can see it */
     int       branchCount;
     Branch    branches[MAX_BRANCHES];
     int       defBranch;             /* the default branch (what git clone checks out)   */
@@ -789,7 +790,7 @@ static TextField tfPass    = {.secret = true}, tfPass2    = {.secret = true};
 static TextField tfOldPass = {.secret = true}, tfNewPass  = {.secret = true};
 static TextField tfNewPass2= {.secret = true}, tfDelPass  = {.secret = true};
 static EditorState ed;
-static bool  optReadme = true, optExample = true;
+static bool  optReadme = true, optExample = true, optPrivate = false;
 static int   homeView;                /* 0 = your repositories, 1 = everyone's */
 static float scGraph, scFiles, scCommits, scIssues, scChanges, scDiff, scDay, scDayRepos;
 static char  shownCode[24];           /* recovery code on screen right now (never saved) */
@@ -1808,6 +1809,9 @@ static bool IsInvited(Repo *r, int uid)
 /* Owners and collaborators can change a repository; everyone else can only look. */
 static bool CanEditBy(Repo *r, int uid) { return uid >= 0 && (r->owner == uid || IsCollab(r, uid)); }
 static bool CanEdit(Repo *r)            { return CanEditBy(r, curUser); }
+/* Who can see (and so fork, clone, star) a repository: anyone if it's public;
+   if it's private, only the owner, collaborators, and people invited to be one. */
+static bool CanSee(Repo *r, int uid) { return !r->isPrivate || CanEditBy(r, uid) || IsInvited(r, uid); }
 
 static void RemoveInvite(Repo *r, int uid)
 {
@@ -2765,7 +2769,7 @@ static void Save(void)
     if (loadFailed) return;                /* never write over a save file that couldn't be read */
     FILE *f = fopen(SAVE_FILE ".tmp", "wb");
     if (!f) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(f, "MINIGITHUB9\n");
+    fprintf(f, "MINIGITHUB10\n");
     WI(f, nextUserId);
     WS(f, lastUser);
     WI(f, userCount);
@@ -2781,7 +2785,7 @@ static void Save(void)
     WI(f, repoCount);
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
-        WI(f, r->owner); WS(f, r->name); WS(f, r->desc); WI(f, r->created); WS(f, r->branch);
+        WI(f, r->owner); WS(f, r->name); WS(f, r->desc); WI(f, r->created); WS(f, r->branch); WI(f, r->isPrivate);
         WI(f, r->starCount);
         for (int k = 0; k < r->starCount; k++) WI(f, r->starredBy[k]);
         WI(f, r->collabCount);
@@ -2914,8 +2918,10 @@ static bool Load(void)
     loadErr = 0; loadLine = 0; loadWhy[0] = 0; loadWhere[0] = 0;
     char magic[32] = {0};
     int ver = 0;
-    if (fscanf(f, "%31s", magic) == 1 && strncmp(magic, "MINIGITHUB", 10) == 0 && magic[10] >= '1' && magic[10] <= '9' && !magic[11])
-        ver = magic[10] - '0';
+    if (fscanf(f, "%31s", magic) == 1 && strncmp(magic, "MINIGITHUB", 10) == 0) {
+        int v = atoi(magic + 10);
+        if (v >= 1 && v <= 10 && magic[10] != '0') ver = v;    /* MINIGITHUB1 ... MINIGITHUB10 */
+    }
     if (!ver) {
         if (strncmp(magic, "MINIGITHUB", 10) == 0) snprintf(loadWhy, sizeof loadWhy, "it was made by a newer version of Mini GitHub");
         else snprintf(loadWhy, sizeof loadWhy, "it isn't a Mini GitHub save file");
@@ -2980,6 +2986,7 @@ static bool Load(void)
         if (ver == 1) RI(f);                    /* old single-user "starred" flag: dropped */
         r->created = RI(f);
         if (ver >= 7) { RSInto(f, r->branch, NAME_LEN); if (!r->branch[0]) snprintf(r->branch, NAME_LEN, "main"); }
+        if (ver >= 10) r->isPrivate = RI(f) != 0;
         if (ver >= 2) {
             int sc = (int)RI(f);
             if (sc < 0 || sc > MAX_USERS) { LOADFAIL; break; }
@@ -3797,6 +3804,7 @@ static void GatherDay(int uid, long long start)
 
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
+        if (!CanSee(r, curUser)) continue;                /* private, and you're not in it */
         RepoTally t = {i, 0, 0, 0, 0};
         for (int k = 0; k < r->commitCount; k++) {
             Commit *c = &r->commits[k];
@@ -4812,6 +4820,7 @@ static bool PageStillThere(const Page *p, int *ri, int *ci)
     if (p->screen == SCR_REPO || p->screen == SCR_COMMIT) {
         *ri = FindRepoOf(p->repoOwner, p->repoName);
         if (*ri < 0) return false;                                      /* deleted (or renamed) */
+        if (!CanSee(&repos[*ri], curUser)) return false;                /* private now, and you're not in it */
         if (p->screen == SCR_COMMIT) { *ci = CommitBySha(&repos[*ri], p->commit); if (*ci < 0) return false; }
         return true;
     }
@@ -5111,6 +5120,7 @@ static void DrawContributions(Rectangle area, int uid, long long *hoverDay, bool
 
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
+        if (!CanSee(r, curUser)) continue;                /* private, and you're not in it */
         for (int k = 0; k < r->commitCount + r->issueCount; k++) {
             bool isCommit = k < r->commitCount;
             int author    = isCommit ? r->commits[k].author : r->issues[k - r->commitCount].author;
@@ -6328,8 +6338,9 @@ static struct {
 } tech = {-999, 0, false, 0, 0, 0, 0, {0}, {0}, 0};
 static unsigned WorldStamp(void)
 {
-    unsigned s = (unsigned)repoCount * 2654435761u + (unsigned)outsiderCount * 40503u + (unsigned)userCount;
-    for (int i = 0; i < repoCount; i++) s = s * 31u + repos[i].gen * 7u + (unsigned)repos[i].commitCount;
+    unsigned s = (unsigned)repoCount * 2654435761u + (unsigned)outsiderCount * 40503u + (unsigned)userCount + (unsigned)curUser * 977u;
+    for (int i = 0; i < repoCount; i++)            /* (what you can see counts too: private repositories) */
+        s = s * 31u + repos[i].gen * 7u + (unsigned)repos[i].commitCount + (CanSee(&repos[i], curUser) ? 1u : 0u);
     for (int i = 0; i < userCount; i++) s = s * 31u + (unsigned)users[i].claimCount;
     return s;
 }
@@ -6340,13 +6351,14 @@ static void BuildTech(int uid)
         memset(&tech, 0, sizeof tech);
         tech.uid = uid; tech.stamp = stamp;
         for (int i = 0; i < repoCount; i++)
-            for (int k = 0; k < repos[i].commitCount; k++)
+            for (int k = 0; k < repos[i].commitCount && CanSee(&repos[i], curUser); k++)
                 if (repos[i].commits[k].author == uid && !repos[i].commits[k].copied && !repos[i].commits[k].tech) tech.todo++;
     }
     if (tech.done) return;
     double until = GetTime() + 0.025;
     for (; tech.repo < repoCount; tech.repo++, tech.commit = 0) {
         Repo *r = &repos[tech.repo];
+        if (!CanSee(r, curUser)) continue;                  /* private, and you're not in it */
         for (; tech.commit < r->commitCount; tech.commit++) {
             Commit *c = &r->commits[tech.commit];
             if (c->author != uid || c->copied) continue;
@@ -6477,6 +6489,7 @@ static void ScreenProfile(void)
     int nRepos = 0, nCommits = 0, nStars = 0, nIssues = 0, nStarred = 0, nOpen = 0;
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
+        if (!CanSee(r, curUser)) continue;                /* private, and you're not in it */
         if (r->owner == u->id) { nRepos++; nStars += r->starCount; nOpen += OpenIssues(r); }
         if (HasStarred(r, u->id)) nStarred++;
         for (int k = 0; k < r->commitCount; k++) if (r->commits[k].author == u->id && !r->commits[k].copied) nCommits++;
@@ -6574,6 +6587,7 @@ static void ScreenProfile(void)
     int order[MAX_REPOS], n = 0;
     for (int i = 0; i < repoCount; i++) {
         Repo *r = &repos[i];
+        if (!CanSee(r, curUser)) continue;                                              /* private, and you're not in it */
         if (!everyone && r->owner != u->id && !(mine && IsCollab(r, u->id))) continue;   /* yours: owned + collaborating */
         if (!ContainsCI(r->name, tfSearch.buf) && !ContainsCI(UserName(r->owner), tfSearch.buf)) continue;
         order[n++] = i;
@@ -6613,6 +6627,12 @@ static void ScreenProfile(void)
         tx += MeasureText(r->name, FS) + 16;
         if (IsCollab(r, curUser)) { DrawText("collaborator", tx, (int)card.y + 12, FS, UI_MUTED); tx += MeasureText("collaborator", FS) + 16; }
         if (r->isFork) { DrawText("fork", tx, (int)card.y + 12, FS, UI_MUTED); tx += MeasureText("fork", FS) + 16; }
+        if (r->isPrivate) {                                                             /* a "Private" label */
+            Rectangle pp = {(float)tx, card.y + 11, (float)MeasureText("Private", FS) + 16, 24};
+            DrawRectangleRounded(pp, 0.5f, 6, (Color){110, 80, 20, 120});
+            DrawText("Private", tx + 8, (int)card.y + 13, FS, UI_YELLOW);
+            tx += (int)pp.width + 12;
+        }
         if (HasStarred(r, curUser)) DrawText("starred", tx, (int)card.y + 12, FS, UI_YELLOW);
 
         DrawFit(r->desc[0] ? r->desc : "No description", (int)card.x + 18, (int)card.y + 38, FS, (int)card.width - 36, UI_MUTED);
@@ -6673,7 +6693,8 @@ static void ScreenPeople(void)
         DrawBold(u->name, tx, (int)card.y + 12, FS, UI_LINK);
         if (u->id == curUser) DrawText("(you)", tx + MeasureText(u->name, FS) + 12, (int)card.y + 12, FS, UI_MUTED);
         DrawFit(u->bio[0] ? u->bio : "No bio yet", tx, (int)card.y + 38, FS, tw, u->bio[0] ? UI_TEXT : UI_MUTED);
-        int owned = ReposOwnedBy(u->id);
+        int owned = 0;
+        for (int i = 0; i < repoCount; i++) if (repos[i].owner == u->id && CanSee(&repos[i], curUser)) owned++;
         DrawFit(TextFormat("%d repositor%s   |   joined %s   |   theme: %s", owned, owned == 1 ? "y" : "ies",
                            TimeAgo(u->created), THEMES[UserTheme(u->id)].name),
                 tx, (int)card.y + 64, FS, tw, UI_MUTED);
@@ -6692,6 +6713,7 @@ static void TryCreateRepo(void)
         if (repos[i].owner == curUser && EqualsCI(repos[i].name, nm)) { Toast("You already have a repository with that name"); return; }
     Repo *r = NewRepo(curUser, nm, tfDesc.buf);
     if (!r) { Toast("This computer has reached the maximum number of repositories"); return; }
+    r->isPrivate = optPrivate;
     if (optReadme) {
         DraftSetText(r, curUser, "README.md", TextFormat("# %s\n\n%s\n", nm, tfDesc.buf[0] ? tfDesc.buf : "A new project."));
         DoCommit(r, "Initial commit");
@@ -6719,6 +6741,14 @@ static void ScreenNew(void)
     DrawText("Description (optional)", x, y + 198, FS, UI_TEXT);
     bool e2 = TextFieldUI(&tfDesc, (Rectangle){(float)x, (float)y + 224, 560, 40}, "What is this project about?");
     Checkbox(&optReadme, x, y + 287, "Add a README file");
+    /* who can see it */
+    int vx = x + 300;
+    for (int v = 0; v < 2; v++) {
+        Rectangle b = {(float)vx + v * 132, (float)y + 280, 124, 36};
+        bool on = optPrivate == (v == 1);
+        if (ButtonEx(b, v ? "Private" : "Public", on ? (v ? (Color){110, 80, 20, 255} : UI_BLUE) : UI_BTN, true)) optPrivate = v == 1;
+        if (Hover(b)) SetTip(v ? "Private" : "Public", v ? "Only you and people you invite can see it" : "Everyone on this computer can see and fork it", NULL);
+    }
 
     bool create = Button((Rectangle){p.x + p.width - 230, (float)y + 350, 200, 44}, "Create repository", UI_GREEN);
     bool cancel = Button((Rectangle){p.x + p.width - 360, (float)y + 350, 120, 44}, "Cancel", UI_BTN);
@@ -7467,6 +7497,7 @@ static bool CopyMissing(Repo *dst, Repo *src, int tip)
 static void TryForkRepo(int orig)
 {
     Repo *p = &repos[orig];
+    if (!CanSee(p, curUser)) { Toast("That repository is private"); return; }
     int mineAlready = FindForkOf(curUser, orig);
     if (mineAlready >= 0) { OpenRepo(mineAlready); Toast("You already have a fork of this repository - here it is"); return; }
     if (repoCount >= MAX_REPOS) { Toast("This computer has reached the maximum number of repositories"); return; }
@@ -7479,6 +7510,7 @@ static void TryForkRepo(int orig)
 
     Repo *r = NewRepo(curUser, nm, p->desc);       /* p is still valid: repos[] never moves */
     r->isFork    = true;
+    r->isPrivate = p->isPrivate;                   /* a copy of private work stays private */
     r->forkOwner = p->owner;
     snprintf(r->forkName, NAME_LEN, "%s", p->name);
     snprintf(r->branch, NAME_LEN, "%s", p->branch);
@@ -7517,6 +7549,7 @@ static const char *SyncFork(Repo *r, char *done, int doneCap)
 {
     ForkState s = GetForkState(r);
     if (s.up < 0)     return "The original repository has been deleted";
+    if (!CanSee(&repos[s.up], curUser)) return "The original repository is private now - you can't sync from it";
     if (!s.related)   return "The original repository's history no longer matches this fork";
     if (!s.behind)    return "Already up to date";
     Repo *p = &repos[s.up];
@@ -7966,14 +7999,16 @@ static float DrawForkBar(Repo *r, float top)
     if (!r->isFork) return top;
     Rectangle bar = {20, top, (float)W - 40, 46};
     ForkState s = GetForkState(r);
-    bool canSync = CanEdit(r) && s.up >= 0 && s.related && s.behind > 0;
+    bool hidden = s.up >= 0 && !CanSee(&repos[s.up], curUser);     /* the original went private */
+    bool canSync = CanEdit(r) && s.up >= 0 && !hidden && s.related && s.behind > 0;
     Color edge = canSync ? UI_YELLOW : UI_BORDER;
     DrawRectangleRec(bar, UI_PANEL);
     DrawRectangleLinesEx(bar, 1, edge);
 
     const char *from = TextFormat("%s / %s", UserName(r->forkOwner), r->forkName);
     const char *msg;
-    if (s.up < 0)                 msg = TextFormat("Forked from %s, which has since been deleted.", from);
+    if (hidden)                   msg = "Forked from a repository that has since been made private.";
+    else if (s.up < 0)            msg = TextFormat("Forked from %s, which has since been deleted.", from);
     else if (!s.related)          msg = TextFormat("Forked from %s, but its history no longer matches this fork.", from);
     else if (!s.ahead && !s.behind) msg = TextFormat("This fork is up to date with %s.", from);
     else if (!s.behind)           msg = TextFormat("This fork is %d commit%s ahead of %s.", s.ahead, s.ahead == 1 ? "" : "s", from);
@@ -8323,6 +8358,40 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
     DrawText(badge, (int)pill.x + 10, (int)pill.y + 3, FS, UI_MUTED);
     if (Clicked(ownerHit)) { OpenProfile(r->owner); return true; }
 
+    /* Public / Private. The owner can click it to change it (twice, to be sure). */
+    const char *vis = r->isPrivate ? "Private" : "Public";
+    Rectangle vp = {pill.x + pill.width + 10, pill.y, (float)MeasureText(vis, FS) + 20, 26};
+    if (mine) {
+        const char *ask = r->isPrivate ? "Make public?" : "Make private?";
+        if (armedId == 95) vp.width = (float)MeasureText(ask, FS) + 20;
+        bool hv = Hover(vp);
+        if (hv) {
+            wantCursor = MOUSE_CURSOR_POINTING_HAND;
+            SetTip(r->isPrivate ? "Private: only you, collaborators and people you invite can see it"
+                                : "Public: everyone on this computer can see it and fork it",
+                   r->isPrivate ? "Click twice to make it public" : "Click twice to make it private", NULL);
+        }
+        Color bg = armedId == 95 ? UI_DANGER : r->isPrivate ? (Color){110, 80, 20, 255} : UI_BTN;
+        DrawRectangleRounded(vp, 0.5f, 6, hv ? ColorBrightness(bg, 0.15f) : bg);
+        DrawText(armedId == 95 ? ask : vis, (int)vp.x + 10, (int)vp.y + 3, FS, r->isPrivate || armedId == 95 ? UI_TEXT : UI_MUTED);
+        if (Clicked(vp)) {
+            if (armedId != 95) { armedId = 95; armedT = 3; }
+            else {
+                armedId = 0;
+                r->isPrivate = !r->isPrivate;
+                if (r->isPrivate)                  /* people who can't see it any more don't keep a star on it */
+                    for (int i = r->starCount - 1; i >= 0; i--) if (!CanSee(r, r->starredBy[i])) RemoveStar(r, r->starredBy[i]);
+                MarkDirty();
+                Toast(r->isPrivate ? "Now private: only you, collaborators and people you invite can see it"
+                                   : "Now public: everyone can see it and fork it");
+            }
+        }
+    } else {
+        DrawRectangleRounded(vp, 0.5f, 6, r->isPrivate ? (Color){110, 80, 20, 255} : UI_BTN);
+        DrawText(vis, (int)vp.x + 10, (int)vp.y + 3, FS, r->isPrivate ? UI_TEXT : UI_MUTED);
+    }
+    pill = vp;
+
     /* next to the badge: how many people have forked this */
     int forks = ForkCount(r), ix = (int)(pill.x + pill.width + 16);
     const char *extra = TextFormat("%d branch%s%s", r->branchCount, r->branchCount == 1 ? "" : "es",
@@ -8333,8 +8402,10 @@ static bool DrawRepoHeader(Repo *r, int activeTab)
     int dx = x, dmax = W - 400;
     if (r->isFork) {
         int up = Upstream(r);
+        bool hiddenUp = up >= 0 && !CanSee(&repos[up], curUser);
+        if (hiddenUp) up = -1;                     /* private now: no link, no name */
         const char *pre = "forked from ";
-        const char *src = TextFormat("%s / %s", UserName(r->forkOwner), r->forkName);
+        const char *src = hiddenUp ? "a private repository" : TextFormat("%s / %s", UserName(r->forkOwner), r->forkName);
         int pw = MeasureText(pre, FS), sw = MeasureText(src, FS);
         DrawText(pre, dx, y + 40, FS, UI_MUTED);
         DrawText(src, dx + pw, y + 40, FS, up >= 0 ? UI_LINK : UI_MUTED);
@@ -11337,9 +11408,13 @@ static void HandleRequest(Conn *c, Req *q)
         return;
     }
     int uid = -1;
-    if (wantPush) {
+    if (wantPush || r->isPrivate) {               /* private repositories: even reading needs a password */
         uid = Authenticate(q);
         if (uid < 0) { AskForPassword(c); return; }
+        if (!CanSee(r, uid)) {                     /* don't even admit it exists */
+            ReplyText(c, 404, TextFormat("Mini GitHub has no repository called %s/%s\n", owner, name), NULL);
+            return;
+        }
     }
     if (strcmp(rest, "info/refs") == 0) {
         if (strcmp(q->method, "GET") != 0) { ReplyText(c, 405, "Use GET\n", NULL); return; }
@@ -11616,6 +11691,7 @@ int main(void)
         case SCR_NEW:      ScreenNew();      break;
         case SCR_REPO: {
             Repo *r = &repos[curRepo];
+            if (!CanSee(r, curUser)) { GoHome(); Toast("That repository is private"); break; }
             if (DrawRepoHeader(r, tab)) break;
             if      (tab == TAB_CODE)    TabCode(r);
             else if (tab == TAB_COMMITS) TabCommits(r);
@@ -11624,11 +11700,13 @@ int main(void)
         } break;
         case SCR_COMMIT: {
             Repo *r = &repos[curRepo];
+            if (!CanSee(r, curUser)) { GoHome(); Toast("That repository is private"); break; }
             if (DrawRepoHeader(r, TAB_COMMITS)) break;
             if (screen == SCR_COMMIT) ScreenCommit(r);
         } break;
         case SCR_UPLOAD: {
             Repo *r = &repos[curRepo];
+            if (!CanSee(r, curUser)) { GoHome(); Toast("That repository is private"); break; }
             if (DrawRepoHeader(r, TAB_CODE)) break;
             if (screen == SCR_UPLOAD) ScreenUpload(r);
         } break;
