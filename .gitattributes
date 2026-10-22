@@ -1,0 +1,5 @@
+# Windows batch files need CRLF line endings; make wants LF (and its recipe tabs kept)
+*.bat    text eol=crlf
+Makefile text eol=lf
+*.c      text
+*.h      text

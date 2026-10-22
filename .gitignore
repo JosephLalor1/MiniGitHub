@@ -9,3 +9,6 @@ minigithub
 
 # Fallback downloads folder
 downloads/
+
+# Compiled object files (make)
+build/
