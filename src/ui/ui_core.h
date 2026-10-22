@@ -28,8 +28,12 @@ extern const Color UI_YELLOW;
 extern const Color UI_PURPLE;
 extern const Color UI_ORANGE;
 
-/* Notes that something changed and needs saving (it's saved within a second). */
+/* Notes that something changed and needs saving (it's saved once changes pause for a second). */
 void MarkDirty(void);
+
+/* Called once a frame: true when it's time to save - the changes have stopped for a
+   second, or the oldest unsaved change is ten seconds old. */
+bool SaveIsDue(float frameSeconds);
 
 /* Shows a short message at the bottom of the window for a few seconds. */
 void Toast(const char *message);

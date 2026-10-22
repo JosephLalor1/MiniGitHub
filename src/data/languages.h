@@ -25,7 +25,14 @@ extern const char *LANG_NAMES[LANG_COUNT];
 #define LANG_BINARY (-2)                      /* not text at all (pictures and so on) */
 
 /* Remembers a file's points so they're only worked out once. */
-struct LangCache { unsigned short scores[LANG_COUNT]; int lines; bool done; bool binary; };
+struct LangCache {
+    unsigned short scores[LANG_COUNT];   /* points for each language, from the content */
+    int  lines;
+    bool done;
+    bool binary;
+    const char *pickedFor;               /* the (shared, interned) path pickedLang was worked out for */
+    int  pickedLang;                     /* the language for that path: scores plus its file ending */
+};
 
 /* Works out a file's language clues and line count into *cache. */
 void FillLangCache(LangCache *cache, const char *data, int length, bool binary);

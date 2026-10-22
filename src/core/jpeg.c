@@ -168,6 +168,7 @@ static void JpegDecodeScan(JpegDecoder *jpeg)
     int headerLength = JpegRead16(jpeg), scanComponentCount = jpeg->position < jpeg->size ? jpeg->data[jpeg->position++] : 0;
     JpegComponent *scanComponents[3];
     if (scanComponentCount < 1 || scanComponentCount > 3) { jpeg->error = "the picture data is damaged"; return; }
+    if (jpeg->position + (size_t)scanComponentCount * 2 + 3 > jpeg->size) { jpeg->error = "the file is cut short"; return; }
     for (int i = 0; i < scanComponentCount; i++) {
         int componentId = jpeg->data[jpeg->position++], tableIds = jpeg->data[jpeg->position++];
         scanComponents[i] = NULL;
@@ -267,6 +268,7 @@ Image DecodeJpg(const uint8_t *data, int size, const char **error)
             while (jpeg->position < segEnd) {
                 int precision = jpeg->data[jpeg->position] >> 4, quantTableId = jpeg->data[jpeg->position] & 3;
                 jpeg->position++;
+                if (jpeg->position + (precision ? 128 : 64) > segEnd) { jpeg->error = "the picture data is damaged"; break; }
                 for (int index = 0; index < 64; index++) {
                     if (precision) { jpeg->quantTables[quantTableId][index] = (uint16_t)(jpeg->data[jpeg->position] << 8 | jpeg->data[jpeg->position + 1]); jpeg->position += 2; }
                     else      jpeg->quantTables[quantTableId][index] = jpeg->data[jpeg->position++];
@@ -277,6 +279,7 @@ Image DecodeJpg(const uint8_t *data, int size, const char **error)
                 int tableClass = jpeg->data[jpeg->position] >> 4, huffmanTableId = jpeg->data[jpeg->position] & 3, valueCount = 0;
                 jpeg->position++;
                 JpegHuffman *table = tableClass ? &jpeg->acTables[huffmanTableId] : &jpeg->dcTables[huffmanTableId];
+                if (jpeg->position + 16 > segEnd) { jpeg->error = "the picture data is damaged"; break; }
                 for (int length = 1; length <= 16; length++) { table->counts[length] = jpeg->data[jpeg->position++]; valueCount += table->counts[length]; }
                 if (valueCount > 256 || jpeg->position + (size_t)valueCount > segEnd) { jpeg->error = "the picture data is damaged"; break; }
                 memcpy(table->values, jpeg->data + jpeg->position, (size_t)valueCount);
@@ -284,12 +287,14 @@ Image DecodeJpg(const uint8_t *data, int size, const char **error)
                 JpegBuildHuffman(table);
             }
         } else if (marker == 0xC0 || marker == 0xC1) {          /* frame header: size and colour layout */
+            if (segEnd - jpeg->position < 6) { jpeg->error = "the picture data is damaged"; break; }
             jpeg->position++;                                   /* bits per sample: always 8 here */
             jpeg->height = JpegRead16(jpeg);
             jpeg->width = JpegRead16(jpeg);
             jpeg->componentCount = jpeg->data[jpeg->position++];
             if (jpeg->componentCount != 1 && jpeg->componentCount != 3) { jpeg->error = "CMYK JPG files aren't supported"; break; }
             if (jpeg->width <= 0 || jpeg->height <= 0 || jpeg->width > 16384 || jpeg->height > 16384) { jpeg->error = "the picture is too big"; break; }
+            if (jpeg->position + (size_t)jpeg->componentCount * 3 > segEnd) { jpeg->error = "the picture data is damaged"; break; }
             jpeg->maxHSampling = jpeg->maxVSampling = 1;
             for (int i = 0; i < jpeg->componentCount; i++) {
                 JpegComponent *component = &jpeg->components[i];
@@ -305,6 +310,7 @@ Image DecodeJpg(const uint8_t *data, int size, const char **error)
                 JpegComponent *component = &jpeg->components[i];
                 component->blocksWide = mcusAcross * component->hSampling;
                 component->blocksHigh = mcusDown * component->vSampling;
+                free(component->pixels);                        /* (a second frame header: the first one's pixels go) */
                 component->pixels = calloc((size_t)component->blocksWide * 8 * (size_t)component->blocksHigh * 8, 1);
                 if (!component->pixels) jpeg->error = "out of memory";
             }

@@ -71,10 +71,7 @@ void ScreenLoadFail(void)
         if (ConfirmButton((Rectangle){buttonX, buttonY, 330, 44}, "Use the last good copy", "Click again to use it", 70)) {
             const char *aside = SetAsideName();
             if (rename(SAVE_FILE, aside) != 0) { Toast("Couldn't move the unreadable file aside"); return; }
-            int size = 0;
-            unsigned char *data = LoadFileData(SAVE_FILE ".last-good", &size);
-            bool ok = data && SaveFileData(SAVE_FILE, data, size);
-            if (data) UnloadFileData(data);
+            bool ok = CopyFileBytes(SAVE_FILE ".last-good", SAVE_FILE);
             loadFailed = false;
             if (ok && Load()) { AfterLoad(); Toast(TextFormat("Restored the last good copy - the unreadable file is kept as %s", GetFileName(aside))); }
             else { rename(aside, SAVE_FILE); loadFailed = true; Toast("That copy couldn't be read either - nothing was changed"); }

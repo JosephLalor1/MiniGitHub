@@ -183,8 +183,17 @@ static bool ParseRequestHead(const uint8_t *data, int length, HttpRequest *reque
         int lineLength = lineEnd - pos;
         if (lineLength == 0) break;
         if (lineNumber++ == 0) {
+            /* the request line on its own, ending in a zero: the received bytes don't end
+               in one, and sscanf would otherwise read on into the next lines (or past the
+               end of what arrived) when the line is malformed */
+            char *requestLine = malloc((size_t)lineLength + 1);
+            if (!requestLine) return false;
+            memcpy(requestLine, lineText, (size_t)lineLength);
+            requestLine[lineLength] = 0;
             char target[800];
-            if (sscanf(lineText, "%7s %799s", request->method, target) != 2) return false;
+            int parts = sscanf(requestLine, "%7s %799s", request->method, target);
+            free(requestLine);
+            if (parts != 2) return false;
             char *questionMark = strchr(target, '?');
             if (questionMark) { snprintf(request->query, sizeof request->query, "%s", questionMark + 1); *questionMark = 0; }
             /* undo %20-style escapes */
@@ -198,7 +207,11 @@ static bool ParseRequestHead(const uint8_t *data, int length, HttpRequest *reque
         } else {
             const char *value;
             int valueLength;
-            if (HeaderMatches(lineText, lineLength, "Content-Length", &value, &valueLength)) request->contentLength = strtoll(value, NULL, 10);
+            if (HeaderMatches(lineText, lineLength, "Content-Length", &value, &valueLength)) {
+                char number[32];                                  /* ending in a zero, so strtoll stops at the line's end */
+                snprintf(number, sizeof number, "%.*s", valueLength, value);
+                request->contentLength = strtoll(number, NULL, 10);
+            }
             else if (HeaderMatches(lineText, lineLength, "Transfer-Encoding", &value, &valueLength)) request->chunked = HeaderValueHas(value, valueLength, "chunked");
             else if (HeaderMatches(lineText, lineLength, "Content-Encoding", &value, &valueLength)) request->gzip = HeaderValueHas(value, valueLength, "gzip");
             else if (HeaderMatches(lineText, lineLength, "Expect", &value, &valueLength)) request->expectsContinue = HeaderValueHas(value, valueLength, "100-continue");

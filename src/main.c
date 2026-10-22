@@ -112,12 +112,11 @@ int main(void)
     if (loadFailed) screen = SCREEN_LOAD_FAILED;  /* say so, and wait: nothing is saved until you choose */
     else AfterLoad();
 
-    float saveTimer = 0;                   /* seconds since the last save */
     int   lastCursor = -1;                 /* the mouse cursor shape set last frame */
 
     /* Each frame: answer git, handle dropped files and the Back keys, draw
        the current page (which also handles its clicks and typing), then
-       remember the page for Back and save if anything changed. */
+       remember the page for Back and save once the changes have stopped. */
     while (!WindowShouldClose() && !quitNow) {
         screenWidth = GetScreenWidth();
         screenHeight = GetScreenHeight();
@@ -235,8 +234,7 @@ int main(void)
 
         if (wantedCursor != lastCursor) { SetMouseCursor(wantedCursor); lastCursor = wantedCursor; }
 
-        saveTimer += frameSeconds;
-        if (unsavedChanges && saveTimer > 0.75f) { Save(); unsavedChanges = false; saveTimer = 0; }
+        if (SaveIsDue(frameSeconds)) { Save(); unsavedChanges = false; }
     }
 
     GitServerStop();

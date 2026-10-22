@@ -33,8 +33,27 @@ const Color UI_ORANGE = {247, 129, 102, 255};
 /* Small helpers                                                      */
 /* ------------------------------------------------------------------ */
 
-/* Notes that something changed and needs saving (it's saved within a second). */
-void MarkDirty(void) { unsavedChanges = true; }
+/* Notes that something changed and needs saving (it's saved once changes pause for a second). */
+void MarkDirty(void) { unsavedChanges = true; changeCount++; }
+
+/* Saving rewrites the whole save file, which takes a moment once there's a lot in
+   it - and the window can't redraw meanwhile. Saving soon after every change meant
+   a pause every second while typing, so this waits for the changes to stop instead:
+   a second with nothing new, or at most ten seconds after the first unsaved change. */
+static float    quietSeconds;               /* seconds since the last change */
+static float    unsavedSeconds;             /* seconds since the first change that isn't saved yet */
+static unsigned lastChangeCount;            /* changeCount the frame before */
+
+bool SaveIsDue(float frameSeconds)
+{
+    quietSeconds = changeCount != lastChangeCount ? 0 : quietSeconds + frameSeconds;
+    lastChangeCount = changeCount;
+    if (!unsavedChanges) { unsavedSeconds = 0; return false; }
+    unsavedSeconds += frameSeconds;
+    if (quietSeconds < 1.0f && unsavedSeconds < 10.0f) return false;
+    unsavedSeconds = 0;
+    return true;
+}
 /* Shows a short message at the bottom of the window for a few seconds. */
 void Toast(const char *message) { snprintf(toastText, sizeof toastText, "%s", message); toastSeconds = 3.0f; }
 

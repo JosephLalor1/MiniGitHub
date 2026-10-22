@@ -43,6 +43,7 @@ extern int wantedCursor;
 extern int gitPort;                /* the git server's port (see "Talking to real git"), 0 = off */
 extern char gitProblem[TEXT_LEN];  /* why it isn't running */
 extern bool unsavedChanges;        /* something changed and needs saving */
+extern unsigned changeCount;       /* goes up with every change (MarkDirty), so the main loop can tell when changes stop */
 extern char toastText[TEXT_LEN];
 extern float toastSeconds;
 extern int armedButtonId;  /* for "click again to confirm" buttons */

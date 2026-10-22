@@ -32,4 +32,8 @@ void Save(void);
    (profiles + recovery codes), 3 (either one), 2 (accounts), 1 (before accounts). */
 bool Load(void);
 
+/* Copies a file a piece at a time, under a temporary name until it's complete (so a
+   copy cut short never replaces a good file). False if it couldn't be made. */
+bool CopyFileBytes(const char *fromPath, const char *toPath);
+
 #endif

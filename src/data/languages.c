@@ -238,11 +238,40 @@ static bool ContainsText(const char *data, int length, const char *text)
     return false;
 }
 
-/* Same letters, ignoring capitals (strncasecmp isn't on every compiler). */
-static bool MatchesIgnoreCase(const char *a, const char *b, int length)
+/* The clues sorted out once, so each line and each word only looks at the clues
+   that could apply to it, instead of all of them every time (which made reading a
+   file the slowest part of opening a repository for the first time):
+     lineClueList          how a line starts or ends, and the "#!" first line
+     wordClueList          the whole-word clues, grouped by length: the ones of
+                           length n are wordClueList[wordClueFirst[n] .. wordClueFirst[n + 1] - 1]
+     textClueList          the "this text anywhere" clues
+   Every clue's hits are counted on their own, so the order they're checked in
+   makes no difference to the points. */
+#define MAX_WORD_CLUE_LENGTH 31
+static int  clueLengths[CLUE_COUNT];
+static int  lineClueList[CLUE_COUNT], lineClueCount;
+static int  wordClueList[CLUE_COUNT], wordClueFirst[MAX_WORD_CLUE_LENGTH + 2];
+static int  textClueList[CLUE_COUNT], textClueCount;
+static bool cluesIndexed;
+
+static void IndexClues(void)
 {
-    for (int i = 0; i < length; i++) if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
-    return true;
+    int wordClueCount = 0;
+    for (int length = 0; length <= MAX_WORD_CLUE_LENGTH; length++) {
+        wordClueFirst[length] = wordClueCount;
+        for (int k = 0; k < CLUE_COUNT; k++)
+            if ((CLUES[k].kind == CLUE_WORD || CLUES[k].kind == CLUE_WORD_ANYCASE) && (int)strlen(CLUES[k].text) == length)
+                wordClueList[wordClueCount++] = k;
+    }
+    wordClueFirst[MAX_WORD_CLUE_LENGTH + 1] = wordClueCount;
+    for (int k = 0; k < CLUE_COUNT; k++) {
+        clueLengths[k] = (int)strlen(CLUES[k].text);
+        int kind = CLUES[k].kind;
+        if (kind == CLUE_LINE_START || kind == CLUE_LINE_START_ANYCASE || kind == CLUE_LINE_END || kind == CLUE_SHEBANG)
+            lineClueList[lineClueCount++] = k;
+        else if (kind == CLUE_TEXT) textClueList[textClueCount++] = k;
+    }
+    cluesIndexed = true;
 }
 
 /* Points for each language, from the content alone. */
@@ -274,6 +303,7 @@ static void ScoreLanguages(const char *data, int length, unsigned short scores[L
         data = withoutCodeBlocks;
         scanLength = cleanLength;
     }
+    if (!cluesIndexed) IndexClues();
     int clueHits[sizeof CLUES / sizeof CLUES[0]];
     memset(clueHits, 0, sizeof clueHits);
     #define COUNT_HIT(i) do { if (clueHits[i] < 4) clueHits[i]++; } while (0)
@@ -303,22 +333,21 @@ static void ScoreLanguages(const char *data, int length, unsigned short scores[L
         }
         if (lineStart < scanLength && data[lineStart] == '\t' && textEnd > textStart) tabLines++;
 
-        for (int i = 0; i < CLUE_COUNT; i++) {
+        for (int listIndex = 0; listIndex < lineClueCount; listIndex++) {
+            int i = lineClueList[listIndex];
             const Clue *clue = &CLUES[i];
             if (isComment && !(clue->kind == CLUE_LINE_START && clue->text[0] == '/')) continue;
-            int clueLength;
+            int clueLength = clueLengths[i];
             switch (clue->kind) {
             case CLUE_LINE_START: case CLUE_LINE_START_ANYCASE:
-                clueLength = (int)strlen(clue->text);
                 if (textEnd - textStart < clueLength) break;
-                if (clue->kind == CLUE_LINE_START ? memcmp(data + textStart, clue->text, (size_t)clueLength) == 0 : MatchesIgnoreCase(data + textStart, clue->text, clueLength)) {
+                if (clue->kind == CLUE_LINE_START ? memcmp(data + textStart, clue->text, (size_t)clueLength) == 0 : SameTextIgnoreCase(data + textStart, clue->text, clueLength)) {
                     /* for word-like clues ("fi", "end", "mov") the next character mustn't continue the word */
                     char lastChar = clue->text[clueLength - 1], nextChar = textStart + clueLength < textEnd ? data[textStart + clueLength] : ' ';
                     if (!(WordChar(lastChar) && WordChar(nextChar))) COUNT_HIT(i);
                 }
                 break;
             case CLUE_LINE_END:
-                clueLength = (int)strlen(clue->text);
                 if (textEnd - textStart >= clueLength && memcmp(data + textEnd - clueLength, clue->text, (size_t)clueLength) == 0) COUNT_HIT(i);
                 break;
             case CLUE_SHEBANG:
@@ -339,11 +368,12 @@ static void ScoreLanguages(const char *data, int length, unsigned short scores[L
                 int wordEnd = i;
                 while (wordEnd < textEnd && WordChar(data[wordEnd])) wordEnd++;
                 int wordLength = wordEnd - i;
-                for (int k = 0; k < CLUE_COUNT; k++) {
+                for (int listIndex = wordLength <= MAX_WORD_CLUE_LENGTH ? wordClueFirst[wordLength] : 0;
+                     wordLength <= MAX_WORD_CLUE_LENGTH && listIndex < wordClueFirst[wordLength + 1]; listIndex++) {
+                    int k = wordClueList[listIndex];                       /* only the clues this long */
                     const Clue *clue = &CLUES[k];
-                    if ((clue->kind != CLUE_WORD && clue->kind != CLUE_WORD_ANYCASE) || clueHits[k] >= 4) continue;
-                    if ((int)strlen(clue->text) != wordLength) continue;
-                    if (clue->kind == CLUE_WORD ? memcmp(data + i, clue->text, (size_t)wordLength) == 0 : MatchesIgnoreCase(data + i, clue->text, wordLength)) COUNT_HIT(k);
+                    if (clueHits[k] >= 4) continue;
+                    if (clue->kind == CLUE_WORD ? memcmp(data + i, clue->text, (size_t)wordLength) == 0 : SameTextIgnoreCase(data + i, clue->text, wordLength)) COUNT_HIT(k);
                 }
                 i = wordEnd;
             }
@@ -370,12 +400,19 @@ static void ScoreLanguages(const char *data, int length, unsigned short scores[L
     }
 
     /* text anywhere (memmem isn't everywhere, so a simple search) */
-    for (int k = 0; k < CLUE_COUNT; k++) {
+    for (int listIndex = 0; listIndex < textClueCount; listIndex++) {
+        int k = textClueList[listIndex];
         const Clue *clue = &CLUES[k];
-        if (clue->kind != CLUE_TEXT) continue;
-        int clueLength = (int)strlen(clue->text);
-        for (int i = 0; i + clueLength <= scanLength && clueHits[k] < 4; i++)
-            if (data[i] == clue->text[0] && memcmp(data + i, clue->text, (size_t)clueLength) == 0) { COUNT_HIT(k); i += clueLength - 1; }
+        int clueLength = clueLengths[k];
+        /* memchr jumps straight to the next place the clue's first character appears
+           (much faster than checking every byte); a match is counted, then skipped over */
+        for (int i = 0; i + clueLength <= scanLength && clueHits[k] < 4; ) {
+            const char *candidate = memchr(data + i, clue->text[0], (size_t)(scanLength - clueLength + 1 - i));
+            if (!candidate) break;
+            i = (int)(candidate - data);
+            if (memcmp(data + i, clue->text, (size_t)clueLength) == 0) { COUNT_HIT(k); i += clueLength; }
+            else i++;
+        }
     }
     #undef COUNT_HIT
 
@@ -449,6 +486,7 @@ void FillLangCache(LangCache *cache, const char *data, int length, bool binary)
 {
     cache->binary = binary;
     cache->lines = 0;
+    cache->pickedFor = NULL;                                  /* new clues: pick the language again */
     if (!binary) {
         ScoreLanguages(data, length, cache->scores);
         cache->lines = length ? 1 : 0;
@@ -486,7 +524,16 @@ int ViewFileLang(Repo *repo, ViewFile *viewFile, int *lineCount)
 {
     LangCache *cache = viewFile->draftFile ? GetWorkLangCache(viewFile->draftFile) : viewFile->blob >= 0 ? GetBlobLangCache(repo, viewFile->blob) : NULL;
     if (lineCount) *lineCount = cache ? cache->lines : 0;
-    return cache ? LangFromCache(cache, viewFile->name) : LANG_TEXT;
+    if (!cache) return LANG_TEXT;
+    if (cache->binary) return LANG_BINARY;
+    /* Picking means checking the file ending too, for every file, several times a frame -
+       so the answer is kept. Paths in the view are interned (one shared copy each, never
+       freed), so the same pointer always means the same path. */
+    if (cache->pickedFor != viewFile->name) {
+        cache->pickedLang = PickLang(cache->scores, viewFile->name);
+        cache->pickedFor = viewFile->name;
+    }
+    return cache->pickedLang;
 }
 
 /* The name to show for a language ("Binary" for non-text files). */

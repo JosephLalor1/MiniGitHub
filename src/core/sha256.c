@@ -63,10 +63,13 @@ void Sha256Update(Sha256 *sha, const void *data, size_t length)
 {
     const uint8_t *bytes = (const uint8_t *)data;
     sha->totalLength += length;
-    while (length--) {
-        sha->block[sha->blockUsed++] = *bytes++;
+    /* top up a part-filled block first, then hash whole blocks straight from the input */
+    if (sha->blockUsed) {
+        while (length && sha->blockUsed < 64) { sha->block[sha->blockUsed++] = *bytes++; length--; }
         if (sha->blockUsed == 64) { Sha256ProcessBlock(sha, sha->block); sha->blockUsed = 0; }
     }
+    while (length >= 64) { Sha256ProcessBlock(sha, bytes); bytes += 64; length -= 64; }
+    while (length) { sha->block[sha->blockUsed++] = *bytes++; length--; }
 }
 /* Finishes a SHA-256 calculation and writes the 32-byte digest. */
 void Sha256Final(Sha256 *sha, uint8_t digest[32])
@@ -83,29 +86,48 @@ void Sha256Final(Sha256 *sha, uint8_t digest[32])
     }
 }
 
-static void HmacSha256(const uint8_t *key, size_t keyLength, const uint8_t *message, size_t messageLength, uint8_t out[32])
+/* An HMAC-SHA256 key, ready to use: HMAC hashes the key (padded to a block and
+   mixed with 0x36 / 0x5c) before every message, so with the same key used tens of
+   thousands of times - as PBKDF2 does - those two blocks are hashed once and kept. */
+typedef struct { Sha256 inner, outer; } HmacKey;
+
+static void HmacKeyInit(HmacKey *hmac, const uint8_t *key, size_t keyLength)
 {
-    uint8_t paddedKey[64] = {0}, innerPad[64], outerPad[64], innerHash[32];
-    Sha256 sha;
-    if (keyLength > 64) { Sha256Init(&sha); Sha256Update(&sha, key, keyLength); Sha256Final(&sha, paddedKey); }
+    uint8_t paddedKey[64] = {0}, innerPad[64], outerPad[64];
+    if (keyLength > 64) { Sha256 sha; Sha256Init(&sha); Sha256Update(&sha, key, keyLength); Sha256Final(&sha, paddedKey); }
     else memcpy(paddedKey, key, keyLength);
     for (int i = 0; i < 64; i++) { innerPad[i] = paddedKey[i] ^ 0x36; outerPad[i] = paddedKey[i] ^ 0x5c; }
-    Sha256Init(&sha); Sha256Update(&sha, innerPad, 64); Sha256Update(&sha, message, messageLength); Sha256Final(&sha, innerHash);
-    Sha256Init(&sha); Sha256Update(&sha, outerPad, 64); Sha256Update(&sha, innerHash, 32); Sha256Final(&sha, out);
+    Sha256Init(&hmac->inner); Sha256Update(&hmac->inner, innerPad, 64);
+    Sha256Init(&hmac->outer); Sha256Update(&hmac->outer, outerPad, 64);
+    memset(paddedKey, 0, sizeof paddedKey);               /* don't leave the password lying around */
+    memset(innerPad, 0, sizeof innerPad);
+    memset(outerPad, 0, sizeof outerPad);
+}
+
+/* HMAC-SHA256 of a message with a key prepared by HmacKeyInit. */
+static void HmacSha256(const HmacKey *hmac, const uint8_t *message, size_t messageLength, uint8_t out[32])
+{
+    uint8_t innerHash[32];
+    Sha256 sha = hmac->inner;
+    Sha256Update(&sha, message, messageLength); Sha256Final(&sha, innerHash);
+    sha = hmac->outer;
+    Sha256Update(&sha, innerHash, 32); Sha256Final(&sha, out);
 }
 
 /* Standard PBKDF2-HMAC-SHA256, producing one 32-byte block. */
 void Pbkdf2(const char *password, const uint8_t *salt, int saltLength, int iterations, uint8_t out[32])
 {
-    size_t passwordLength = strlen(password);
+    HmacKey hmac;
+    HmacKeyInit(&hmac, (const uint8_t *)password, strlen(password));
     uint8_t firstMessage[64 + 4], block[32], nextBlock[32];
     memcpy(firstMessage, salt, (size_t)saltLength);
     firstMessage[saltLength] = 0; firstMessage[saltLength + 1] = 0; firstMessage[saltLength + 2] = 0; firstMessage[saltLength + 3] = 1;
-    HmacSha256((const uint8_t *)password, passwordLength, firstMessage, (size_t)saltLength + 4, block);
+    HmacSha256(&hmac, firstMessage, (size_t)saltLength + 4, block);
     memcpy(out, block, 32);
     for (int i = 1; i < iterations; i++) {
-        HmacSha256((const uint8_t *)password, passwordLength, block, 32, nextBlock);
+        HmacSha256(&hmac, block, 32, nextBlock);
         memcpy(block, nextBlock, 32);
         for (int j = 0; j < 32; j++) out[j] ^= block[j];
     }
+    memset(&hmac, 0, sizeof hmac);
 }

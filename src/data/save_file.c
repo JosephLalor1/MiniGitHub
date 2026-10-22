@@ -240,6 +240,35 @@ void Save(void)
     rename(SAVE_FILE ".tmp", SAVE_FILE);
 }
 
+/* Copies a file's bytes to another file, a megabyte at a time: the save file can
+   be hundreds of megabytes, and this never holds it all in memory at once. The copy
+   is written under a temporary name and only then given its real name, so a copy
+   cut short (the program closed, the disk full) never replaces a good file. (The
+   temporary name isn't "....tmp": Load treats minigithub.dat.tmp as an unfinished
+   save to recover.) Returns false if the copy couldn't be made. */
+bool CopyFileBytes(const char *fromPath, const char *toPath)
+{
+    char partialPath[1100];
+    snprintf(partialPath, sizeof partialPath, "%s.copying", toPath);
+    FILE *from = fopen(fromPath, "rb");
+    if (!from) return false;
+    FILE *to = fopen(partialPath, "wb");
+    if (!to) { fclose(from); return false; }
+    static char chunk[1 << 20];
+    bool ok = true;
+    size_t got;
+    while (ok && (got = fread(chunk, 1, sizeof chunk, from)) > 0) ok = fwrite(chunk, 1, got, to) == got;
+    ok = ok && !ferror(from);
+    fclose(from);
+    ok = fclose(to) == 0 && ok;
+    if (ok) {
+        remove(toPath);                                   /* rename won't replace a file on Windows */
+        ok = rename(partialPath, toPath) == 0;
+    }
+    if (!ok) remove(partialPath);
+    return ok;
+}
+
 /* "MINIGITHUB3" was used by two different versions of this program: one added
    profiles, the other added recovery codes. Both put their new fields right after
    each account's creation time: profiles start with the bio (text, then a number),
@@ -613,11 +642,7 @@ bool Load(void)
             /* keep the old file, just in case */
             char backupName[64];
             snprintf(backupName, sizeof backupName, "%s.v%d-backup", SAVE_FILE, version);
-            if (!FileExists(backupName)) {
-                int size = 0;
-                unsigned char *fileBytes = LoadFileData(SAVE_FILE, &size);
-                if (fileBytes) { SaveFileData(backupName, fileBytes, size); UnloadFileData(fileBytes); }
-            }
+            if (!FileExists(backupName)) CopyFileBytes(SAVE_FILE, backupName);
             MarkDirty();
         }
     }
@@ -639,16 +664,12 @@ bool Load(void)
     if (repairedCount) {                                     /* save the mended version (the old file is kept, below) */
         char backupName[64];
         snprintf(backupName, sizeof backupName, "%s.before-repair", SAVE_FILE);
-        if (!FileExists(backupName)) { int size = 0; unsigned char *fileBytes = LoadFileData(SAVE_FILE, &size); if (fileBytes) { SaveFileData(backupName, fileBytes, size); UnloadFileData(fileBytes); } }
+        if (!FileExists(backupName)) CopyFileBytes(SAVE_FILE, backupName);
         MarkDirty();
         Toast(TextFormat("Mended the history of %d repositor%s stored out of order by an older version", repairedCount, repairedCount == 1 ? "y" : "ies"));
         return true;
     }
     /* it loaded: keep a copy of this good file, in case anything goes wrong later */
-    if (version >= 7) {
-        int size = 0;
-        unsigned char *fileBytes = LoadFileData(SAVE_FILE, &size);
-        if (fileBytes) { SaveFileData(SAVE_FILE ".last-good", fileBytes, size); UnloadFileData(fileBytes); }
-    }
+    if (version >= 7) CopyFileBytes(SAVE_FILE, SAVE_FILE ".last-good");
     return true;
 }

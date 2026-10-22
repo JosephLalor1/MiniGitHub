@@ -7,6 +7,7 @@
  */
 
 #include "diff.h"
+#include "util.h"
 #include "model.h"
 #include "repo.h"
 
@@ -20,24 +21,13 @@ LineRef *diffOldLines, *diffNewLines;
 DiffOp  *diffOps;
 int      diffOldCapacity, diffNewCapacity, diffOpsCapacity, diffOpCount;
 
-static void *GrowBuffer(void *array, int *capacity, int needed, size_t itemSize)
-{
-    if (needed <= *capacity) return array;
-    int newCapacity = *capacity ? *capacity : 256;
-    while (newCapacity < needed) newCapacity *= 2;
-    void *grown = realloc(array, (size_t)newCapacity * itemSize);
-    if (!grown) return array;                 /* out of memory: keep the old one */
-    *capacity = newCapacity;
-    return grown;
-}
-
 /* Cuts text into lines (without the newline characters). Returns how many. */
 int SplitLines(const char *text, LineRef **lines, int *capacity)
 {
     int count = 0;
     const char *lineStart = text;
     while (*lineStart) {
-        *lines = GrowBuffer(*lines, capacity, count + 1, sizeof(LineRef));
+        *lines = GrowArray(*lines, capacity, count + 1, sizeof(LineRef));
         if (count >= *capacity) break;
         const char *lineEnd = strchr(lineStart, '\n');
         (*lines)[count].start = lineStart;
@@ -64,7 +54,7 @@ void ComputeDiff(const char *oldText, const char *newText, int *adds, int *dels)
 {
     int oldCount = SplitLines(oldText, &diffOldLines, &diffOldCapacity), newCount = SplitLines(newText, &diffNewLines, &diffNewCapacity);
     int addCount = 0, delCount = 0;
-    diffOps = GrowBuffer(diffOps, &diffOpsCapacity, oldCount + newCount + 1, sizeof(DiffOp));
+    diffOps = GrowArray(diffOps, &diffOpsCapacity, oldCount + newCount + 1, sizeof(DiffOp));
     diffOpCount = 0;
     if (diffOpsCapacity < oldCount + newCount + 1) { if (adds) *adds = 0; if (dels) *dels = 0; return; }
 
@@ -123,7 +113,7 @@ void DiffCounts(const char *oldText, const char *newText, int *adds, int *dels)
     int oldMiddleCount = oldCount - prefix - suffix, newMiddleCount = newCount - prefix - suffix;
     if (!oldMiddleCount || !newMiddleCount) { *adds = newMiddleCount; *dels = oldMiddleCount; return; }
     int maxEdits = oldMiddleCount + newMiddleCount < 4000 ? oldMiddleCount + newMiddleCount : 4000;
-    countFurthest = GrowBuffer(countFurthest, &countFurthestCapacity, 2 * maxEdits + 3, sizeof(int));
+    countFurthest = GrowArray(countFurthest, &countFurthestCapacity, 2 * maxEdits + 3, sizeof(int));
     if (countFurthestCapacity < 2 * maxEdits + 3) { ComputeDiff(oldText, newText, adds, dels); return; }
     int *furthest = countFurthest + maxEdits + 1;
     furthest[1] = 0;
