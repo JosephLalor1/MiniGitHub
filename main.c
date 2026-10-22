@@ -4712,6 +4712,200 @@ static void OpenCommit(int ci)
 }
 
 /* ------------------------------------------------------------------ */
+/* Going back                                                         */
+/*                                                                    */
+/* Every page you visit is remembered (like a web browser's history), */
+/* so Back returns to the one before. Pages that only make sense once */
+/* - "New repository", "Upload files", the recovery code, and the     */
+/* sign-in pages - are never remembered, so Back can't return to a    */
+/* form whose job is done. And before going back to a page, it's      */
+/* checked that it still exists (the repository wasn't deleted, the   */
+/* commit is still there...); if not, Back goes further back. With    */
+/* nowhere left to go, Back signs you out: every chain ends at the    */
+/* sign-in page.                                                      */
+/* ------------------------------------------------------------------ */
+static int  FindRepoOf(int owner, const char *name);
+static void SetTip(const char *a, const char *b, const char *c);
+static bool codeMenu, branchMenu;                    /* (the drop-down menus, further down) */
+typedef struct {
+    Screen    screen;
+    int       repoOwner; char repoName[NAME_LEN];   /* a repository by owner + name: positions in the list change */
+    Tab       tab;
+    uint8_t   commit[20];                            /* a commit by its fingerprint */
+    int       viewUser, dayUser;
+    long long day;
+    int       settingsTab;
+    bool      fromDay;
+} Page;
+#define MAX_HISTORY 100
+static Page navHist[MAX_HISTORY];
+static int  navCount;
+static Page navNow;                                  /* the page shown last frame */
+static bool navHaveNow, navGoingBack;
+static int  navUser = -1;                            /* whose history it is */
+
+static bool Remembered(Screen s)
+{
+    return s == SCR_PROFILE || s == SCR_REPO || s == SCR_COMMIT || s == SCR_DAY || s == SCR_ACCOUNT || s == SCR_PEOPLE;
+}
+
+static Page CurrentPage(void)
+{
+    Page p;
+    memset(&p, 0, sizeof p);
+    p.screen = screen;
+    p.viewUser = -1; p.dayUser = -1; p.repoOwner = -1;
+    if ((screen == SCR_REPO || screen == SCR_COMMIT || screen == SCR_UPLOAD) && curRepo >= 0 && curRepo < repoCount) {
+        p.repoOwner = repos[curRepo].owner;
+        snprintf(p.repoName, NAME_LEN, "%s", repos[curRepo].name);
+        p.tab = tab;
+        if (screen == SCR_COMMIT && curCommit >= 0 && curCommit < repos[curRepo].commitCount) {
+            memcpy(p.commit, repos[curRepo].commits[curCommit].sha, 20);
+            p.fromDay = fromDay;
+            p.dayUser = dayUser; p.day = curDay;
+        }
+    }
+    if (screen == SCR_PROFILE) p.viewUser = viewUser;
+    if (screen == SCR_DAY) { p.dayUser = dayUser; p.day = curDay; }
+    if (screen == SCR_ACCOUNT) p.settingsTab = settingsTab;
+    return p;
+}
+
+static bool SamePage(const Page *a, const Page *b)
+{
+    if (a->screen != b->screen) return false;
+    switch (a->screen) {
+    case SCR_PROFILE: return a->viewUser == b->viewUser;
+    case SCR_REPO:    return a->repoOwner == b->repoOwner && strcmp(a->repoName, b->repoName) == 0 && a->tab == b->tab;
+    case SCR_COMMIT:  return a->repoOwner == b->repoOwner && strcmp(a->repoName, b->repoName) == 0 && memcmp(a->commit, b->commit, 20) == 0;
+    case SCR_UPLOAD:  return a->repoOwner == b->repoOwner && strcmp(a->repoName, b->repoName) == 0;
+    case SCR_DAY:     return a->dayUser == b->dayUser && a->day == b->day;
+    case SCR_ACCOUNT: return a->settingsTab == b->settingsTab;
+    default:          return true;
+    }
+}
+
+static void NavClear(void) { navCount = 0; navHaveNow = false; }
+
+/* Called once a frame, after the page has been drawn: if you've moved to a
+   different page, the one you left goes on the history (if it's one to keep). */
+static void NavTrack(void)
+{
+    if (curUser != navUser) { NavClear(); navUser = curUser; }   /* signed in or out: a fresh history */
+    Page now = CurrentPage();
+    if (!navHaveNow) { navNow = now; navHaveNow = true; navGoingBack = false; return; }
+    if (SamePage(&now, &navNow)) return;
+    if (!navGoingBack && Remembered(navNow.screen) && curUser >= 0 &&
+        !(navCount && SamePage(&navHist[navCount - 1], &navNow))) {
+        if (navCount == MAX_HISTORY) { memmove(navHist, navHist + 1, sizeof(Page) * (MAX_HISTORY - 1)); navCount--; }
+        navHist[navCount++] = navNow;
+    }
+    navNow = now;
+    navGoingBack = false;
+}
+
+/* Is this remembered page still there? (index of its repository in *ri, commit in *ci) */
+static bool PageStillThere(const Page *p, int *ri, int *ci)
+{
+    *ri = *ci = -1;
+    if (curUser < 0) return false;
+    if (p->screen == SCR_REPO || p->screen == SCR_COMMIT) {
+        *ri = FindRepoOf(p->repoOwner, p->repoName);
+        if (*ri < 0) return false;                                      /* deleted (or renamed) */
+        if (p->screen == SCR_COMMIT) { *ci = CommitBySha(&repos[*ri], p->commit); if (*ci < 0) return false; }
+        return true;
+    }
+    if (p->screen == SCR_PROFILE) return FindUserById(p->viewUser) != NULL;
+    if (p->screen == SCR_DAY)     return FindUserById(p->dayUser) != NULL;
+    return p->screen == SCR_ACCOUNT || p->screen == SCR_PEOPLE;
+}
+
+/* Where Back would go: the newest remembered page that's still there (-1 = none). */
+static int NavTarget(void)
+{
+    Page now = CurrentPage();
+    for (int i = navCount - 1; i >= 0; i--) {
+        int ri, ci;
+        if (SamePage(&navHist[i], &now)) continue;                      /* that's where you are */
+        if (PageStillThere(&navHist[i], &ri, &ci)) return i;
+    }
+    return -1;
+}
+
+/* A few words for the tooltip: "jo / hello-world (Commits)". */
+static const char *PageLabel(const Page *p)
+{
+    static const char *tabs[4] = {"Code", "Commits", "Issues", "People"};
+    switch (p->screen) {
+    case SCR_PROFILE: return p->viewUser == curUser ? "your profile" : TextFormat("%s's profile", UserName(p->viewUser));
+    case SCR_REPO:    return TextFormat("%s / %s (%s)", UserName(p->repoOwner), p->repoName, tabs[p->tab]);
+    case SCR_COMMIT:  return TextFormat("a commit in %s / %s", UserName(p->repoOwner), p->repoName);
+    case SCR_DAY:     return TextFormat("%s's contributions on %s", UserName(p->dayUser), FormatDay(p->day, false));
+    case SCR_ACCOUNT: return "your settings";
+    case SCR_PEOPLE:  return "People on this computer";
+    default:          return "the previous page";
+    }
+}
+
+/* Goes back. Returns false if there was nowhere to go. */
+static bool NavBack(void)
+{
+    int t = NavTarget();
+    if (t < 0) { navCount = 0; return false; }
+    Page p = navHist[t];
+    navCount = t;                                                       /* it and everything after it are used up */
+    int ri, ci;
+    PageStillThere(&p, &ri, &ci);
+    codeMenu = branchMenu = false;
+    switch (p.screen) {
+    case SCR_PROFILE: OpenProfile(p.viewUser); break;
+    case SCR_PEOPLE:  OpenPeople(); break;
+    case SCR_DAY:     OpenDay(p.dayUser, p.day); break;
+    case SCR_ACCOUNT: if (screen != SCR_ACCOUNT) OpenAccount(); settingsTab = p.settingsTab; Unfocus(); ClearSecrets(); break;
+    case SCR_REPO:
+        /* the same repository: just change tab (your file, scroll and commit message stay) */
+        if (curRepo == ri && (screen == SCR_REPO || screen == SCR_COMMIT || screen == SCR_UPLOAD)) { Unfocus(); screen = SCR_REPO; }
+        else OpenRepo(ri);
+        tab = p.tab;
+        break;
+    case SCR_COMMIT:
+        if (curRepo != ri) OpenRepo(ri);
+        OpenCommit(ci);
+        fromDay = p.fromDay; dayUser = p.dayUser; curDay = p.day;
+        break;
+    default: break;
+    }
+    navGoingBack = true;
+    return true;
+}
+
+/* The Back button in the top bar. */
+static void DrawBackButton(void)
+{
+    if (screen == SCR_LOGIN || screen == SCR_LOADFAIL) return;          /* sign-in is where every chain ends */
+    Rectangle b = {232, 10, 120, 36};
+    if (screen == SCR_REGISTER || screen == SCR_FORGOT) {
+        if (Button(b, "< Back", UI_BTN)) GoLogin();
+        if (Hover(b)) SetTip("Back to sign in", NULL, NULL);
+        return;
+    }
+    if (screen == SCR_RECOVERY) {                                       /* the code has been shown: carry on */
+        if (Button(b, "< Back", UI_BTN)) GoHome();
+        if (Hover(b)) SetTip("Back to your profile", "Make sure you've saved the code first", NULL);
+        return;
+    }
+    int t = NavTarget();
+    if (t >= 0) {
+        if (Button(b, "< Back", UI_BTN)) NavBack();
+        else if (Hover(b)) SetTip(TextFormat("Back to %s", PageLabel(&navHist[t])), NULL, NULL);
+    } else {
+        /* nothing earlier: back from here is signing out (asks first) */
+        if (ConfirmButton(b, "< Back", "Sign out?", 90)) SignOut();
+        else if (Hover(b)) SetTip("This is the first page since you signed in", "Back from here signs you out", NULL);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Account actions                                                    */
 /* ------------------------------------------------------------------ */
 static void DoLogin(void)
@@ -4872,6 +5066,7 @@ static void DrawHeader(void)
     DrawLine(0, 56, W, 56, UI_BORDER);
     DrawLogo(38, 28);
     DrawBold("Mini GitHub", 68, 18, FS, UI_TEXT);
+    DrawBackButton();                      /* the same place on every page */
     if (curUser < 0) return;
 
     Rectangle home = {18, 8, 200, 40};
@@ -5427,7 +5622,6 @@ static void ScreenAccount(void)
     DrawAvatar(u->id, 60, 112, 40);
     DrawBold(u->name, 120, 84, 30, UI_TEXT);
     DrawText("Your settings", 120, 120, FS, UI_MUTED);
-    if (Button((Rectangle){(float)W - 160, 88, 140, 40}, "Back", UI_BTN)) { GoHome(); return; }
 
     int tx = 20;
     const char *labels[3] = {"Profile", "Password & account", "Git"};
@@ -6450,7 +6644,6 @@ static void ScreenPeople(void)
 {
     DrawBold("People on this computer", 20, 80, 30, UI_TEXT);
     DrawText("Click someone to see their profile.", 20, 118, FS, UI_MUTED);
-    if (Button((Rectangle){(float)W - 160, 80, 140, 40}, "Back", UI_BTN)) { GoHome(); return; }
 
     Rectangle la = {20, 160, (float)W - 40, (float)H - 180};
     float rowH = 104;
@@ -6529,7 +6722,7 @@ static void ScreenNew(void)
 
     bool create = Button((Rectangle){p.x + p.width - 230, (float)y + 350, 200, 44}, "Create repository", UI_GREEN);
     bool cancel = Button((Rectangle){p.x + p.width - 360, (float)y + 350, 120, 44}, "Cancel", UI_BTN);
-    if (cancel) { GoHome(); return; }
+    if (cancel) { if (!NavBack()) GoHome(); return; }
     if (create || e1 || e2) TryCreateRepo();
 }
 
@@ -9543,10 +9736,9 @@ static void ScreenCommit(Repo *r)
 {
     Commit *c = &r->commits[curCommit];
 
-    if (Button((Rectangle){20, 186, 170, 38}, fromDay ? "< Back to day" : "< All commits", UI_BTN)) {
+    if (Button((Rectangle){20, 186, 170, 38}, "All commits", UI_BTN)) {   /* (Back, at the top, returns to wherever you came from) */
         Unfocus();
-        if (fromDay) screen = SCR_DAY;
-        else { screen = SCR_REPO; tab = TAB_COMMITS; }
+        screen = SCR_REPO; tab = TAB_COMMITS;
         return;
     }
     if (Button((Rectangle){(float)W - (CanEdit(r) ? 590 : 270), 186, 250, 38}, "Download this version", UI_BTN)) DownloadCommit(r, curCommit);
@@ -9638,7 +9830,7 @@ static void ScreenDay(void)
     long long today = DayStart((long long)time(NULL));
 
     bool mine = dayUser == curUser;
-    if (Button((Rectangle){20, 72, 110, 38}, "< Back", UI_BTN)) { if (mine) GoHome(); else OpenProfile(dayUser); return; }
+    (void)mine;
     if (Button((Rectangle){(float)W - 380, 72, 175, 38}, "< Earlier day", UI_BTN)) { curDay = AddDays(curDay, -1); scDay = scDayRepos = 0; }
     bool canLater = curDay < today;
     if (ButtonEx((Rectangle){(float)W - 195, 72, 175, 38}, "Later day >", canLater ? UI_BTN : UI_PANEL, canLater)) {
@@ -11386,6 +11578,7 @@ int main(void)
         /* the recovery code only stays in memory while its screen is open */
         if (screen != SCR_RECOVERY && shownCode[0]) memset(shownCode, 0, sizeof shownCode);
 
+        bool goBack = false;
         if (IsKeyPressed(KEY_ESCAPE)) {
             bool anyFocus = ed.focused || tfSearch.active || tfName.active || tfDesc.active ||
                             tfNewFile.active || tfCommit.active || tfIssue.active || tfUser.active ||
@@ -11394,14 +11587,15 @@ int main(void)
                             tfUpPath.active || tfUpMsg.active || tfInvite.active || tfEmail.active || tfBranch.active;
             if (codeMenu || branchMenu) codeMenu = branchMenu = false;
             else if (anyFocus) Unfocus();
-            else if (screen == SCR_FORGOT) GoLogin();
+            else goBack = true;
+        }
+        /* the mouse's side "back" button and Alt+Left do the same */
+        if (IsMouseButtonPressed(MOUSE_BUTTON_BACK) || IsMouseButtonPressed(MOUSE_BUTTON_SIDE) ||
+            ((IsKeyDown(KEY_LEFT_ALT) || IsKeyDown(KEY_RIGHT_ALT)) && IsKeyPressed(KEY_LEFT))) goBack = true;
+        if (goBack) {                      /* like the Back button, but never signs you out */
+            if (screen == SCR_REGISTER || screen == SCR_FORGOT) GoLogin();
             else if (screen == SCR_RECOVERY) GoHome();
-            else if (screen == SCR_NEW || screen == SCR_REPO || screen == SCR_ACCOUNT || screen == SCR_PEOPLE) GoHome();
-            else if (screen == SCR_PROFILE && viewUser != curUser) GoHome();
-            else if (screen == SCR_DAY) { if (dayUser == curUser) GoHome(); else OpenProfile(dayUser); }
-            else if (screen == SCR_UPLOAD) BackToCode();
-            else if (screen == SCR_COMMIT && fromDay) screen = SCR_DAY;
-            else if (screen == SCR_COMMIT) { screen = SCR_REPO; tab = TAB_COMMITS; }
+            else if (screen != SCR_LOGIN && screen != SCR_LOADFAIL) NavBack();
         }
 
         BeginDrawing();
@@ -11445,6 +11639,7 @@ int main(void)
         DrawTip();
         DrawToast();
         EndDrawing();
+        NavTrack();                        /* remember the page you were on, if you've moved */
 
         if (wantCursor != lastCursor) { SetMouseCursor(wantCursor); lastCursor = wantCursor; }
 
