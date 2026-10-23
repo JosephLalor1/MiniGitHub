@@ -74,6 +74,7 @@
 #include "common.h"
 #include "app_state.h"
 #include "avatars.h"
+#include "background.h"
 #include "git_server.h"
 #include "header_bar.h"
 #include "model.h"
@@ -104,6 +105,9 @@
 #include "users.h"
 #include "widgets.h"
 
+/* Loads the save file; run on another thread while the splash plays. */
+static void LoadInBackground(void *unused) { (void)unused; Load(); }
+
 /* ------------------------------------------------------------------ */
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
@@ -115,8 +119,9 @@ int main(void)
     SetExitKey(KEY_NULL);            /* Esc goes "back" instead of quitting */
     SetTargetFPS(60);
 
-    SplashIntro();                   /* the logo appears, and stays up while loading */
-    Load();
+    BackgroundTask loading = {0};    /* the save file loads while the splash plays (big ones take a second) */
+    RunInBackground(&loading, LoadInBackground, NULL);
+    SplashIntro(&loading);
     if (loadFailed) screen = SCREEN_LOAD_FAILED;  /* say so, and wait: nothing is saved until you choose */
     else AfterLoad();
     SplashFinish();
@@ -244,10 +249,13 @@ int main(void)
 
         if (wantedCursor != lastCursor) { SetMouseCursor(wantedCursor); lastCursor = wantedCursor; }
 
-        if (SaveIsDue(frameSeconds)) { Save(); unsavedChanges = false; }
+        /* saving: what to write is gathered now, and written on another thread so this doesn't freeze */
+        CheckOnSave();
+        if (SaveIsDue(frameSeconds) && SaveInBackground()) unsavedChanges = false;
     }
 
     GitServerStop();
+    WaitForSave();                     /* a save still being written finishes first */
     if (unsavedChanges) Save();
     ClearSecrets();
     for (int i = 0; i < repoCount; i++) FreeRepo(&repos[i]);

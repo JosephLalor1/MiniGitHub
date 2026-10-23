@@ -3,9 +3,9 @@
  *
  * The logo pops in over one of the animated themes (picked at random each
  * time), with the app's name and a progress bar in the theme's colour. Its
- * start plays before the save file loads (so the window shows something while
- * it does), the rest after; a click or a key skips to the app once loading is
- * done, and it fades into the app at the end.
+ * start plays while the save file loads on another thread, the rest after;
+ * a click or a key skips to the app once loading is done, and it fades into
+ * the app at the end.
  */
 
 #include "screen_splash.h"
@@ -121,18 +121,16 @@ static bool DrainInput(void)
     return pressed;
 }
 
-void SplashIntro(void)
+void SplashIntro(BackgroundTask *loading)
 {
-    while (!WindowShouldClose() && GetTime() < SPLASH_INTRO_SECONDS) {
+    /* the save file loads on another thread meanwhile, so this keeps moving */
+    while (!WindowShouldClose() && (GetTime() < SPLASH_INTRO_SECONDS || BackgroundBusy(loading))) {
         DrainInput();
         BeginDrawing();
         DrawSplash((float)GetTime(), 0);
         EndDrawing();
     }
-    /* one more frame: this one stays on screen while the save file loads */
-    BeginDrawing();
-    DrawSplash((float)GetTime(), 0);
-    EndDrawing();
+    WaitForBackground(loading);            /* (only waits if the window was closed while loading) */
 }
 
 void SplashFinish(void)

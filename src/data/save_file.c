@@ -4,9 +4,18 @@
  * Writes everything to the save file and reads it back - including save
  * files from every older version of Mini GitHub, and histories an older
  * version stored out of order.
+ *
+ * The save file can be hundreds of megabytes, and writing it takes long
+ * enough to freeze the window. So a save is done in two steps: first what
+ * to write is gathered up (quick - the small parts are copied, and the
+ * files' contents, which never change once stored, are only pointed at),
+ * then it's written out on another thread while the window carries on.
  */
 
 #include "save_file.h"
+#include "background.h"
+#include "byte_buffer.h"
+#include <stdarg.h>
 #include "drafts.h"
 #include "git_commit.h"
 #include "git_paths.h"
@@ -24,9 +33,50 @@
 /* Saving and loading                                                 */
 /* Format: numbers on their own line; text as  <length>:<bytes>\n      */
 /* ------------------------------------------------------------------ */
-static void WriteBytesField(FILE *file, const char *data, int length) { fprintf(file, "%d:", length); fwrite(data, 1, (size_t)length, file); fputc('\n', file); }
-static void WriteTextField(FILE *file, const char *text) { WriteBytesField(file, text, (int)strlen(text)); }
-static void WriteNumberField(FILE *file, long long value)   { fprintf(file, "%lld\n", value); }
+
+/* What a save will write, in order: pieces of the plan's own text, and pieces
+   of stored file contents (pointed at, not copied). */
+typedef struct { const char *stored; size_t offset, length; } SavePiece;   /* stored = NULL: text.data + offset */
+typedef struct { ByteBuffer text; SavePiece *pieces; int pieceCount, pieceCapacity; bool outOfMemory; } SavePlan;
+
+/* Adds a piece to the plan (joining it onto the last one when they follow on). */
+static void PlanAddPiece(SavePlan *plan, const char *stored, size_t offset, size_t length)
+{
+    if (!length) return;
+    SavePiece *last = plan->pieceCount ? &plan->pieces[plan->pieceCount - 1] : NULL;
+    if (last && !stored && !last->stored && last->offset + last->length == offset) { last->length += length; return; }
+    if (plan->pieceCount == plan->pieceCapacity) {
+        int capacity = plan->pieceCapacity ? plan->pieceCapacity * 2 : 4096;
+        SavePiece *grown = realloc(plan->pieces, (size_t)capacity * sizeof *grown);
+        if (!grown) { plan->outOfMemory = true; return; }
+        plan->pieces = grown; plan->pieceCapacity = capacity;
+    }
+    plan->pieces[plan->pieceCount++] = (SavePiece){stored, offset, length};
+}
+/* Copies bytes into the plan's text. */
+static void PlanAppend(SavePlan *plan, const void *bytes, size_t length)
+{
+    size_t offset = plan->text.length;
+    BufferAppend(&plan->text, bytes, length);
+    PlanAddPiece(plan, NULL, offset, length);
+}
+/* printf into the plan's text (one short line at most). */
+static void PlanPrintf(SavePlan *plan, const char *format, ...)
+{
+    char line[160];
+    va_list arguments;
+    va_start(arguments, format);
+    int length = vsnprintf(line, sizeof line, format, arguments);
+    va_end(arguments);
+    if (length > 0) PlanAppend(plan, line, (size_t)length < sizeof line ? (size_t)length : sizeof line - 1);
+}
+static void PlanFree(SavePlan *plan) { BufferFree(&plan->text); free(plan->pieces); memset(plan, 0, sizeof *plan); }
+
+static void WriteBytesField(SavePlan *file, const char *data, int length) { PlanPrintf(file, "%d:", length); PlanAppend(file, data, (size_t)length); PlanAppend(file, "\n", 1); }
+static void WriteTextField(SavePlan *file, const char *text) { WriteBytesField(file, text, (int)strlen(text)); }
+static void WriteNumberField(SavePlan *file, long long value)   { PlanPrintf(file, "%lld\n", value); }
+/* Like WriteBytesField, for a file's stored contents: they never change, so they're only pointed at. */
+static void WriteStoredField(SavePlan *file, const char *data, int length) { PlanPrintf(file, "%d:", length); PlanAddPiece(file, data, 0, (size_t)length); PlanAppend(file, "\n", 1); }
 
 static int  loadError;
 bool loadFailed;                /* the save file couldn't be read: nothing is saved until you decide */
@@ -153,14 +203,11 @@ static bool RepairHistory(Repo *repo)
     return ok;
 }
 
-/* Writes everything to minigithub.dat (via a temporary file, so a crash never leaves half a file).
-   Never writes over a file that failed to load. */
-void Save(void)
+/* Gathers up everything a save writes, into plan. */
+static void PlanSave(SavePlan *plan)
 {
-    if (loadFailed) return;                /* never write over a save file that couldn't be read */
-    FILE *file = fopen(SAVE_FILE ".tmp", "wb");
-    if (!file) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(file, "MINIGITHUB11\n");
+    SavePlan *file = plan;
+    PlanPrintf(file, "MINIGITHUB11\n");
     WriteNumberField(file, nextUserId);
     WriteTextField(file, lastUserName);
     WriteNumberField(file, userCount);
@@ -186,7 +233,7 @@ void Save(void)
         WriteNumberField(file, repo->inviteCount);
         for (int k = 0; k < repo->inviteCount; k++) { WriteNumberField(file, repo->invites[k]); WriteNumberField(file, repo->inviteTime[k]); }
         WriteNumberField(file, repo->blobCount);
-        for (int k = 0; k < repo->blobCount; k++) WriteBytesField(file, repo->blobs[k].data, repo->blobs[k].length);
+        for (int k = 0; k < repo->blobCount; k++) WriteStoredField(file, repo->blobs[k].data, repo->blobs[k].length);
 
         /* every path used, once, then each commit refers to them by number */
         PathIndexMap pathNumbers = {0};
@@ -205,9 +252,9 @@ void Save(void)
             Commit *commit = &repo->commits[k];
             WriteBytesField(file, commit->raw, commit->rawLen);
             /* the line counts are kept too, so they needn't be worked out again (-1 = not yet) */
-            fprintf(file, "%lld %d %d %d %d %d %d %d %d %d\n", commit->time, commit->author, (int)commit->copied, commit->parentCount,
+            PlanPrintf(file, "%lld %d %d %d %d %d %d %d %d %d\n", commit->time, commit->author, (int)commit->copied, commit->parentCount,
                     commit->parents[0], commit->parents[1], commit->statsDone ? commit->statFiles : -1, commit->statAdds, commit->statDels, commit->fileCount);
-            for (int j = 0; j < commit->fileCount; j++) fprintf(file, "%d %d %d\n", PathIndexGet(&pathNumbers, commit->names[j]), commit->blobs[j], commit->modes[j]);
+            for (int j = 0; j < commit->fileCount; j++) PlanPrintf(file, "%d %d %d\n", PathIndexGet(&pathNumbers, commit->names[j]), commit->blobs[j], commit->modes[j]);
         }
         PathIndexFree(&pathNumbers);
         WriteNumberField(file, repo->branchCount); WriteNumberField(file, repo->defaultBranch);
@@ -235,11 +282,72 @@ void Save(void)
         }
         WriteNumberField(file, repo->isFork); WriteNumberField(file, repo->forkOwner); WriteTextField(file, repo->forkName); WriteTextField(file, repo->forkBase);
     }
+}
+
+/* Writes a plan to minigithub.dat, via a temporary file (so a crash never leaves half
+   a file). Returns NULL, or what went wrong. Safe to run on another thread: it only
+   reads the plan and the stored contents it points at. */
+static const char *WritePlan(const SavePlan *plan)
+{
+    if (plan->outOfMemory || plan->text.outOfMemory) return "Could not save - not enough memory";
+    FILE *file = fopen(SAVE_FILE ".tmp", "wb");
+    if (!file) return "Could not save - is the folder read-only?";
+    for (int i = 0; i < plan->pieceCount; i++) {
+        const SavePiece *piece = &plan->pieces[i];
+        fwrite(piece->stored ? piece->stored : (const char *)plan->text.data + piece->offset, 1, piece->length, file);
+    }
     bool ok = !ferror(file);
     ok = fclose(file) == 0 && ok;
-    if (!ok) { remove(SAVE_FILE ".tmp"); Toast("Could not save - is the disk full?"); return; }
+    if (!ok) { remove(SAVE_FILE ".tmp"); return "Could not save - is the disk full?"; }
     remove(SAVE_FILE);
     rename(SAVE_FILE ".tmp", SAVE_FILE);
+    return NULL;
+}
+
+/* The save being written on another thread (at most one at a time). */
+static BackgroundTask savingTask;
+static SavePlan       savingPlan;
+static const char    *savingError;
+static void WritePlanInBackground(void *plan) { savingError = WritePlan(plan); }
+
+/* Tidies up after a save written in the background: frees its plan, and if it
+   failed, says so and marks the changes as unsaved again (so it's tried again). */
+static void FinishBackgroundSave(void)
+{
+    WaitForBackground(&savingTask);
+    PlanFree(&savingPlan);
+    if (savingError) { Toast(savingError); MarkDirty(); savingError = NULL; }
+}
+
+void Save(void)
+{
+    if (loadFailed) return;                /* never write over a save file that couldn't be read */
+    WaitForSave();
+    SavePlan plan = {0};
+    PlanSave(&plan);
+    const char *error = WritePlan(&plan);
+    PlanFree(&plan);
+    if (error) Toast(error);
+}
+
+bool SaveInBackground(void)
+{
+    if (loadFailed) return true;           /* nothing to do: it's never written over */
+    if (BackgroundBusy(&savingTask)) return false;
+    WaitForSave();                         /* tidy up after the one before, if that's still to do */
+    PlanSave(&savingPlan);
+    RunInBackground(&savingTask, WritePlanInBackground, &savingPlan);
+    return true;
+}
+
+void CheckOnSave(void)
+{
+    if (savingTask.running && !BackgroundBusy(&savingTask)) FinishBackgroundSave();
+}
+
+void WaitForSave(void)
+{
+    if (savingTask.running) FinishBackgroundSave();
 }
 
 /* Copies a file's bytes to another file, a megabyte at a time: the save file can

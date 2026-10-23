@@ -8,6 +8,7 @@
 
 #include "repo.h"
 #include "model.h"
+#include "save_file.h"
 #include "sha1.h"
 #include "sha_map.h"
 #include "util.h"
@@ -47,9 +48,11 @@ void FreeCommit(Commit *commit)
     commit->names = NULL; commit->blobs = NULL; commit->modes = NULL; commit->raw = NULL; commit->langLines = NULL;
 }
 
-/* Frees everything a repository holds. */
+/* Frees everything a repository holds. (A save being written in the background
+   may still be reading its files' contents, so that finishes first.) */
 void FreeRepo(Repo *repo)
 {
+    WaitForSave();
     for (int i = 0; i < repo->draftCount; i++) FreeDraft(&repo->drafts[i]);
     repo->draftCount = 0;
     for (int i = 0; i < repo->blobCount; i++) { free(repo->blobs[i].data); free(repo->blobs[i].lang); }

@@ -21,7 +21,7 @@ void FreeDraft(Draft *draft);
 /* Frees a commit's file lists and git data. */
 void FreeCommit(Commit *commit);
 
-/* Frees everything a repository holds. */
+/* Frees everything a repository holds (after any save being written in the background has finished). */
 void FreeRepo(Repo *repo);
 
 /* Removes a repository from the list (the ones after it move up). */
