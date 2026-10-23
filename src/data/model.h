@@ -26,6 +26,8 @@ typedef struct {
     char      email[TEXT_LEN];       /* put on commits made here, so git shows it ("" = none set) */
     int       claimCount;            /* other emails you've said are you ("That's me"): */
     char      claims[8][TEXT_LEN];   /* commits made with them count as yours            */
+    int       followingCount;        /* the people this account follows (their user ids) */
+    int       following[MAX_USERS];
     int       theme;                 /* one of THEME_...                  */
     int       avatarColor;           /* 0 = automatic, 1..8 = chosen      */
     char     *avatar;                /* profile picture: PNG as base64 text, or NULL */

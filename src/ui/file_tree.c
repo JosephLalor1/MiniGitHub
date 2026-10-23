@@ -5,6 +5,7 @@
  */
 
 #include "file_tree.h"
+#include "animation.h"
 #include "app_state.h"
 #include "editor.h"
 #include "git_paths.h"
@@ -134,7 +135,8 @@ void DrawFileList(Repo *repo, Rectangle area)
         const char *label = TextFormat("%.*s", fileRow->nameLength, fileRow->name);
         if (fileRow->isFolder) {
             bool isOpen = FolderOpenIndex(fileRow->path) >= 0;
-            if (hovered) { DrawRectangleRec(row, UI_HOVER); wantedCursor = MOUSE_CURSOR_POINTING_HAND; }
+            DrawHoverFill(row, AnimationKey(fileRow->path, 1, 0), hovered);
+            if (hovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
             float cx = (float)x + 7, cy = row.y + 15;
             if (isOpen) DrawTriangle((Vector2){cx - 5, cy - 3}, (Vector2){cx, cy + 4}, (Vector2){cx + 5, cy - 3}, UI_MUTED);
             else      DrawTriangle((Vector2){cx - 3, cy - 5}, (Vector2){cx - 3, cy + 5}, (Vector2){cx + 4, cy}, UI_MUTED);
@@ -145,7 +147,7 @@ void DrawFileList(Repo *repo, Rectangle area)
         }
         ViewFile *viewFile = &viewFiles[fileRow->viewIndex];
         if (strcmp(viewFile->name, selectedFile) == 0) DrawRectangleRec(row, (Color){56, 139, 253, 40});
-        else if (hovered)                       DrawRectangleRec(row, UI_HOVER);
+        else DrawHoverFill(row, AnimationKey(viewFile->name, 2, 0), hovered);
         if (hovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
         bool deleted = ViewDeleted(viewFile);
         int lang = deleted ? LANG_TEXT : ViewFileLang(repo, viewFile, NULL);

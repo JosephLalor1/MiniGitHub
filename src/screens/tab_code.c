@@ -122,6 +122,12 @@ static bool FolderOrFileClash(const char *name)
     return false;
 }
 
+/* Adding a file starts as one button; pressing it asks whether to make a new
+   file here or upload some from the computer, and making one asks for its name. */
+enum { ADD_FILE_CLOSED, ADD_FILE_CHOOSING, ADD_FILE_NAMING };
+static int         addFileStep = ADD_FILE_CLOSED;
+static const Repo *addFileRepo;      /* the repository the steps above are for */
+
 /* Draws a repository's Code tab. */
 void TabCode(Repo *repo)
 {
@@ -145,43 +151,71 @@ void TabCode(Repo *repo)
     DrawRectangleRec(leftPanel, UI_PANEL);
     DrawRectangleLinesEx(leftPanel, 1, UI_BORDER);
     BranchButton(repo, (Rectangle){leftPanel.x + 8, top + 6, leftPanel.width - 16, 32});  /* which branch the files are from */
-    DrawFileList(repo, (Rectangle){leftPanel.x + 1, top + 44, leftPanel.width - 2, leftPanel.height - 44 - (canEdit ? 156 : 4)});
+    if (addFileRepo != repo) { addFileStep = ADD_FILE_CLOSED; addFileRepo = repo; }    /* a different repository: start closed */
+    if (!canEdit) addFileStep = ADD_FILE_CLOSED;
+    float addHeight = !canEdit ? 4 : addFileStep == ADD_FILE_CLOSED ? 104 : 156;      /* room kept at the bottom for adding files */
+    DrawFileList(repo, (Rectangle){leftPanel.x + 1, top + 44, leftPanel.width - 2, leftPanel.height - 44 - addHeight});
 
     if (canEdit) {
-        float bottomY = leftPanel.y + leftPanel.height - 148;
+        float bottomY = leftPanel.y + leftPanel.height - addHeight + 8, innerWidth = leftPanel.width - 24;
         DrawLine((int)leftPanel.x, (int)bottomY - 10, (int)(leftPanel.x + leftPanel.width), (int)bottomY - 10, UI_BORDER);
-        bool addEnter = TextFieldWidget(&newFileField, (Rectangle){leftPanel.x + 12, bottomY, leftPanel.width - 24, 38}, "new-file.txt");
-        if (Button((Rectangle){leftPanel.x + 12, bottomY + 46, 114, 36}, "Add file", UI_GREEN) || addEnter) {
-            char name[PATH_LEN];
-            SanitizePath(newFileField.text, name);
-            BuildView(repo, currentUserId);
-            int viewIndex = ViewIndex(name);
-            if (!name[0])                                    Toast("Type a file name first, e.g. notes.txt or docs/notes.txt");
-            else if (!IsValidPath(name))                       Toast("That isn't a usable file name");
-            else if (FolderOrFileClash(name))                Toast("That name is already used by a folder (or a file on the way to it)");
-            else if (viewIndex >= 0 && !ViewDeleted(&viewFiles[viewIndex]))   Toast("A file with that name already exists");
-            else if (viewIndex < 0 && ShownFileCount(repo) >= MAX_FILES) Toast(TextFormat("A repository can hold up to %d files", MAX_FILES));
-            else {
-                WorkFile *draftFile = DraftEdit(repo, currentUserId, name);
-                if (!draftFile) Toast("You're changing too many files at once - commit some first");
+        if (addFileStep == ADD_FILE_CLOSED) {
+            /* just the one button; it asks how next */
+            if (Button((Rectangle){leftPanel.x + 12, bottomY, innerWidth, 38}, "Add file", UI_GREEN)) addFileStep = ADD_FILE_CHOOSING;
+        } else {
+            DrawText(addFileStep == ADD_FILE_CHOOSING ? "Add a file:" : "New file name:", (int)leftPanel.x + 14, (int)bottomY, FONT_SIZE, UI_MUTED);
+            if (LinkText("Cancel", leftPanel.x + leftPanel.width - 14, bottomY, true)) {
+                addFileStep = ADD_FILE_CLOSED;
+                newFileField.active = false;
+            }
+        }
+        if (addFileStep == ADD_FILE_CHOOSING) {
+            if (Button((Rectangle){leftPanel.x + 12, bottomY + 28, innerWidth, 36}, "Create in Mini GitHub", UI_GREEN)) {
+                addFileStep = ADD_FILE_NAMING;
+                Unfocus();
+                TextFieldClear(&newFileField);
+                newFileField.active = true;
+            }
+            if (Button((Rectangle){leftPanel.x + 12, bottomY + 70, innerWidth, 36}, "Upload from computer", UI_BUTTON)) {
+                addFileStep = ADD_FILE_CLOSED;
+                OpenUpload();
+                return;
+            }
+        } else if (addFileStep == ADD_FILE_NAMING) {
+            bool addEnter = TextFieldWidget(&newFileField, (Rectangle){leftPanel.x + 12, bottomY + 28, innerWidth - 92, 36}, "new-file.txt");
+            if (Button((Rectangle){leftPanel.x + leftPanel.width - 12 - 84, bottomY + 28, 84, 36}, "Create", UI_GREEN) || addEnter) {
+                char name[PATH_LEN];
+                SanitizePath(newFileField.text, name);
+                BuildView(repo, currentUserId);
+                int viewIndex = ViewIndex(name);
+                if (!name[0])                                    Toast("Type a file name first, e.g. notes.txt or docs/notes.txt");
+                else if (!IsValidPath(name))                       Toast("That isn't a usable file name");
+                else if (FolderOrFileClash(name))                Toast("That name is already used by a folder (or a file on the way to it)");
+                else if (viewIndex >= 0 && !ViewDeleted(&viewFiles[viewIndex]))   Toast("A file with that name already exists");
+                else if (viewIndex < 0 && ShownFileCount(repo) >= MAX_FILES) Toast(TextFormat("A repository can hold up to %d files", MAX_FILES));
                 else {
-                    draftFile->deleted = false;
-                    WorkFileSetBytes(draftFile, "", 0);
-                    SelectFileName(name);
-                    Unfocus();
-                    editor.focused = true;
-                    TextFieldClear(&newFileField);
-                    MarkDirty();
+                    WorkFile *draftFile = DraftEdit(repo, currentUserId, name);
+                    if (!draftFile) Toast("You're changing too many files at once - commit some first");
+                    else {
+                        draftFile->deleted = false;
+                        WorkFileSetBytes(draftFile, "", 0);
+                        SelectFileName(name);
+                        Unfocus();
+                        editor.focused = true;
+                        TextFieldClear(&newFileField);
+                        addFileStep = ADD_FILE_CLOSED;
+                        MarkDirty();
+                    }
                 }
             }
         }
-        if (Button((Rectangle){leftPanel.x + leftPanel.width - 126, bottomY + 46, 114, 36}, "Upload", UI_BUTTON)) { OpenUpload(); return; }
         int pendingChanges, pendingConflicts;
         DraftCounts(repo, currentUserId, &pendingChanges, &pendingConflicts);
         const char *statusText = pendingConflicts ? TextFormat("%d change%s, %d conflict%s", pendingChanges + pendingConflicts, pendingChanges + pendingConflicts == 1 ? "" : "s", pendingConflicts, pendingConflicts == 1 ? "" : "s")
                        : pendingChanges ? TextFormat("%d change%s to commit", pendingChanges, pendingChanges == 1 ? "" : "s")
                              : "All changes committed";
-        DrawTextFit(statusText, (int)leftPanel.x + 14, (int)bottomY + 100, FONT_SIZE, (int)leftPanel.width - 28, pendingConflicts ? UI_ORANGE : pendingChanges ? UI_YELLOW : UI_MUTED);
+        float statusY = leftPanel.y + leftPanel.height - 34;
+        DrawTextFit(statusText, (int)leftPanel.x + 14, (int)statusY, FONT_SIZE, (int)leftPanel.width - 28, pendingConflicts ? UI_ORANGE : pendingChanges ? UI_YELLOW : UI_MUTED);
     }
 
     /* ---- right: the language breakdown, then the editor (or a viewer) + bottom bar ---- */

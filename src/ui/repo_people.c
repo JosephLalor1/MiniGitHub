@@ -5,12 +5,15 @@
  */
 
 #include "repo_people.h"
+#include "animation.h"
 #include "app_state.h"
 #include "avatars.h"
 #include "contributions.h"
 #include "editor.h"
 #include "model.h"
 #include "navigation.h"
+#include "tech_stack.h"
+#include "themes.h"
 #include "ui_core.h"
 #include "users.h"
 #include "util.h"
@@ -118,22 +121,13 @@ static int DrawPie(Vector2 center, float radius)
         angle += sweep;
     }
     angle = -90;
-    for (int i = 0; i < shareCount; i++) {
+    for (int i = 0; i < shareCount; i++) {         /* the hovered slice eases outward, the others dim a little */
         if (!shares[i].lines) continue;
         float sweep = 360.0f * shares[i].lines / shareTotal;
-        float sliceRadius = i == hovered ? radius + 4 : radius;
-        DrawCircleSector(center, sliceRadius, angle, angle + sweep, (int)(sweep / 3) + 4, shares[i].color);
+        float lift = HoverAmount(AnimationKey("share pie", center.x + center.y * 4096, (float)shares[i].userId), i == hovered);
+        float fade = HoverAmount(AnimationKey("share pie fade", center.x + center.y * 4096, (float)shares[i].userId), hovered >= 0 && i != hovered);
+        DrawPieSlice(center, radius, angle, sweep, shares[i].color, sliceCount > 1 ? lift : lift * 0.4f, fade * 0.6f, sliceCount > 1);
         angle += sweep;
-    }
-    if (sliceCount > 1) {                        /* the gaps between slices */
-        Color gapColor = {22, 27, 34, 255};
-        angle = -90;
-        for (int i = 0; i < shareCount; i++) {
-            if (!shares[i].lines) continue;
-            Vector2 edge = {center.x + cosf(angle * DEG2RAD) * (radius + 6), center.y + sinf(angle * DEG2RAD) * (radius + 6)};
-            DrawLineEx(center, edge, 2, gapColor);
-            angle += 360.0f * shares[i].lines / shareTotal;
-        }
     }
     return hovered;
 }
@@ -288,7 +282,7 @@ void TabPeople(Repo *repo)
             if (chipX + chipWidth > x + leftWidth) break;
             Rectangle chip = {chipX, inviteY + 94, (float)chipWidth, 28};
             bool hovered = IsHovered(chip);
-            DrawRectangleRounded(chip, 0.5f, 6, hovered ? UI_HOVER : UI_BUTTON);
+            DrawRectangleRounded(chip, 0.5f, 6, MixColors(UI_BUTTON, UI_HOVER, HoverAmount(RectKey(chip), hovered)));
             DrawText(user->name, (int)chip.x + 10, (int)chip.y + 4, FONT_SIZE, UI_LINK);
             if (hovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
             if (WasClicked(chip)) { snprintf(inviteField.text, TEXT_LEN, "%s", user->name); inviteField.length = (int)strlen(inviteField.text); }
@@ -326,7 +320,7 @@ void TabPeople(Repo *repo)
         bool isOutsider = IsOutsider(share->userId);
         Rectangle row = {rightX + 10, keyY - 4, rightWidth - 20, 28};
         bool hovered = IsHovered(row);
-        if (hovered && isOutsider) DrawRectangleRec(row, UI_HOVER);
+        DrawHoverFill(row, AnimationKey("share row", (float)share->userId, 0), hovered && isOutsider);
         DrawRectangleRounded((Rectangle){rightX + 18, keyY + 3, 14, 14}, 0.3f, 4, share->color);
         const char *valueText = TextFormat("%d line%s  %d%%", share->lines, share->lines == 1 ? "" : "s", Percent(share->lines, shareTotal));
         int valueWidth = MeasureText(valueText, FONT_SIZE);

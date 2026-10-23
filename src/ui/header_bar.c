@@ -5,11 +5,13 @@
  */
 
 #include "header_bar.h"
+#include "animation.h"
 #include "app_state.h"
 #include "avatars.h"
 #include "model.h"
 #include "nav_history.h"
 #include "navigation.h"
+#include "themes.h"
 #include "ui_core.h"
 #include "users.h"
 #include "widgets.h"
@@ -43,15 +45,20 @@ static void DrawBackButton(void)
 /* ------------------------------------------------------------------ */
 /* Screens                                                            */
 /* ------------------------------------------------------------------ */
-static void DrawLogo(int centerX, int centerY)
+/* The logo - a circle with git's branch mark cut out of it - centred on
+   (centerX, centerY), at scale times its normal size (a radius of 18). */
+void DrawLogoScaled(float centerX, float centerY, float scale, Color body, Color cutout)
 {
-    DrawCircle(centerX, centerY, 18, UI_TEXT);
-    DrawLineEx((Vector2){(float)centerX - 6, (float)centerY - 10}, (Vector2){(float)centerX - 6, (float)centerY + 10}, 3, UI_BG);
-    DrawLineEx((Vector2){(float)centerX + 6, (float)centerY - 6},  (Vector2){(float)centerX - 6, (float)centerY + 4},  3, UI_BG);
-    DrawCircle(centerX - 6, centerY - 10, 4, UI_BG);
-    DrawCircle(centerX - 6, centerY + 10, 4, UI_BG);
-    DrawCircle(centerX + 6, centerY - 6, 4, UI_BG);
+    DrawCircleV((Vector2){centerX, centerY}, 18 * scale, body);
+    DrawLineEx((Vector2){centerX - 6 * scale, centerY - 10 * scale}, (Vector2){centerX - 6 * scale, centerY + 10 * scale}, 3 * scale, cutout);
+    DrawLineEx((Vector2){centerX + 6 * scale, centerY - 6 * scale},  (Vector2){centerX - 6 * scale, centerY + 4 * scale},  3 * scale, cutout);
+    DrawCircleV((Vector2){centerX - 6 * scale, centerY - 10 * scale}, 4 * scale, cutout);
+    DrawCircleV((Vector2){centerX - 6 * scale, centerY + 10 * scale}, 4 * scale, cutout);
+    DrawCircleV((Vector2){centerX + 6 * scale, centerY - 6 * scale}, 4 * scale, cutout);
 }
+
+/* The logo at its normal size, in the top bar. */
+static void DrawLogo(int centerX, int centerY) { DrawLogoScaled((float)centerX, (float)centerY, 1.0f, UI_TEXT, UI_BG); }
 
 /* Draws the bar across the top of the window and handles its buttons. */
 void DrawHeader(void)
@@ -74,10 +81,9 @@ void DrawHeader(void)
     int nameWidth = MeasureText(name, FONT_SIZE);
     int accountWidth = nameWidth + 8 + 12 + 32 + 8;
     Rectangle accountArea = {(float)(screenWidth - 146 - accountWidth), 8, (float)accountWidth, 40};
-    if (IsHovered(accountArea)) {
-        wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-        DrawRectangleRounded(accountArea, 0.3f, 6, UI_HOVER);
-    }
+    if (IsHovered(accountArea)) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
+    float glow = HoverAmount(AnimationKey("account", 0, 0), IsHovered(accountArea));
+    if (glow > 0) DrawRectangleRounded(accountArea, 0.3f, 6, WithAlpha(UI_HOVER, glow));
     DrawText(name, (int)accountArea.x + 8, 18, FONT_SIZE, UI_TEXT);
     DrawAvatar(currentUserId, (int)accountArea.x + 8 + nameWidth + 12 + 16, 28, 16);
     if (WasClicked(accountArea)) OpenProfile(currentUserId);

@@ -5,6 +5,7 @@
  */
 
 #include "tab_commits.h"
+#include "animation.h"
 #include "app_state.h"
 #include "avatars.h"
 #include "branches.h"
@@ -255,7 +256,9 @@ static void CommitGraph(Repo *repo, Rectangle area)
     /* row backgrounds first, so the lines go over them */
     for (int i = firstRow; i <= lastRow; i++) {
         Rectangle row = {area.x + 1, area.y + 4 + i * rowHeight - graphScroll, area.width - 14, rowHeight};
-        if (IsHovered(area) && CheckCollisionPointRec(mouse, row)) { hoveredRow = i; DrawRectangleRec(row, UI_HOVER); }
+        bool rowHovered = IsHovered(area) && CheckCollisionPointRec(mouse, row);
+        if (rowHovered) hoveredRow = i;
+        DrawHoverFill(row, AnimationKey("graph row", (float)i, 0), rowHovered);
     }
     /* the lines: from each row's dot level down to the next row's */
     BeginScissorMode((int)area.x + 1, (int)area.y + 1, (int)(graphWidth + 30), (int)area.height - 2);
@@ -408,7 +411,7 @@ void TabCommits(Repo *repo)
         if (row.y > listArea.y + listArea.height || row.y + row.height < listArea.y) continue;
         bool hovered = IsHovered(listArea) && IsHovered(row);
         if (hovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-        DrawRectangleRec(row, hovered ? UI_HOVER : UI_PANEL);
+        DrawRectangleRec(row, CardColor(AnimationKey("commit row", (float)commitIndex, 0), hovered));
         DrawRectangleLinesEx(row, 1, UI_BORDER);
         DrawAvatar(commit->author, (int)row.x + 36, (int)row.y + 37, 18);
         DrawTextFit(commit->message, (int)row.x + 70, (int)row.y + 14, FONT_SIZE, (int)row.width - 310, UI_TEXT);

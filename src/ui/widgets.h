@@ -17,6 +17,13 @@ bool ButtonEnabled(Rectangle rect, const char *label, Color color, bool enabled)
 /* Draws a button. Returns true when it is clicked. */
 bool Button(Rectangle rect, const char *label, Color color);
 
+/* Fills a row with the hover colour, fading in and out as the mouse comes and goes. key: what
+   the row shows (so it keeps its fade while the list scrolls). */
+void DrawHoverFill(Rectangle rect, unsigned key, bool hovered);
+
+/* A card's background: the panel colour, easing to the hover colour while it's hovered. */
+Color CardColor(unsigned key, bool hovered);
+
 /* First click arms it (turns red), second click within 3 seconds does it. */
 bool ConfirmButton(Rectangle rect, const char *label, const char *confirmLabel, int id);
 

@@ -7,6 +7,7 @@
 
 #include "screen_settings.h"
 #include "account_actions.h"
+#include "animation.h"
 #include "app_state.h"
 #include "avatars.h"
 #include "model.h"
@@ -192,7 +193,7 @@ static void SettingsGitTab(User *user, float top)
         DrawCircle((int)x + 6, (int)y + 60, 6, UI_RED_TEXT);
         DrawTextFit(TextFormat("The git server isn't running: %s", gitProblem), (int)x + 22, (int)y + 50, FONT_SIZE, (int)fieldWidth - 22, UI_ORANGE);
     }
-    DrawTextFit("1.  Open a repository, press Code, and copy its address.", (int)x, (int)y + 88, FONT_SIZE, (int)fieldWidth, UI_MUTED);
+    DrawTextFit("1.  Open a repository and press Copy repo address.", (int)x, (int)y + 88, FONT_SIZE, (int)fieldWidth, UI_MUTED);
     DrawTextFit("2.  In a terminal, type  git clone  and paste the address.", (int)x, (int)y + 114, FONT_SIZE, (int)fieldWidth, UI_MUTED);
     DrawTextFit("3.  Change files, git commit, then git push. When git asks, use your Mini GitHub username and password.",
             (int)x, (int)y + 140, FONT_SIZE, (int)fieldWidth, UI_MUTED);
@@ -261,10 +262,9 @@ void ScreenSettings(void)
         int tabWidth = MeasureText(labels[tabIndex], FONT_SIZE) + 28;
         Rectangle tabRect = {(float)tabX, 156, (float)tabWidth, 38};
         bool selected = settingsTab == tabIndex;
-        if (IsHovered(tabRect)) {
-            wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-            if (!selected) DrawRectangleRounded((Rectangle){(float)tabX, 158, (float)tabWidth, 30}, 0.3f, 6, UI_HOVER);
-        }
+        if (IsHovered(tabRect)) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
+        float glow = HoverAmount(RectKey(tabRect), IsHovered(tabRect) && !selected);
+        if (glow > 0) DrawRectangleRounded((Rectangle){(float)tabX, 158, (float)tabWidth, 30}, 0.3f, 6, WithAlpha(UI_HOVER, glow));
         DrawText(labels[tabIndex], tabX + 14, 164, FONT_SIZE, selected ? UI_TEXT : UI_MUTED);
         if (selected) DrawRectangle(tabX, 191, tabWidth, 3, accentColor);
         if (WasClicked(tabRect) && !selected) { Unfocus(); ClearSecrets(); settingsTab = tabIndex; }

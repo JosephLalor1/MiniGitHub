@@ -127,7 +127,7 @@ int NavTarget(void)
 /* A few words for the tooltip: "jo / hello-world (Commits)". */
 const char *PageLabel(const Page *page)
 {
-    static const char *tabNames[4] = {"Code", "Commits", "Issues", "People"};
+    static const char *tabNames[5] = {"Code", "Commits", "Issues", "People", "Settings"};
     switch (page->screen) {
     case SCREEN_PROFILE: return page->profileUserId == currentUserId ? "your profile" : TextFormat("%s's profile", UserName(page->profileUserId));
     case SCREEN_REPO:    return TextFormat("%s / %s (%s)", UserName(page->repoOwner), page->repoName, tabNames[page->repoTab]);

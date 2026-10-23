@@ -18,6 +18,11 @@ Color LangColor(int lang);
    shows its numbers. */
 void DrawLanguageBar(Rectangle area);
 
+/* One slice of a pie, pushed out from the centre by lift (0..1: how far it has risen on hover)
+   and dimmed by fade (0..1) while another slice is the one hovered. separated: there are
+   other slices, so leave a thin gap between them. */
+void DrawPieSlice(Vector2 center, float radius, float startAngle, float sweep, Color color, float lift, float fade, bool separated);
+
 /* The "Tech stack" card on a profile: a pie and its key (or, in a narrow window, a bar). */
 void DrawTechStack(Rectangle area, int userId, bool asBar);
 

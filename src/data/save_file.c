@@ -160,7 +160,7 @@ void Save(void)
     if (loadFailed) return;                /* never write over a save file that couldn't be read */
     FILE *file = fopen(SAVE_FILE ".tmp", "wb");
     if (!file) { Toast("Could not save - is the folder read-only?"); return; }
-    fprintf(file, "MINIGITHUB10\n");
+    fprintf(file, "MINIGITHUB11\n");
     WriteNumberField(file, nextUserId);
     WriteTextField(file, lastUserName);
     WriteNumberField(file, userCount);
@@ -172,6 +172,8 @@ void Save(void)
         WriteTextField(file, user->email);
         WriteNumberField(file, user->claimCount);
         for (int k = 0; k < user->claimCount; k++) WriteTextField(file, user->claims[k]);
+        WriteNumberField(file, user->followingCount);
+        for (int k = 0; k < user->followingCount; k++) WriteNumberField(file, user->following[k]);
     }
     WriteNumberField(file, repoCount);
     for (int i = 0; i < repoCount; i++) {
@@ -327,7 +329,8 @@ static bool UpgradeCommits(Repo *repo)
     return true;
 }
 
-/* Reads every version: 7 (git commits, folders), 6 (forks), 5 (collaborators + drafts),
+/* Reads every version: 11 (following), 10 (private repositories), 9 (other emails),
+   8 (branches), 7 (git commits, folders), 6 (forks), 5 (collaborators + drafts),
    4 (profiles + recovery codes), 3 (either one), 2 (accounts), 1 (before accounts). */
 bool Load(void)
 {
@@ -340,7 +343,7 @@ bool Load(void)
     int version = 0;
     if (fscanf(file, "%31s", magic) == 1 && strncmp(magic, "MINIGITHUB", 10) == 0) {
         int number = atoi(magic + 10);
-        if (number >= 1 && number <= 10 && magic[10] != '0') version = number;  /* MINIGITHUB1 ... MINIGITHUB10 */
+        if (number >= 1 && number <= 11 && magic[10] != '0') version = number;  /* MINIGITHUB1 ... MINIGITHUB11 */
     }
     if (!version) {
         if (strncmp(magic, "MINIGITHUB", 10) == 0) snprintf(loadReason, sizeof loadReason, "it was made by a newer version of Mini GitHub");
@@ -384,9 +387,23 @@ bool Load(void)
                 if (savedClaimCount < 0 || savedClaimCount > 8) LOAD_FAIL;
                 for (int k = 0; k < savedClaimCount && !loadError; k++) ReadTextInto(file, user->claims[user->claimCount++], TEXT_LEN);
             }
+            if (version >= 11) {
+                int savedFollowingCount = (int)ReadNumberField(file);
+                if (savedFollowingCount < 0 || savedFollowingCount > MAX_USERS) LOAD_FAIL;
+                for (int k = 0; k < savedFollowingCount && !loadError; k++) user->following[user->followingCount++] = (int)ReadNumberField(file);
+            }
             if (user->id <= 0 || strlen(user->salt) != 32 || strlen(user->hash) != 64) LOAD_FAIL;
             if (user->id >= nextUserId) nextUserId = user->id + 1;
         }
+    }
+
+    /* follows of accounts that no longer exist (or of yourself) are dropped */
+    for (int i = 0; i < userCount; i++) {
+        User *user = &users[i];
+        int kept = 0;
+        for (int k = 0; k < user->followingCount; k++)
+            if (user->following[k] != user->id && FindUserById(user->following[k])) user->following[kept++] = user->following[k];
+        user->followingCount = kept;
     }
 
     int savedRepoCount = loadError ? 0 : (int)ReadNumberField(file);
@@ -668,6 +685,13 @@ bool Load(void)
         MarkDirty();
         Toast(TextFormat("Mended the history of %d repositor%s stored out of order by an older version", repairedCount, repairedCount == 1 ? "y" : "ies"));
         return true;
+    }
+    /* a file from an older version that's still readable by it: keep a copy as it was,
+       since the next save is in the new format that version can't read */
+    if (version >= 7 && version < 11) {
+        char backupName[64];
+        snprintf(backupName, sizeof backupName, "%s.v%d-backup", SAVE_FILE, version);
+        if (!FileExists(backupName)) CopyFileBytes(SAVE_FILE, backupName);
     }
     /* it loaded: keep a copy of this good file, in case anything goes wrong later */
     if (version >= 7) CopyFileBytes(SAVE_FILE, SAVE_FILE ".last-good");

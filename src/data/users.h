@@ -87,6 +87,15 @@ void RemoveStar(Repo *repo, int userId);
 /* Stars the repository for userId, or takes the star away. */
 void ToggleStar(Repo *repo, int userId);
 
+/* Does followerId follow userId? */
+bool IsFollowing(int followerId, int userId);
+
+/* Starts followerId following userId, or stops it. (Nobody follows themselves.) */
+void ToggleFollow(int followerId, int userId);
+
+/* How many people follow userId. */
+int FollowerCount(int userId);
+
 /* How many files you see: the latest commit plus your own draft if you can edit; just the latest
    commit if you're a visitor. */
 int ShownFileCount(Repo *repo);
@@ -100,8 +109,8 @@ int OrphanCount(void);
 /* How many repositories userId owns. */
 int ReposOwnedBy(int userId);
 
-/* Removes the account, all of its repositories, and its stars elsewhere. Commits and issues it
-   made in other people's repos stay (as "ghost"). */
+/* Removes the account, all of its repositories, its stars elsewhere and anyone's follow of it.
+   Commits and issues it made in other people's repos stay (as "ghost"). */
 void DeleteAccount(int userId);
 
 /* NULL if this would make a good new username, or what's wrong with it. */

@@ -7,12 +7,14 @@
  */
 
 #include "tech_stack.h"
+#include "animation.h"
 #include "app_state.h"
 #include "diff.h"
 #include "languages.h"
 #include "model.h"
 #include "repo.h"
 #include "save_file.h"
+#include "themes.h"
 #include "ui_core.h"
 #include "users.h"
 #include "widgets.h"
@@ -35,18 +37,25 @@ void DrawLanguageBar(Rectangle area)
         return;
     }
     Rectangle bar = {area.x, area.y + 2, area.width, 10};
-    float x = bar.x;
     int hovered = -1;
-    for (int i = 0; i < langPartCount; i++) {
-        LangPart *part = &langParts[i];
-        float width = bar.width * part->lines / langTotal;
-        if (i == langPartCount - 1) width = bar.x + bar.width - x;        /* no rounding gap at the end */
-        float drawWidth = width - (i < langPartCount - 1 ? 2 : 0);        /* a 2-pixel gap between parts */
-        if (drawWidth < 2) drawWidth = 2;
-        Rectangle segment = {x, bar.y, drawWidth, bar.height};
-        DrawRectangleRounded(segment, 0.6f, 4, part->color);
-        if (CheckCollisionPointRec(GetMousePosition(), (Rectangle){x, bar.y - 6, width, bar.height + 12})) hovered = i;
-        x += width;
+    for (int pass = 0; pass < 2; pass++) {               /* first find the part under the mouse, then draw */
+        float x = bar.x;
+        for (int i = 0; i < langPartCount; i++) {
+            LangPart *part = &langParts[i];
+            float width = bar.width * part->lines / langTotal;
+            if (i == langPartCount - 1) width = bar.x + bar.width - x;    /* no rounding gap at the end */
+            if (pass == 0) {
+                if (IsHovered((Rectangle){x, bar.y - 6, width, bar.height + 12})) hovered = i;
+            } else {
+                float drawWidth = width - (i < langPartCount - 1 ? 2 : 0);    /* a 2-pixel gap between parts */
+                if (drawWidth < 2) drawWidth = 2;
+                float grow = HoverAmount(AnimationKey("language bar", bar.x + bar.y * 4096, (float)part->lang), i == hovered) * 3;
+                float fade = HoverAmount(AnimationKey("language bar fade", bar.x + bar.y * 4096, (float)part->lang), hovered >= 0 && i != hovered);
+                Color shown = fade > 0 ? MixColors(part->color, ColorBrightness(part->color, -0.3f), fade * 0.6f) : part->color;
+                DrawRectangleRounded((Rectangle){x, bar.y - grow, drawWidth, bar.height + grow * 2}, 0.6f, 4, shown);
+            }
+            x += width;
+        }
     }
     /* the key: name and share for each, as many as fit */
     float keyX = area.x, keyY = area.y + 18;
@@ -161,8 +170,22 @@ static void CountTechStack(int userId)
     techTotals.done = true;
 }
 
-/* A pie of the parts BuildLangParts made. Returns the slice under the mouse, or -1. */
-static int DrawLangPie(Vector2 center, float radius)
+/* One slice of a pie, pushed out from the centre by lift (0..1: how far it has risen
+   on hover) and dimmed by fade (0..1) while another slice is the one hovered.
+   separated: there are other slices, so leave a thin gap between them. */
+void DrawPieSlice(Vector2 center, float radius, float startAngle, float sweep, Color color, float lift, float fade, bool separated)
+{
+    float rise = radius * 0.08f < 5 ? radius * 0.08f : 5;  /* how far a hovered slice moves out: less on a small pie */
+    float middle = (startAngle + sweep / 2) * DEG2RAD, push = (separated ? 1.2f : 0) + rise * lift;
+    Vector2 sliceCenter = {center.x + cosf(middle) * push, center.y + sinf(middle) * push};
+    Color shown = fade > 0 ? MixColors(color, ColorBrightness(color, -0.35f), fade) : color;
+    DrawCircleSector(sliceCenter, radius + rise * 0.6f * lift, startAngle, startAngle + sweep, (int)(sweep / 3) + 4, shown);
+}
+
+/* A pie of the parts BuildLangParts made. Each slice eases outward while it's hovered (or
+   while it's highlighted - its row in the key is hovered, -1 for none) and back after.
+   Returns the slice under the mouse, or -1. */
+static int DrawLangPie(Vector2 center, float radius, int highlighted)
 {
     if (!langTotal) { DrawRing(center, radius - 3, radius, 0, 360, 48, UI_BORDER); return -1; }
     Vector2 mouse = GetMousePosition();
@@ -177,19 +200,14 @@ static int DrawLangPie(Vector2 center, float radius)
         if (inside && mouseAngle >= angle && mouseAngle < angle + sweep) hovered = i;
         angle += sweep;
     }
+    int lit = hovered >= 0 ? hovered : highlighted;      /* the slice under the mouse, or the key row under it */
     angle = -90;
     for (int i = 0; i < langPartCount; i++) {
         float sweep = 360.0f * langParts[i].lines / langTotal;
-        DrawCircleSector(center, i == hovered ? radius + 4 : radius, angle, angle + sweep, (int)(sweep / 3) + 4, langParts[i].color);
+        float lift = HoverAmount(AnimationKey("tech pie", center.x + center.y * 4096, (float)langParts[i].lang), i == lit);
+        float fade = HoverAmount(AnimationKey("tech pie fade", center.x + center.y * 4096, (float)langParts[i].lang), lit >= 0 && i != lit);
+        DrawPieSlice(center, radius, angle, sweep, langParts[i].color, langPartCount > 1 ? lift : lift * 0.4f, fade * 0.6f, langPartCount > 1);
         angle += sweep;
-    }
-    if (langPartCount > 1) {
-        angle = -90;
-        for (int i = 0; i < langPartCount; i++) {
-            Vector2 edge = {center.x + cosf(angle * DEG2RAD) * (radius + 6), center.y + sinf(angle * DEG2RAD) * (radius + 6)};
-            DrawLineEx(center, edge, 2, (Color){22, 27, 34, 255});
-            angle += 360.0f * langParts[i].lines / langTotal;
-        }
     }
     return hovered;
 }
@@ -225,18 +243,23 @@ void DrawTechStack(Rectangle area, int userId, bool asBar)
     float radius = (area.height - 56) / 2;
     if (radius > 62) radius = 62;
     Vector2 center = {area.x + 20 + radius, area.y + 44 + radius};
-    int hovered = DrawLangPie(center, radius);
-    float keyX = center.x + radius + 24, keyY = area.y + 44, keyWidth = area.x + area.width - 16 - keyX;
+    float keyX = center.x + radius + 24, keyTop = area.y + 44, keyWidth = area.x + area.width - 16 - keyX;
     int rows = (int)((area.height - 52) / 22);
+    int keyHovered = -1;                                 /* a row of the key under the mouse lights its slice too */
+    for (int i = 0; i < langPartCount && i < rows; i++)
+        if (IsHovered((Rectangle){keyX - 4, keyTop + i * 22 - 2, keyWidth + 8, 22})) keyHovered = i;
+    int hovered = DrawLangPie(center, radius, keyHovered);
+    if (hovered < 0) hovered = keyHovered;
+    float keyY = keyTop;
     for (int i = 0; i < langPartCount && i < rows; i++) {
         LangPart *part = &langParts[i];
-        bool highlighted = i == hovered || IsHovered((Rectangle){keyX - 4, keyY - 2, keyWidth + 8, 22});
-        DrawCircle((int)keyX + 5, (int)keyY + 10, 5, part->color);
+        float glow = HoverAmount(AnimationKey("tech key", keyX + keyTop * 4096, (float)part->lang), i == hovered);
+        if (glow > 0) DrawRectangleRounded((Rectangle){keyX - 6, keyY - 2, keyWidth + 12, 23}, 0.4f, 6, WithAlpha(UI_HOVER, glow));
+        DrawCircleV((Vector2){keyX + 5, keyY + 10}, 5 + 1.5f * glow, part->color);
         const char *percent = TextFormat("%.1f%%", 100.0 * part->lines / langTotal);
         int percentWidth = MeasureText(percent, FONT_SIZE);
-        DrawTextFit(LangPartName(part), (int)keyX + 16, (int)keyY, FONT_SIZE, (int)keyWidth - 16 - percentWidth - 10, highlighted ? UI_TEXT : UI_TEXT);
-        DrawText(percent, (int)(keyX + keyWidth) - percentWidth, (int)keyY, FONT_SIZE, highlighted ? UI_TEXT : UI_MUTED);
-        if (highlighted && hovered < 0) hovered = i;
+        DrawTextFit(LangPartName(part), (int)keyX + 16, (int)keyY, FONT_SIZE, (int)keyWidth - 16 - percentWidth - 10, UI_TEXT);
+        DrawText(percent, (int)(keyX + keyWidth) - percentWidth, (int)keyY, FONT_SIZE, MixColors(UI_MUTED, UI_TEXT, glow));
         keyY += 22;
     }
     if (hovered >= 0) {

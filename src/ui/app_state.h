@@ -11,7 +11,7 @@
 #include "common.h"
 
 typedef enum { SCREEN_SIGN_IN, SCREEN_CREATE_ACCOUNT, SCREEN_FORGOT_PASSWORD, SCREEN_RECOVERY_CODE, SCREEN_NEW_REPO, SCREEN_REPO, SCREEN_COMMIT, SCREEN_SETTINGS, SCREEN_DAY, SCREEN_PROFILE, SCREEN_PEOPLE, SCREEN_UPLOAD, SCREEN_LOAD_FAILED } Screen;
-typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES, TAB_PEOPLE } Tab;
+typedef enum { TAB_CODE, TAB_COMMITS, TAB_ISSUES, TAB_PEOPLE, TAB_SETTINGS } Tab;  /* Settings: the owner only */
 typedef struct { char text[TEXT_LEN]; int length; bool active; bool secret; bool reveal; } TextField;
 typedef struct { int cursor; float scrollY, scrollX; bool focused; } EditorState;
 extern Screen screen;
@@ -24,7 +24,7 @@ extern TextField currentPasswordField, newPasswordField;
 extern TextField confirmNewPasswordField, deletePasswordField;
 extern EditorState editor;
 extern bool newRepoWithReadme, withExampleRepo, newRepoIsPrivate;
-extern int homeRepoView;  /* 0 = your repositories, 1 = everyone's */
+extern int homeRepoView;  /* 0 = your repositories, 1 = everyone's, 2 = people you follow */
 extern float graphScroll, fileListScroll, commitListScroll, issueListScroll, changeListScroll, diffScroll, dayScroll, dayReposScroll;
 extern char shownRecoveryCode[24];  /* recovery code on screen right now (never saved) */
 extern bool codeAfterReset;         /* the code screen was reached by resetting a password */

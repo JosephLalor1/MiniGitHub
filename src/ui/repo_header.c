@@ -1,11 +1,13 @@
 /*
  * repo_header.c - the top of a repository page
  *
- * Name, visibility, Star / Fork / Code buttons and tabs; the Code and
- * branch menus; the fork bar and the merge banner.
+ * Name, visibility, the Star / Fork / Copy repo address buttons and the
+ * tabs; the address menu and the branch menu; the fork bar and the merge
+ * banner.
  */
 
 #include "repo_header.h"
+#include "animation.h"
 #include "app_state.h"
 #include "branches.h"
 #include "downloads.h"
@@ -19,6 +21,7 @@
 #include "repo.h"
 #include "repo_people.h"
 #include "tab_code.h"
+#include "themes.h"
 #include "ui_core.h"
 #include "users.h"
 #include "widgets.h"
@@ -57,10 +60,12 @@ float DrawForkBar(Repo *repo, float top)
     return top + 46 + 12;
 }
 
-/* ---------- the Code menu: clone address and Download ZIP ---------- */
+/* ---------- the address menu: clone address and Download ZIP ----------
+   It hangs from the arrow beside the "Copy repo address" button. */
 
-bool      codeMenuOpen;           /* the menu under the Code button is open */
-static Rectangle codeButtonRect;  /* where the Code button is              */
+bool      codeMenuOpen;           /* the menu under the address button's arrow is open */
+static Rectangle codeButtonRect;  /* where that arrow is                               */
+static double    codeMenuOpenedAt; /* when it was opened, so it can slide in             */
 
 /* The menu is drawn after everything else on the page so it sits on top,
    but it takes its clicks first (before the page under it can). So this is
@@ -93,7 +98,10 @@ void CodeMenu(Repo *repo, bool draw)
         return;
     }
     hoverBlocked = false;
-    DrawRectangleRounded((Rectangle){menu.x + 3, menu.y + 5, menu.width, menu.height}, 0.04f, 6, (Color){0, 0, 0, 110});
+    float opening = EaseInOut((float)(GetTime() - codeMenuOpenedAt) / 0.15f);   /* drops into place as it opens */
+    menu.y -= 8 * (1 - opening);
+    box.y -= 8 * (1 - opening); copyButton.y -= 8 * (1 - opening); zipButton.y -= 8 * (1 - opening);
+    DrawRectangleRounded((Rectangle){menu.x + 3, menu.y + 5, menu.width, menu.height}, 0.04f, 6, (Color){0, 0, 0, (unsigned char)(110 * opening)});
     DrawRectangleRounded(menu, 0.04f, 6, (Color){22, 27, 34, 255});
     DrawRectangleRoundedLinesEx(menu, 0.04f, 6, 1, UI_BORDER);
     DrawTextBold("Clone with git", (int)menu.x + 16, (int)menu.y + 14, FONT_SIZE, UI_TEXT);
@@ -103,7 +111,7 @@ void CodeMenu(Repo *repo, bool draw)
         DrawTextFit(url, (int)box.x + 10, (int)box.y + 10, FONT_SIZE, (int)box.width - 20, UI_TEXT);
         bool copyHovered = CheckCollisionPointRec(mouse, copyButton);
         if (copyHovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-        DrawRectangleRounded(copyButton, 0.25f, 6, copyHovered ? ColorBrightness(UI_BUTTON, 0.15f) : UI_BUTTON);
+        DrawRectangleRounded(copyButton, 0.25f, 6, MixColors(UI_BUTTON, ColorBrightness(UI_BUTTON, 0.15f), HoverAmount(AnimationKey("menu copy", 0, 0), copyHovered)));
         DrawText("Copy", (int)(copyButton.x + (copyButton.width - MeasureText("Copy", FONT_SIZE)) / 2), (int)copyButton.y + 10, FONT_SIZE, UI_TEXT);
         DrawTextFit("Works with git clone, pull and push. When git asks, sign", (int)menu.x + 16, (int)menu.y + 100, FONT_SIZE, (int)width - 32, UI_MUTED);
         DrawTextFit("in with your Mini GitHub username and password.", (int)menu.x + 16, (int)menu.y + 124, FONT_SIZE, (int)width - 32, UI_MUTED);
@@ -114,7 +122,7 @@ void CodeMenu(Repo *repo, bool draw)
     DrawLine((int)menu.x + 1, (int)(zipButton.y - 14), (int)(menu.x + menu.width - 1), (int)(zipButton.y - 14), UI_BORDER);
     bool zipHovered = CheckCollisionPointRec(mouse, zipButton);
     if (zipHovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-    DrawRectangleRounded(zipButton, 0.25f, 6, zipHovered ? ColorBrightness(UI_BUTTON, 0.15f) : UI_BUTTON);
+    DrawRectangleRounded(zipButton, 0.25f, 6, MixColors(UI_BUTTON, ColorBrightness(UI_BUTTON, 0.15f), HoverAmount(AnimationKey("menu zip", 0, 0), zipHovered)));
     DrawText("Download ZIP", (int)(zipButton.x + (zipButton.width - MeasureText("Download ZIP", FONT_SIZE)) / 2), (int)zipButton.y + 10, FONT_SIZE, UI_TEXT);
 }
 
@@ -234,7 +242,7 @@ void BranchMenu(Repo *repo, bool draw)
             if (row.y + rowHeight < listArea.y || row.y > listArea.y + listArea.height) continue;
             bool hovered = CheckCollisionPointRec(mouse, row) && CheckCollisionPointRec(mouse, listArea);
             bool isCurrent = branchIndex == repo->currentBranch;
-            if (hovered) DrawRectangleRec(row, UI_HOVER);
+            DrawHoverFill(row, AnimationKey("branch row", (float)branchIndex, 0), hovered);
             if (isCurrent) DrawRectangle((int)row.x, (int)row.y + 6, 3, (int)rowHeight - 12, accentColor);
             DrawBranchIcon(row.x + 18, row.y + rowHeight / 2, isCurrent ? UI_TEXT : UI_MUTED);
             int nameX = (int)row.x + 38;
@@ -385,51 +393,50 @@ bool DrawRepoHeader(Repo *repo, int activeTab)
     DrawText(" / ", x + ownerWidth, y, 30, UI_MUTED);
     DrawTextBold(repo->name, x + ownerWidth + slashWidth, y, 30, UI_TEXT);
     bool ownRepo = IsMine(repo);
-    const char *badge = ownRepo ? "Yours" : IsCollaborator(repo, currentUserId) ? "Collaborator" : "Read-only";
-    Rectangle pill = {(float)(x + ownerWidth + slashWidth + nameWidth + 16), (float)y + 2, (float)MeasureText(badge, FONT_SIZE) + 20, 26};
-    DrawRectangleRounded(pill, 0.5f, 6, UI_BUTTON);
-    DrawText(badge, (int)pill.x + 10, (int)pill.y + 3, FONT_SIZE, UI_MUTED);
     if (WasClicked(ownerHit)) { OpenProfile(repo->owner); return true; }
 
-    /* Public / Private. The owner can click it to change it (twice, to be sure). */
+    /* the buttons on the right: [Fork]  [Copy repo address | v]  [Star] (more compact in a narrow window) */
+    bool narrow = screenWidth < 1200;
+    float starWidth = narrow ? 120 : 150, copyWidth = narrow ? 170 : 230;
+    float starX = (float)screenWidth - 20 - starWidth, addressX = starX - 12 - (copyWidth + 40), forkX = addressX - 12 - 140;
+    float buttonsLeft = ownRepo ? addressX : forkX;
+
+    /* after the name: Yours / Collaborator / Read-only, then Public / Private - as many
+       as fit before the buttons (the first to go is the first one) */
+    const char *badge = ownRepo ? "Yours" : IsCollaborator(repo, currentUserId) ? "Collaborator" : "Read-only";
     const char *visibilityText = repo->isPrivate ? "Private" : "Public";
-    Rectangle visibilityPill = {pill.x + pill.width + 10, pill.y, (float)MeasureText(visibilityText, FONT_SIZE) + 20, 26};
-    if (ownRepo) {
-        const char *askText = repo->isPrivate ? "Make public?" : "Make private?";
-        if (armedButtonId == 95) visibilityPill.width = (float)MeasureText(askText, FONT_SIZE) + 20;
-        bool visibilityHovered = IsHovered(visibilityPill);
-        if (visibilityHovered) {
-            wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-            SetTooltip(repo->isPrivate ? "Private: only you, collaborators and people you invite can see it"
-                                : "Public: everyone on this computer can see it and fork it",
-                   repo->isPrivate ? "Click twice to make it public" : "Click twice to make it private", NULL);
-        }
-        Color pillColor = armedButtonId == 95 ? UI_DANGER : repo->isPrivate ? (Color){110, 80, 20, 255} : UI_BUTTON;
-        DrawRectangleRounded(visibilityPill, 0.5f, 6, visibilityHovered ? ColorBrightness(pillColor, 0.15f) : pillColor);
-        DrawText(armedButtonId == 95 ? askText : visibilityText, (int)visibilityPill.x + 10, (int)visibilityPill.y + 3, FONT_SIZE, repo->isPrivate || armedButtonId == 95 ? UI_TEXT : UI_MUTED);
-        if (WasClicked(visibilityPill)) {
-            if (armedButtonId != 95) { armedButtonId = 95; armedSeconds = 3; }
-            else {
-                armedButtonId = 0;
-                repo->isPrivate = !repo->isPrivate;
-                if (repo->isPrivate)               /* people who can't see it any more don't keep a star on it */
-                    for (int i = repo->starCount - 1; i >= 0; i--) if (!CanSee(repo, repo->starredBy[i])) RemoveStar(repo, repo->starredBy[i]);
-                MarkDirty();
-                Toast(repo->isPrivate ? "Now private: only you, collaborators and people you invite can see it"
-                                   : "Now public: everyone can see it and fork it");
-            }
-        }
-    } else {
-        DrawRectangleRounded(visibilityPill, 0.5f, 6, repo->isPrivate ? (Color){110, 80, 20, 255} : UI_BUTTON);
+    float pillsX = (float)(x + ownerWidth + slashWidth + nameWidth + 16);
+    float badgeWidth = (float)MeasureText(badge, FONT_SIZE) + 20, visibilityWidth = (float)MeasureText(visibilityText, FONT_SIZE) + 20;
+    bool showBadge = pillsX + badgeWidth + 10 + visibilityWidth <= buttonsLeft - 12;
+    bool showVisibility = pillsX + visibilityWidth <= buttonsLeft - 12;
+    Rectangle pill = {pillsX, (float)y + 2, showBadge ? badgeWidth : -10, 26};
+    if (showBadge) {
+        DrawRectangleRounded(pill, 0.5f, 6, UI_BUTTON);
+        DrawText(badge, (int)pill.x + 10, (int)pill.y + 3, FONT_SIZE, UI_MUTED);
+    }
+
+    /* Public / Private. The owner changes it in the Settings tab (clicking the pill goes there). */
+    Rectangle visibilityPill = {pill.x + pill.width + 10, pill.y, showVisibility ? visibilityWidth : 0, 26};
+    Color pillColor = repo->isPrivate ? (Color){110, 80, 20, 255} : UI_BUTTON;
+    bool visibilityHovered = ownRepo && IsHovered(visibilityPill);
+    if (visibilityHovered) {
+        wantedCursor = MOUSE_CURSOR_POINTING_HAND;
+        SetTooltip(repo->isPrivate ? "Private: only you, collaborators and people you invite can see it"
+                                   : "Public: everyone on this computer can see it and fork it",
+                   "Click to change it in Settings", NULL);
+    }
+    if (showVisibility) {
+        DrawRectangleRounded(visibilityPill, 0.5f, 6, MixColors(pillColor, ColorBrightness(pillColor, 0.15f), HoverAmount(RectKey(visibilityPill), visibilityHovered)));
         DrawText(visibilityText, (int)visibilityPill.x + 10, (int)visibilityPill.y + 3, FONT_SIZE, repo->isPrivate ? UI_TEXT : UI_MUTED);
     }
+    if (ownRepo && WasClicked(visibilityPill)) { Unfocus(); repoTab = TAB_SETTINGS; screen = SCREEN_REPO; }
     pill = visibilityPill;
 
     /* next to the badge: how many people have forked this */
     int forkCount = ForkCount(repo), infoX = (int)(pill.x + pill.width + 16);
     const char *infoText = TextFormat("%d branch%s%s", repo->branchCount, repo->branchCount == 1 ? "" : "es",
                                    forkCount ? TextFormat("   %d fork%s", forkCount, forkCount == 1 ? "" : "s") : "");
-    if (repo->branchCount && screenWidth - 570 - infoX > MeasureText(infoText, FONT_SIZE)) DrawText(infoText, infoX, y + 5, FONT_SIZE, UI_MUTED);
+    if (repo->branchCount && buttonsLeft - 20 - infoX > MeasureText(infoText, FONT_SIZE)) DrawText(infoText, infoX, y + 5, FONT_SIZE, UI_MUTED);
 
     /* under the name: "forked from owner / name" (click to open the original), then the description */
     int descX = x, descMaxWidth = screenWidth - 400;
@@ -453,47 +460,54 @@ bool DrawRepoHeader(Repo *repo, int activeTab)
     if (descMaxWidth > 40) DrawTextFit(repo->description[0] ? repo->description : "No description", descX, y + 40, FONT_SIZE, descMaxWidth, UI_MUTED);
 
     bool starred = HasStarred(repo, currentUserId);
-    if (Button((Rectangle){(float)screenWidth - 170, (float)y, 150, 38},
+    if (Button((Rectangle){starX, (float)y, starWidth, 38},
                TextFormat("%s  %d", starred ? "Starred" : "Star", repo->starCount),
                starred ? (Color){110, 80, 20, 255} : UI_BUTTON)) {
         ToggleStar(repo, currentUserId);
         MarkDirty();
     }
-    codeButtonRect = (Rectangle){(float)screenWidth - (ownRepo ? 550 : 360), (float)y, 180, 38};
-    if (Button(codeButtonRect, codeMenuOpen ? "Code  ^" : "Code  v", UI_GREEN)) { codeMenuOpen = !codeMenuOpen; branchMenuOpen = false; }
+
+    /* Copy repo address: one click puts the git address on the clipboard. The arrow
+       beside it opens the menu (the address in full, help, and Download ZIP). */
+    Rectangle copyRect = {addressX, (float)y, copyWidth, 38};
+    codeButtonRect = (Rectangle){addressX + copyWidth + 2, (float)y, 38, 38};
+    if (Button(copyRect, narrow ? "Copy address" : "Copy repo address", UI_GREEN)) {
+        if (gitPort) { SetClipboardText(CloneUrl(repo)); Toast("Copied the address - use it with git clone"); codeMenuOpen = false; }
+        else { codeMenuOpen = true; codeMenuOpenedAt = GetTime(); branchMenuOpen = false; }   /* the menu says why there's no address */
+    } else if (IsHovered(copyRect)) SetTooltip(gitPort ? CloneUrl(repo) : "Mini GitHub's git server isn't running", gitPort ? "Click to copy it, for git clone" : NULL, NULL);
+    if (Button(codeButtonRect, "", UI_GREEN)) {
+        codeMenuOpen = !codeMenuOpen; branchMenuOpen = false;
+        if (codeMenuOpen) codeMenuOpenedAt = GetTime();
+    } else if (IsHovered(codeButtonRect) && !codeMenuOpen) SetTooltip("More", "The address in full, and Download ZIP", NULL);
+    float arrowX = codeButtonRect.x + codeButtonRect.width / 2, arrowY = codeButtonRect.y + codeButtonRect.height / 2;
+    if (codeMenuOpen) DrawTriangle((Vector2){arrowX - 6, arrowY + 3}, (Vector2){arrowX + 6, arrowY + 3}, (Vector2){arrowX, arrowY - 4}, UI_TEXT);
+    else              DrawTriangle((Vector2){arrowX - 6, arrowY - 3}, (Vector2){arrowX, arrowY + 4}, (Vector2){arrowX + 6, arrowY - 3}, UI_TEXT);
+
     if (!ownRepo) {                    /* you can't fork your own repository - you already own it */
         int myFork = FindForkOf(currentUserId, currentRepo);
-        if (Button((Rectangle){(float)screenWidth - 550, (float)y, 180, 38},
+        if (Button((Rectangle){forkX, (float)y, 140, 38},
                    myFork >= 0 ? "Your fork" : TextFormat("Fork  %d", ForkCount(repo)), UI_BUTTON)) {
             TryForkRepo(currentRepo);
             return true;
         }
     }
-    if (ownRepo && ConfirmButton((Rectangle){(float)screenWidth - 360, (float)y, 180, 38}, "Delete repo", "Really delete?", 1)) {
-        int i = currentRepo;
-        GoHome();
-        DeleteRepo(i);
-        MarkDirty();
-        Toast("Repository deleted");
-        return true;
-    }
 
     if (HeaderPie(repo, (float)screenWidth - 20, 150)) { Unfocus(); repoTab = TAB_PEOPLE; screen = SCREEN_REPO; }
 
-    int tabX = 20;
-    for (int tabIndex = 0; tabIndex < 4; tabIndex++) {
-        const char *label = tabIndex == 0 ? TextFormat("Code  %d", ShownFileCount(repo))
-                          : tabIndex == 1 ? TextFormat("Commits  %d", repo->commitCount)
-                          : tabIndex == 2 ? TextFormat("Issues  %d", OpenIssueCount(repo))
-                                   : TextFormat("People  %d", 1 + repo->collaboratorCount);
+    int tabX = 20, tabCount = ownRepo ? 5 : 4;          /* Settings is only for the owner */
+    for (int tabIndex = 0; tabIndex < tabCount; tabIndex++) {
+        const char *label = tabIndex == TAB_CODE    ? TextFormat("Code  %d", ShownFileCount(repo))
+                          : tabIndex == TAB_COMMITS ? TextFormat("Commits  %d", repo->commitCount)
+                          : tabIndex == TAB_ISSUES  ? TextFormat("Issues  %d", OpenIssueCount(repo))
+                          : tabIndex == TAB_PEOPLE  ? TextFormat("People  %d", 1 + repo->collaboratorCount)
+                                                    : "Settings";
         int tabWidth = MeasureText(label, FONT_SIZE) + 28;
         Rectangle tabRect = {(float)tabX, 132, (float)tabWidth, 38};
         bool selected = (tabIndex == activeTab);
-        if (IsHovered(tabRect)) {
-            wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-            if (!selected) DrawRectangleRounded((Rectangle){(float)tabX, 134, (float)tabWidth, 30}, 0.3f, 6, UI_HOVER);
-        }
-        DrawText(label, tabX + 14, 140, FONT_SIZE, selected ? UI_TEXT : UI_MUTED);
+        if (IsHovered(tabRect)) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
+        float glow = HoverAmount(AnimationKey("repo tab", (float)tabIndex, 0), IsHovered(tabRect) && !selected);
+        if (glow > 0) DrawRectangleRounded((Rectangle){(float)tabX, 134, (float)tabWidth, 30}, 0.3f, 6, WithAlpha(UI_HOVER, glow));
+        DrawText(label, tabX + 14, 140, FONT_SIZE, selected ? UI_TEXT : MixColors(UI_MUTED, UI_TEXT, glow));
         if (selected) DrawRectangle(tabX, 167, tabWidth, 3, accentColor);
         if (WasClicked(tabRect)) { Unfocus(); repoTab = (Tab)tabIndex; screen = SCREEN_REPO; }
         tabX += tabWidth + 6;

@@ -6,7 +6,9 @@
  */
 
 #include "widgets.h"
+#include "animation.h"
 #include "app_state.h"
+#include "themes.h"
 #include "ui_core.h"
 
 /* ------------------------------------------------------------------ */
@@ -17,13 +19,25 @@ bool ButtonEnabled(Rectangle rect, const char *label, Color color, bool enabled)
 {
     bool hovered = enabled && IsHovered(rect);
     if (hovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-    DrawRectangleRounded(rect, 0.25f, 6, hovered ? ColorBrightness(color, 0.15f) : color);
+    float glow = HoverAmount(RectKey(rect), hovered);      /* brightens smoothly as the mouse arrives */
+    DrawRectangleRounded(rect, 0.25f, 6, glow > 0 ? MixColors(color, ColorBrightness(color, 0.15f), glow) : color);
     int textWidth = MeasureText(label, FONT_SIZE);
     DrawText(label, (int)(rect.x + (rect.width - (float)textWidth) / 2), (int)(rect.y + (rect.height - FONT_SIZE) / 2), FONT_SIZE, UI_TEXT);
     return enabled && WasClicked(rect);
 }
 /* Draws a button. Returns true when it is clicked. */
 bool Button(Rectangle rect, const char *label, Color color) { return ButtonEnabled(rect, label, color, true); }
+
+/* Fills a row with the hover colour, fading in and out as the mouse comes and goes.
+   key: what the row shows (so it keeps its fade while the list scrolls). */
+void DrawHoverFill(Rectangle rect, unsigned key, bool hovered)
+{
+    float glow = HoverAmount(key, hovered);
+    if (glow > 0) DrawRectangleRec(rect, WithAlpha(UI_HOVER, glow));
+}
+
+/* A card's background: the panel colour, easing to the hover colour while it's hovered. */
+Color CardColor(unsigned key, bool hovered) { return MixColors(UI_PANEL, UI_HOVER, HoverAmount(key, hovered)); }
 
 /* First click arms it (turns red), second click within 3 seconds does it. */
 bool ConfirmButton(Rectangle rect, const char *label, const char *confirmLabel, int id)
@@ -133,14 +147,43 @@ bool TextFieldWidget(TextField *field, Rectangle rect, const char *placeholder)
     return pressedEnter;
 }
 
+/* Smooth scrolling: the wheel moves where each list is heading, and the list
+   glides there over the next few frames. One slot per scroll position in use. */
+#define SCROLL_SLOTS 32
+typedef struct { float *scroll; float target, shown; double lastTime; } ScrollSlot;
+static ScrollSlot scrollSlots[SCROLL_SLOTS];
+
+/* The slot for this scroll position (the least recently used one is taken over for a new one). */
+static ScrollSlot *FindScrollSlot(float *scroll)
+{
+    ScrollSlot *oldest = &scrollSlots[0];
+    for (int i = 0; i < SCROLL_SLOTS; i++) {
+        if (scrollSlots[i].scroll == scroll) return &scrollSlots[i];
+        if (scrollSlots[i].lastTime < oldest->lastTime) oldest = &scrollSlots[i];
+    }
+    *oldest = (ScrollSlot){scroll, *scroll, *scroll, GetTime()};
+    return oldest;
+}
+
 /* Scrolls *scroll with the mouse wheel while the mouse is over area, keeping it in range. */
 void ScrollArea(Rectangle area, float *scroll, float contentHeight)
 {
-    if (IsHovered(area)) *scroll -= GetMouseWheelMove() * 40.0f;
     float maxScroll = contentHeight - area.height;
     if (maxScroll < 0) maxScroll = 0;
+    ScrollSlot *slot = FindScrollSlot(scroll);
+    double now = GetTime();
+    float elapsed = (float)(now - slot->lastTime);
+    if (elapsed > 0.1f) elapsed = 0.1f;
+    slot->lastTime = now;
+    if (*scroll != slot->shown) slot->target = *scroll;   /* moved by something else (a reset, a jump): go along with it */
+    if (IsHovered(area)) slot->target -= GetMouseWheelMove() * 60.0f;
+    if (slot->target > maxScroll) slot->target = maxScroll;
+    if (slot->target < 0)         slot->target = 0;
+    *scroll += (slot->target - *scroll) * (1 - expf(-16.0f * elapsed));
+    if (fabsf(slot->target - *scroll) < 0.5f) *scroll = slot->target;
     if (*scroll > maxScroll) *scroll = maxScroll;
-    if (*scroll < 0)   *scroll = 0;
+    if (*scroll < 0)         *scroll = 0;
+    slot->shown = *scroll;
 }
 /* Draws a scrollbar along the right of area (only if the content doesn't fit). */
 void DrawScrollbar(Rectangle area, float scroll, float contentHeight)
@@ -274,9 +317,11 @@ void DrawTooltip(void)
 void DrawToast(void)
 {
     if (toastSeconds <= 0) return;
-    float alpha = toastSeconds < 0.4f ? toastSeconds / 0.4f : 1.0f;
+    float shownFor = 3.0f - toastSeconds;                       /* it slides up and fades in, then fades out */
+    float arrive = EaseInOut(shownFor / 0.25f);
+    float alpha = toastSeconds < 0.4f ? toastSeconds / 0.4f : arrive;
     int width = MeasureText(toastText, FONT_SIZE) + 44;
-    Rectangle box = {(float)(screenWidth - width) / 2, (float)screenHeight - 130, (float)width, 46};
+    Rectangle box = {(float)(screenWidth - width) / 2, (float)screenHeight - 130 + 16 * (1 - arrive), (float)width, 46};
     DrawRectangleRounded(box, 0.3f, 8, Fade((Color){48, 54, 61, 255}, alpha));
     DrawText(toastText, (int)box.x + 22, (int)box.y + 13, FONT_SIZE, Fade(UI_TEXT, alpha));
 }

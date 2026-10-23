@@ -226,6 +226,35 @@ void ToggleStar(Repo *repo, int userId)
     else if (repo->starCount < MAX_USERS) repo->starredBy[repo->starCount++] = userId;
 }
 
+/* Does followerId follow userId? */
+bool IsFollowing(int followerId, int userId)
+{
+    User *follower = FindUserById(followerId);
+    if (!follower) return false;
+    for (int i = 0; i < follower->followingCount; i++) if (follower->following[i] == userId) return true;
+    return false;
+}
+/* Starts followerId following userId, or stops it. (Nobody follows themselves.) */
+void ToggleFollow(int followerId, int userId)
+{
+    User *follower = FindUserById(followerId);
+    if (!follower || followerId == userId || !FindUserById(userId)) return;
+    for (int i = 0; i < follower->followingCount; i++)
+        if (follower->following[i] == userId) {               /* unfollow, keeping the rest in order */
+            memmove(&follower->following[i], &follower->following[i + 1], (size_t)(follower->followingCount - i - 1) * sizeof(int));
+            follower->followingCount--;
+            return;
+        }
+    if (follower->followingCount < MAX_USERS) follower->following[follower->followingCount++] = userId;
+}
+/* How many people follow userId. */
+int FollowerCount(int userId)
+{
+    int count = 0;
+    for (int i = 0; i < userCount; i++) if (IsFollowing(users[i].id, userId)) count++;
+    return count;
+}
+
 /* How many files you see: the latest commit plus your own draft if you can
    edit; just the latest commit if you're a visitor. */
 int ShownFileCount(Repo *repo)
@@ -268,8 +297,8 @@ int ReposOwnedBy(int userId)
     return count;
 }
 
-/* Removes the account, all of its repositories, and its stars elsewhere.
-   Commits and issues it made in other people's repos stay (as "ghost"). */
+/* Removes the account, all of its repositories, its stars elsewhere and anyone's
+   follow of it. Commits and issues it made in other people's repos stay (as "ghost"). */
 void DeleteAccount(int userId)
 {
     for (int i = repoCount - 1; i >= 0; i--) if (repos[i].owner == userId) DeleteRepo(i);
@@ -277,6 +306,7 @@ void DeleteAccount(int userId)
         RemoveStar(&repos[i], userId);
         RemoveMember(&repos[i], userId);               /* collaborator places and invitations */
     }
+    for (int i = 0; i < userCount; i++) if (IsFollowing(users[i].id, userId)) ToggleFollow(users[i].id, userId);
     for (int i = 0; i < userCount; i++)
         if (users[i].id == userId) {
             if (users[i].avatarState == 1) UnloadTexture(users[i].avatarTexture);

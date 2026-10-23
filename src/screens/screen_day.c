@@ -6,6 +6,7 @@
  */
 
 #include "screen_day.h"
+#include "animation.h"
 #include "app_state.h"
 #include "contributions.h"
 #include "model.h"
@@ -71,7 +72,8 @@ void ScreenDay(void)
         RepoTally *tally = &tallies[i];
         Rectangle row = {listArea.x, listArea.y + i * rowHeight - dayReposScroll, listArea.width, rowHeight};
         bool hovered = IsHovered(listArea) && IsHovered(row);
-        if (hovered) { DrawRectangleRec(row, UI_HOVER); wantedCursor = MOUSE_CURSOR_POINTING_HAND; }
+        DrawHoverFill(row, AnimationKey("day repo", (float)tally->repo, 0), hovered);
+        if (hovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
         if (i) DrawLine((int)row.x + 12, (int)row.y, (int)(row.x + row.width - 12), (int)row.y, UI_BORDER);
         DrawTextFit(RepoLabel(tally->repo), (int)row.x + 14, (int)row.y + 10, FONT_SIZE, (int)row.width - 28, UI_LINK);
         DrawText(TallyText(tally->commits, tally->issues), (int)row.x + 14, (int)row.y + 34, FONT_SIZE, UI_MUTED);
@@ -114,7 +116,7 @@ void ScreenDay(void)
         if (card.y > rightArea.y + rightArea.height || card.y + card.height < rightArea.y) continue;
         bool hovered = IsHovered(rightArea) && IsHovered(card);
         if (hovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
-        DrawRectangleRec(card, hovered ? UI_HOVER : UI_PANEL);
+        DrawRectangleRec(card, CardColor(AnimationKey("day card", (float)i, 0), hovered));
         DrawRectangleLinesEx(card, 1, UI_BORDER);
 
         /* left column: time and what kind of thing it was */

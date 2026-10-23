@@ -22,7 +22,7 @@ TextField currentPasswordField = {.secret = true}, newPasswordField  = {.secret 
 TextField confirmNewPasswordField= {.secret = true}, deletePasswordField  = {.secret = true};
 EditorState editor;
 bool  newRepoWithReadme = true, withExampleRepo = true, newRepoIsPrivate = false;
-int   homeRepoView;            /* 0 = your repositories, 1 = everyone's */
+int   homeRepoView;            /* 0 = your repositories, 1 = everyone's, 2 = people you follow */
 float graphScroll, fileListScroll, commitListScroll, issueListScroll, changeListScroll, diffScroll, dayScroll, dayReposScroll;
 char  shownRecoveryCode[24];   /* recovery code on screen right now (never saved) */
 bool  codeAfterReset;          /* the code screen was reached by resetting a password */

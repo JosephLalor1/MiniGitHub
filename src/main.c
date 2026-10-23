@@ -9,7 +9,8 @@
  *   - Forgot your password? Each account gets a one-time recovery code
  *     (shown when you sign up, or made in Account settings). Enter it on the
  *     "Forgot password?" screen to choose a new password.
- *   - Repositories belong to a user: create, star and delete your own
+ *   - Repositories belong to a user: create, star and delete your own (a
+ *     repository's Settings tab makes it public or private, or deletes it)
  *   - Browse everyone's repositories (read-only unless they're yours)
  *   - A built-in text editor for the files in your repositories
  *   - Uploads: drag files from your computer onto one of your repositories (or
@@ -29,17 +30,21 @@
  *     yourself (a fast-forward), or combined with your work in a merge commit
  *     when you have - unless you both changed the same file.
  *   - Profiles: a picture (PNG or JPG, dragged onto the window or by file path), a short
- *     bio, a circle colour, and a choice of animated themes (Classic is the plain look)
+ *     bio, a circle colour, and a choice of animated themes (Classic is the plain look).
+ *     A splash screen shows one of them, picked at random, while the app opens
  *   - A People page and a profile page for every user. Your own profile is your
  *     home page: it's where you land after signing in, and it lists your
- *     repositories (or everyone's), with a search box and a New button
+ *     repositories (or those of people you follow, or everyone's), with a search
+ *     box and a New repository button. The column about you hides behind your
+ *     picture there: hover the picture to see it, click it to keep it open
+ *   - Following: follow other people from their profile or the People page
  *   - A contribution graph of the last six months: hover a day to see what you
  *     did, click it to open a page listing every commit and issue from that day
  *   - Real git: every repository is a real git repository too. Mini GitHub runs
  *     a small git server on this computer only (http://localhost:7979), so
  *     git clone, git pull, git fetch and git push all work. Pushing needs your
  *     Mini GitHub username and password, and only the owner and collaborators
- *     may push. Press "Code" on a repository for its address; Settings > Git
+ *     may push. Press "Copy repo address" on a repository for its address; Settings > Git
  *     explains the rest. Commits keep git's own fingerprints (SHA-1), files are
  *     kept byte for byte, and folders show as a tree you can open and close.
  *
@@ -87,10 +92,12 @@
 #include "screen_profile.h"
 #include "screen_settings.h"
 #include "screen_sign_in.h"
+#include "screen_splash.h"
 #include "screen_upload.h"
 #include "tab_code.h"
 #include "tab_commits.h"
 #include "tab_issues.h"
+#include "tab_settings.h"
 #include "themes.h"
 #include "ui_core.h"
 #include "uploads.h"
@@ -108,9 +115,11 @@ int main(void)
     SetExitKey(KEY_NULL);            /* Esc goes "back" instead of quitting */
     SetTargetFPS(60);
 
+    SplashIntro();                   /* the logo appears, and stays up while loading */
     Load();
     if (loadFailed) screen = SCREEN_LOAD_FAILED;  /* say so, and wait: nothing is saved until you choose */
     else AfterLoad();
+    SplashFinish();
 
     int   lastCursor = -1;                 /* the mouse cursor shape set last frame */
 
@@ -209,7 +218,8 @@ int main(void)
             if      (repoTab == TAB_CODE)    TabCode(repo);
             else if (repoTab == TAB_COMMITS) TabCommits(repo);
             else if (repoTab == TAB_ISSUES)  TabIssues(repo);
-            else                         TabPeople(repo);
+            else if (repoTab == TAB_PEOPLE)  TabPeople(repo);
+            else                         TabSettings(repo);
         } break;
         case SCREEN_COMMIT: {
             Repo *repo = &repos[currentRepo];

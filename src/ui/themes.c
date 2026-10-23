@@ -23,6 +23,11 @@ const ThemeInfo THEMES[THEME_COUNT] = {
     {"Circuit board", "Glowing circuits",           { 45, 212, 191, 255}},
     {"Ocean",         "Waves and bubbles",          { 88, 166, 255, 255}},
     {"Autumn",        "Falling leaves",                     {230, 126,  34, 255}},
+    {"Snowfall",      "Snow drifting over pines",           {160, 205, 255, 255}},
+    {"Aurora",        "Northern lights",                    {110, 240, 190, 255}},
+    {"Synthwave",     "A neon sun and grid",                {255,  95, 200, 255}},
+    {"Fireflies",     "A warm summer night",                {250, 215,  90, 255}},
+    {"Rainy city",    "Rain over the rooftops",             {125, 170, 225, 255}},
 };
 
 /* A repeatable "random" number from 0 to 1 for one item and one of its properties. */
@@ -43,13 +48,15 @@ Color WithAlpha(Color color, float alpha)
     return color;
 }
 
-/* Colour fades drawn as thin strips. (raylib has functions for this, but their
-   arguments have changed between raylib versions, so these work with any of them.) */
-static Color MixColors(Color from, Color to, float amount)
+/* A colour part way from one to another (amount 0 = from, 1 = to). */
+Color MixColors(Color from, Color to, float amount)
 {
     return (Color){(unsigned char)(from.r + (to.r - from.r) * amount), (unsigned char)(from.g + (to.g - from.g) * amount),
                    (unsigned char)(from.b + (to.b - from.b) * amount), (unsigned char)(from.a + (to.a - from.a) * amount)};
 }
+
+/* Colour fades drawn as thin strips. (raylib has functions for this, but their
+   arguments have changed between raylib versions, so these work with any of them.) */
 static void DrawGradientVertical(int x, int y, int width, int height, Color top, Color bottom)
 {
     for (int offset = 0; offset < height; offset += 4) DrawRectangle(x, y + offset, width, height - offset < 4 ? height - offset : 4, MixColors(top, bottom, height > 1 ? (float)offset / (height - 1) : 0));
@@ -253,6 +260,170 @@ static void DrawThemeAutumn(Rectangle area, float seconds, float strength)
     }
 }
 
+static void DrawThemeSnow(Rectangle area, float seconds, float strength)
+{
+    DrawGradientVertical((int)area.x, (int)area.y, (int)area.width, (int)area.height,
+                           WithAlpha((Color){15, 25, 50, 255}, 0.55f * strength), WithAlpha((Color){45, 60, 90, 255}, 0.5f * strength));
+    /* a row of pine trees along the bottom, with snow on the ground in front */
+    bool small = area.height < 300;
+    float ground = area.y + area.height - (small ? 10 : 26);
+    int treeCount = (int)(area.width / 46) + 2;
+    Color pine = WithAlpha((Color){18, 40, 45, 255}, 0.9f * strength), snowOnPine = WithAlpha((Color){220, 235, 255, 255}, 0.3f * strength);
+    for (int i = 0; i < treeCount; i++) {
+        float x = area.x + i * 46 - 20 + HashRandom(i, 31) * 20, height = (small ? 30 : 60) + HashRandom(i, 32) * (small ? 25 : 70);
+        for (int tier = 0; tier < 3; tier++) {               /* three stacked triangles, smaller toward the top */
+            float tierBottom = ground - height * tier * 0.28f, halfWidth = height * (0.32f - tier * 0.07f), tip = tierBottom - height * 0.45f;
+            DrawTriangleAnyOrder((Vector2){x, tip}, (Vector2){x - halfWidth, tierBottom}, (Vector2){x + halfWidth, tierBottom}, pine);
+            DrawTriangleAnyOrder((Vector2){x, tip}, (Vector2){x - halfWidth * 0.45f, tip + height * 0.2f}, (Vector2){x + halfWidth * 0.45f, tip + height * 0.2f}, snowOnPine);
+        }
+    }
+    DrawRectangleRec((Rectangle){area.x, ground, area.width, area.y + area.height - ground}, WithAlpha((Color){215, 228, 245, 255}, 0.45f * strength));
+    /* snowflakes: small soft dots falling and swaying, and now and then a bigger six-armed one */
+    int count = ItemCount(area, 3200, 420);
+    for (int i = 0; i < count; i++) {
+        float fallSpeed = 18 + HashRandom(i, 1) * 40, size = 1 + HashRandom(i, 2) * 2.4f;
+        float y = area.y + fmodf(HashRandom(i, 3) * (area.height + 20) + seconds * fallSpeed, area.height + 20) - 10;
+        float x = area.x + fmodf(HashRandom(i, 4) * area.width + sinf(seconds * (0.4f + HashRandom(i, 5)) + HashRandom(i, 6) * 6.28f) * 18 + area.width, area.width);
+        if (i % 23 == 0) {
+            float spin = seconds * (HashRandom(i, 7) - 0.5f) + HashRandom(i, 8) * 6.28f, arm = 4 + HashRandom(i, 9) * 3;
+            for (int k = 0; k < 3; k++) {
+                float angle = spin + k * 60 * DEG2RAD;
+                DrawLineEx((Vector2){x - cosf(angle) * arm, y - sinf(angle) * arm}, (Vector2){x + cosf(angle) * arm, y + sinf(angle) * arm}, 1.2f, WithAlpha(WHITE, 0.75f * strength));
+            }
+        } else DrawCircleV((Vector2){x, y}, size, WithAlpha(WHITE, (0.45f + 0.4f * HashRandom(i, 10)) * strength));
+    }
+}
+
+static void DrawThemeAurora(Rectangle area, float seconds, float strength)
+{
+    DrawGradientVertical((int)area.x, (int)area.y, (int)area.width, (int)area.height,
+                           WithAlpha((Color){4, 12, 28, 255}, 0.75f * strength), WithAlpha((Color){8, 30, 40, 255}, 0.55f * strength));
+    int starCount = ItemCount(area, 9000, 160);
+    for (int i = 0; i < starCount; i++) {
+        float twinkle = 0.4f + 0.6f * (0.5f + 0.5f * sinf(seconds * (0.7f + HashRandom(i, 3) * 2) + HashRandom(i, 4) * 6.28f));
+        DrawCircleV((Vector2){area.x + HashRandom(i, 1) * area.width, area.y + HashRandom(i, 2) * area.height * 0.7f}, 0.8f + HashRandom(i, 5),
+                    WithAlpha(WHITE, 0.7f * twinkle * strength));
+    }
+    /* the lights: three curtains, each a row of thin strips whose height and brightness ripple */
+    static const Color curtainColors[3] = {{70, 255, 170, 255}, {60, 190, 255, 255}, {190, 110, 255, 255}};
+    for (int curtain = 0; curtain < 3; curtain++) {
+        float baseY = area.y + area.height * (0.2f + curtain * 0.09f);
+        for (float x = area.x; x < area.x + area.width; x += 5) {
+            float wave = sinf(x / 230 + seconds * 0.35f + curtain * 1.9f) * 0.6f + sinf(x / 95 - seconds * 0.6f + curtain) * 0.4f;
+            float top = baseY + wave * area.height * 0.07f;
+            float height = area.height * (0.12f + 0.08f * (0.5f + 0.5f * sinf(x / 140 + seconds * 0.5f + curtain * 2.3f)));
+            float glow = 0.5f + 0.5f * sinf(x / 60 + seconds * 1.3f + curtain * 4.1f);
+            Color color = WithAlpha(curtainColors[curtain], (0.10f + 0.16f * glow) * strength);
+            int stripTop = (int)top, stripHeight = (int)height;   /* whole pixels, so the two halves meet without a seam */
+            DrawRectangleGradientV((int)x, stripTop, 5, stripHeight, WithAlpha(color, 0.1f), color);                     /* faint at the top...       */
+            DrawRectangleGradientV((int)x, stripTop + stripHeight, 5, (int)(height * 0.6f), color, WithAlpha(color, 0));  /* ...brightest, then fading */
+        }
+    }
+    /* dark hills along the bottom */
+    float bottom = area.y + area.height;
+    for (float x = area.x; x < area.x + area.width; x += 4) {
+        float hill = area.y + area.height * (0.86f + 0.05f * sinf(x / 170) + 0.03f * sinf(x / 61 + 1.3f));
+        DrawRectangle((int)x, (int)hill, 4, (int)(bottom - hill) + 1, WithAlpha((Color){5, 14, 20, 255}, 0.95f * strength));
+    }
+}
+
+static void DrawThemeSynthwave(Rectangle area, float seconds, float strength)
+{
+    float horizon = area.y + area.height * 0.58f, bottom = area.y + area.height, centerX = area.x + area.width / 2;
+    DrawGradientVertical((int)area.x, (int)area.y, (int)area.width, (int)(horizon - area.y),
+                           WithAlpha((Color){25, 8, 50, 255}, 0.7f * strength), WithAlpha((Color){110, 25, 95, 255}, 0.6f * strength));
+    DrawRectangleRec((Rectangle){area.x, horizon, area.width, bottom - horizon}, WithAlpha((Color){18, 4, 32, 255}, 0.8f * strength));
+    int starCount = ItemCount(area, 12000, 90);
+    for (int i = 0; i < starCount; i++)
+        DrawCircleV((Vector2){area.x + HashRandom(i, 1) * area.width, area.y + HashRandom(i, 2) * (horizon - area.y) * 0.6f}, 1,
+                    WithAlpha(WHITE, (0.3f + 0.4f * HashRandom(i, 3)) * strength));
+    /* the sun: yellow fading to pink, sliced by gaps that drift down and widen toward the horizon */
+    float sunRadius = area.height * 0.24f < 150 ? area.height * 0.24f : 150, sunY = horizon - sunRadius * 0.35f;
+    float gapSpacing = sunRadius * 0.13f, gapsFrom = -sunRadius * 0.3f;
+    DrawCircleV((Vector2){centerX, sunY}, sunRadius * 1.25f, WithAlpha((Color){255, 80, 160, 255}, 0.08f * strength));
+    for (float row = -sunRadius; row < sunRadius && sunY + row < horizon; row += 2) {
+        float gapShare = (row - gapsFrom) / (sunRadius * 0.35f - gapsFrom) * 0.6f;    /* 0 where the gaps start, 0.6 at the horizon */
+        if (row > gapsFrom && fmodf(row - seconds * 6 + gapSpacing * 100, gapSpacing) < gapSpacing * gapShare) continue;   /* a gap */
+        float halfWidth = sqrtf(sunRadius * sunRadius - row * row), below = (row + sunRadius) / (2 * sunRadius);
+        DrawRectangleRec((Rectangle){centerX - halfWidth, sunY + row, halfWidth * 2, 2},
+                         WithAlpha(MixColors((Color){255, 220, 90, 255}, (Color){255, 60, 150, 255}, below), 0.9f * strength));
+    }
+    /* the grid: lines running away to the horizon, and cross lines rolling toward you */
+    Color gridColor = {255, 70, 200, 255};
+    for (int line = -14; line <= 14; line++) {
+        float spread = area.width * 0.11f * line;
+        DrawLineEx((Vector2){centerX + spread * 0.08f, horizon}, (Vector2){centerX + spread * 1.6f, bottom}, 1.5f, WithAlpha(gridColor, 0.55f * strength));
+    }
+    float roll = fmodf(seconds * 0.9f, 1);
+    for (int line = 0; line < 14; line++) {
+        float depth = (line + 1 - roll) / 14;                /* 0 = at the horizon, 1 = at your feet */
+        float y = horizon + (bottom - horizon) * depth * depth;
+        DrawLineEx((Vector2){area.x, y}, (Vector2){area.x + area.width, y}, 1 + depth, WithAlpha(gridColor, (0.15f + 0.5f * depth) * strength));
+    }
+    DrawLineEx((Vector2){area.x, horizon}, (Vector2){area.x + area.width, horizon}, 2, WithAlpha((Color){255, 150, 230, 255}, 0.8f * strength));
+}
+
+static void DrawThemeFireflies(Rectangle area, float seconds, float strength)
+{
+    DrawGradientVertical((int)area.x, (int)area.y, (int)area.width, (int)area.height,
+                           WithAlpha((Color){6, 14, 22, 255}, 0.65f * strength), WithAlpha((Color){12, 32, 20, 255}, 0.6f * strength));
+    /* tall grass along the bottom, swaying */
+    float bottom = area.y + area.height, grassHeight = area.height < 300 ? 26 : 70;
+    for (float x = area.x; x < area.x + area.width; x += 5) {
+        int blade = (int)((x - area.x) / 5);
+        float height = grassHeight * (0.5f + HashRandom(blade, 41) * 0.8f);
+        float sway = sinf(seconds * 1.1f + x / 70 + HashRandom(blade, 42) * 2) * height * 0.18f;
+        DrawLineEx((Vector2){x, bottom}, (Vector2){x + sway, bottom - height}, 2, WithAlpha((Color){14, 45, 25, 255}, 0.95f * strength));
+    }
+    /* fireflies: wandering slowly, each glowing and fading on its own rhythm */
+    int count = ItemCount(area, 14000, 110);
+    for (int i = 0; i < count; i++) {
+        float x = area.x + (HashRandom(i, 1) + 0.06f * sinf(seconds * (0.15f + HashRandom(i, 3) * 0.2f) + HashRandom(i, 4) * 6.28f)) * area.width;
+        float y = area.y + (0.15f + HashRandom(i, 2) * 0.8f + 0.05f * cosf(seconds * (0.12f + HashRandom(i, 5) * 0.2f) + HashRandom(i, 6) * 6.28f)) * area.height;
+        float pulse = 0.5f + 0.5f * sinf(seconds * (0.8f + HashRandom(i, 7) * 1.4f) + HashRandom(i, 8) * 6.28f);
+        pulse = pulse * pulse * pulse;                       /* mostly dim, now and then bright */
+        if (pulse < 0.02f) continue;
+        DrawCircleV((Vector2){x, y}, 12, WithAlpha((Color){250, 215, 90, 255}, 0.08f * pulse * strength));
+        DrawCircleV((Vector2){x, y}, 5, WithAlpha((Color){250, 225, 110, 255}, 0.25f * pulse * strength));
+        DrawCircleV((Vector2){x, y}, 2, WithAlpha((Color){255, 250, 200, 255}, 0.95f * pulse * strength));
+    }
+}
+
+static void DrawThemeRain(Rectangle area, float seconds, float strength)
+{
+    DrawGradientVertical((int)area.x, (int)area.y, (int)area.width, (int)area.height,
+                           WithAlpha((Color){14, 20, 32, 255}, 0.7f * strength), WithAlpha((Color){30, 36, 52, 255}, 0.6f * strength));
+    /* now and then, far-off lightning brightens the sky for a moment */
+    float stormPhase = fmodf(seconds, 13);
+    if (stormPhase < 0.35f) {
+        float flash = stormPhase < 0.08f ? stormPhase / 0.08f : stormPhase < 0.14f ? 0.4f : (0.35f - stormPhase) / 0.21f;
+        DrawRectangleRec(area, WithAlpha((Color){180, 200, 255, 255}, 0.12f * flash * strength));
+    }
+    /* the skyline: buildings with a few lit windows (now and then one goes on or off) */
+    float bottom = area.y + area.height, x = area.x - 10;
+    for (int building = 0; x < area.x + area.width; building++) {
+        float width = 40 + HashRandom(building, 51) * 70, height = area.height * (0.15f + HashRandom(building, 52) * 0.3f);
+        Rectangle block = {x, bottom - height, width, height};
+        DrawRectangleRec(block, WithAlpha((Color){12, 16, 26, 255}, 0.95f * strength));
+        for (float windowY = block.y + 8; windowY < bottom - 10; windowY += 14)
+            for (float windowX = block.x + 6; windowX < block.x + width - 10; windowX += 12) {
+                int window = building * 1000 + (int)((windowY - block.y) / 14) * 37 + (int)((windowX - block.x) / 12);
+                bool lit = HashRandom(window, 53) < 0.28f;
+                if (HashRandom(window, 54) < 0.03f) lit = fmodf(seconds + HashRandom(window, 55) * 30, 30) < 15;   /* someone comes home, then goes to bed */
+                if (lit) DrawRectangleRec((Rectangle){windowX, windowY, 5, 7}, WithAlpha((Color){255, 210, 120, 255}, 0.55f * strength));
+            }
+        x += width + 4;
+    }
+    /* the rain: thin slanted streaks falling fast */
+    int count = ItemCount(area, 2400, 520);
+    for (int i = 0; i < count; i++) {
+        float speed = 520 + HashRandom(i, 1) * 360, length = 10 + HashRandom(i, 2) * 14;
+        float y = area.y + fmodf(HashRandom(i, 3) * (area.height + 40) + seconds * speed, area.height + 40) - 20;
+        float dropX = area.x + fmodf(HashRandom(i, 4) * area.width - (y - area.y) * 0.18f + area.width * 2, area.width);
+        DrawLineEx((Vector2){dropX, y}, (Vector2){dropX - length * 0.18f, y - length}, 1, WithAlpha((Color){170, 195, 235, 255}, (0.25f + 0.25f * HashRandom(i, 5)) * strength));
+    }
+}
+
 /* Draws a theme filling the rectangle area, but only the part inside clip.
    strength 0..1: low for behind the app, 1 for banners and previews. */
 void DrawThemeClip(int theme, Rectangle area, Rectangle clip, float strength)
@@ -267,6 +438,11 @@ void DrawThemeClip(int theme, Rectangle area, Rectangle clip, float strength)
     case THEME_CIRCUIT: DrawThemeCircuit(area, seconds, strength); break;
     case THEME_OCEAN:   DrawThemeOcean(area, seconds, strength);   break;
     case THEME_AUTUMN:  DrawThemeAutumn(area, seconds, strength);  break;
+    case THEME_SNOW:      DrawThemeSnow(area, seconds, strength);      break;
+    case THEME_AURORA:    DrawThemeAurora(area, seconds, strength);    break;
+    case THEME_SYNTHWAVE: DrawThemeSynthwave(area, seconds, strength); break;
+    case THEME_FIREFLIES: DrawThemeFireflies(area, seconds, strength); break;
+    case THEME_RAIN:      DrawThemeRain(area, seconds, strength);      break;
     default:            /* Classic: a quiet banner, nothing behind the app */
         if (strength >= 0.99f) {
             DrawGradientHorizontal((int)area.x, (int)area.y, (int)area.width, (int)area.height, (Color){22, 27, 34, 255}, (Color){33, 38, 45, 255});

@@ -1,8 +1,9 @@
 /*
  * repo_header.h - the top of a repository page
  *
- * Name, visibility, Star / Fork / Code buttons and tabs; the Code and
- * branch menus; the fork bar and the merge banner.
+ * Name, visibility, the Star / Fork / Copy repo address buttons and the
+ * tabs; the address menu and the branch menu; the fork bar and the merge
+ * banner.
  */
 
 #ifndef MINIGITHUB_REPO_HEADER_H
@@ -13,7 +14,7 @@
 
 /* The strip at the top of a fork's Code tab: where it came from, ahead / behind, and Sync. */
 float DrawForkBar(Repo *repo, float top);
-extern bool codeMenuOpen;  /* the menu under the Code button is open */
+extern bool codeMenuOpen;  /* the menu under the "Copy repo address" arrow is open */
 
 /* The menu is drawn after everything else on the page so it sits on top, but it takes its clicks
    first (before the page under it can). */

@@ -5,6 +5,7 @@
  */
 
 #include "screen_commit.h"
+#include "animation.h"
 #include "app_state.h"
 #include "diff.h"
 #include "downloads.h"
@@ -137,7 +138,7 @@ void ScreenCommit(Repo *repo)
         Rectangle row = {listArea.x, listArea.y + i * rowHeight - changeListScroll, listArea.width, rowHeight};
         bool hovered = IsHovered(listArea) && IsHovered(row);
         if (i == currentChange) DrawRectangleRec(row, (Color){56, 139, 253, 40});
-        else if (hovered)       DrawRectangleRec(row, UI_HOVER);
+        else DrawHoverFill(row, AnimationKey("change row", (float)i, 0), hovered);
         if (hovered) wantedCursor = MOUSE_CURSOR_POINTING_HAND;
         Color kindColor = commitChanges[i].kind == 'A' ? UI_GREEN_TEXT : commitChanges[i].kind == 'D' ? UI_RED_TEXT : UI_YELLOW;
         char kindText[2] = {commitChanges[i].kind, 0};
